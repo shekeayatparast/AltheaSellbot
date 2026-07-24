@@ -64,13 +64,13 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 DATABASE_PATH = os.getenv("DATABASE_PATH", "bot.db")
-DEFAULT_LANGUAGE = os.getenv("DEFAULT_LANGUAGE", "fa")
+DEFAULT_LANGUAGE = os.getenv("DEFAULT_LANGUAGE", "en")
 TRIAL_ENABLED = os.getenv("TRIAL_ENABLED", "true").lower() == "true"
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "3"))
 TRIAL_GB = int(os.getenv("TRIAL_GB", "5"))
 REFERRAL_BONUS_DAYS = int(os.getenv("REFERRAL_BONUS_DAYS", "5"))
 REFERRAL_BONUS_GB = int(os.getenv("REFERRAL_BONUS_GB", "2"))
-CURRENCY = os.getenv("CURRENCY", "IRT")  # Iranian Toman
+CURRENCY = os.getenv("CURRENCY", "USD")
 EXPIRY_REMINDER_DAYS = [int(x) for x in os.getenv("EXPIRY_REMINDER_DAYS", "3,1").split(",")]
 TRAFFIC_ALERT_THRESHOLD_1 = int(os.getenv("TRAFFIC_ALERT_THRESHOLD_1", "80"))
 TRAFFIC_ALERT_THRESHOLD_2 = int(os.getenv("TRAFFIC_ALERT_THRESHOLD_2", "95"))
@@ -931,10 +931,6 @@ class Database:
         )
         await self._db.commit()
     
-    async def save_setting(self, key: str, value: str):
-        """Alias for set_setting for convenience."""
-        await self.set_setting(key, value)
-    
     # --- Misc ---
     
     async def search_user(self, query: str) -> List[dict]:
@@ -1505,7 +1501,7 @@ def fmt_plan_card(plan: dict) -> str:
     html += f"<pre>┌────────────────────────────┐\n"
     html += f"│ Traffic: {fmt_gb(plan['traffic_gb']):<21} │\n"
     html += f"│ Duration:{fmt_days(plan['duration_days']):<21} │\n"
-    html += f"│ Price:   {plan['price']:>22,.0f} Toman │\n"
+    html += f"│ Price:   ${plan['price']:<22.2f} │\n"
     if plan.get("limit_ip", 0) > 0:
         html += f"│ Max IPs: {plan['limit_ip']:<22} │\n"
     html += f"└────────────────────────────┘</pre>"
@@ -1610,7 +1606,7 @@ def kb_plans(plans: List[dict]) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for plan in plans:
         kb.button(
-            text=f"📦 {plan['name']} — {int(plan['price']):,} Toman",
+            text=f"📦 {plan['name']} — ${plan['price']:.2f}",
             callback_data=PlanCB(action="view", plan_id=plan["id"]).pack(),
             style="primary"
         )
@@ -1696,7 +1692,7 @@ def kb_admin_plans(plans: List[dict]) -> InlineKeyboardMarkup:
     for plan in plans:
         status = "✅" if plan["is_active"] else "❌"
         kb.button(
-            text=f"{status} {plan['name']} — {int(plan['price']):,} Toman",
+            text=f"{status} {plan['name']} — ${plan['price']:.2f}",
             callback_data=PlanCB(action="admin_view", plan_id=plan["id"]).pack()
         )
     kb.button(text="➕ Add Plan", callback_data=PlanCB(action="add", plan_id=0).pack(), style="success")
@@ -1804,22 +1800,16 @@ class AdminStates(StatesGroup):
     waiting_for_plan_duration = State()
     waiting_for_plan_price = State()
     waiting_for_plan_limit_ip = State()
-    waiting_for_plan_inbounds = State()
     # Broadcast
     waiting_for_broadcast_message = State()
     # User search
     waiting_for_user_search = State()
-    # Add balance
-    waiting_for_add_balance_amount = State()
     # Ticket reply
     waiting_for_admin_ticket_reply = State()
     # Promo code
     waiting_for_promo_code_str = State()
     waiting_for_promo_discount = State()
     waiting_for_promo_max_uses = State()
-    # Trial settings
-    waiting_for_trial_days = State()
-    waiting_for_trial_gb = State()
 
 
 # ============================================================================
@@ -3332,12 +3322,6 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     
     @router.callback_query(PlanCB.filter(F.action == "add"))
     async def cb_plan_add(callback: CallbackQuery, state: FSMContext):
-        # Get active servers to show inbounds
-        servers = await db.get_servers(active_only=True)
-        if not servers:
-            await callback.answer("❌ No active server found. Please add a server first.", show_alert=True)
-            return
-        
         await state.set_state(AdminStates.waiting_for_plan_name)
         await callback.message.edit_text("➕ <b>Add Plan</b>\n\nEnter plan name:", reply_markup=kb_cancel())
         await callback.answer()
@@ -3391,63 +3375,25 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def ms_plan_limit_ip(message: Message, state: FSMContext):
         try:
             limit_ip = int(message.text.strip())
-            await state.update_data(limit_ip=limit_ip)
-            # Now ask for server selection
-            servers = await db.get_servers(active_only=True)
-            kb = InlineKeyboardBuilder()
-            for srv in servers:
-                kb.button(text=f"🖥 {srv['alias']}", callback_data=ServerCB(action="select_for_plan", server_id=srv["id"]).pack())
-            kb.adjust(2)
-            await state.set_state(AdminStates.waiting_for_plan_inbounds)
-            await message.answer(f"📡 <b>Select Server for Plan</b>\n\nChoose the server where this plan's accounts will be created:", reply_markup=kb.as_markup())
+            data = await state.get_data()
+            await state.clear()
+            
+            plan_id = await db.add_plan(
+                name=data["name"],
+                description=data["description"],
+                traffic_gb=data["traffic_gb"],
+                duration_days=data["duration_days"],
+                price=data["price"],
+                limit_ip=limit_ip,
+            )
+            
+            plan = await db.get_plan(plan_id)
+            await message.answer(
+                f"✅ <b>Plan Created!</b>\n\n{fmt_plan_card(plan)}",
+                reply_markup=kb_admin_plans(await db.get_plans(active_only=False))
+            )
         except ValueError:
             await message.answer("❌ Please enter a number. Try again:", reply_markup=kb_cancel())
-    
-    @router.callback_query(ServerCB.filter(F.action == "select_for_plan"))
-    async def cb_select_server_for_plan(callback: CallbackQuery, callback_data: ServerCB, state: FSMContext):
-        await state.update_data(server_id=callback_data.server_id)
-        # Get inbounds for selected server
-        inbounds = await db.get_inbounds(callback_data.server_id)
-        if not inbounds:
-            await callback.answer("❌ No inbounds found on this server.", show_alert=True)
-            return
-        
-        kb = InlineKeyboardBuilder()
-        for ib in inbounds:
-            protocol = ib.get('protocol', 'unknown')
-            remark = ib.get('remark', f'Inbound {ib["inbound_id"]}')
-            kb.button(text=f"🔌 {remark} ({protocol})", callback_data=f"inbound_{ib['inbound_id']}")
-        kb.button(text="✅ All Inbounds", callback_data="inbound_all")
-        kb.adjust(2)
-        
-        await state.set_state(AdminStates.waiting_for_plan_inbounds)
-        await callback.message.edit_text(f"🔌 <b>Select Inbound(s)</b>\n\nChoose which inbound(s) this plan should use:", reply_markup=kb.as_markup())
-        await callback.answer()
-    
-    @router.callback_query(lambda c: c.data.startswith("inbound_"))
-    async def cb_select_inbound_for_plan(callback: CallbackQuery, state: FSMContext):
-        inbound_selection = callback.data.split("_", 1)[1]  # "all" or inbound_id
-        data = await state.get_data()
-        await state.clear()
-        
-        # Store inbound selection as comma-separated string
-        inbound_ids = inbound_selection if inbound_selection == "all" else inbound_selection
-        
-        plan_id = await db.add_plan(
-            name=data["name"],
-            description=data["description"],
-            traffic_gb=data["traffic_gb"],
-            duration_days=data["duration_days"],
-            price=data["price"],
-            limit_ip=data["limit_ip"],
-            inbound_group=inbound_ids,  # Store inbound IDs or "all"
-        )
-        
-        plan = await db.get_plan(plan_id)
-        await callback.message.edit_text(
-            f"✅ <b>Plan Created!</b>\n\n{fmt_plan_card(plan)}",
-            reply_markup=kb_admin_plans(await db.get_plans(active_only=False))
-        )
     
     @router.callback_query(PlanCB.filter(F.action == "admin_view"))
     async def cb_admin_plan_view(callback: CallbackQuery, callback_data: PlanCB):
@@ -3527,9 +3473,9 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         text += f"<pre>┌────────────────────────────┐\n"
         text += f"│ TG ID:    {user['tg_id']:<18} │\n"
         text += f"│ Username: {(user.get('username') or 'N/A')[:18]:<18} │\n"
-        text += f"│ Balance:  {user.get('balance', 0):<17.0f} Toman │\n"
+        text += f"│ Balance:  ${user.get('balance', 0):<17.2f} │\n"
         text += f"│ Orders:   {user.get('total_orders', 0):<18} │\n"
-        text += f"│ Spent:    {user.get('total_spent', 0):<17.0f} Toman │\n"
+        text += f"│ Spent:    ${user.get('total_spent', 0):<17.2f} │\n"
         text += f"│ Banned:   {'Yes' if user.get('is_banned') else 'No':<18} │\n"
         text += f"│ Joined:   {user['created_at'][:18]:<18} │\n"
         text += f"└────────────────────────────┘</pre>\n"
@@ -3564,80 +3510,6 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         tg_id = int(callback_data.data)
         await db.ban_user(tg_id, False)
         await callback.answer("✅ User unbanned.", show_alert=True)
-    
-    @router.callback_query(AdminCB.filter(F.action == "add_balance"))
-    async def cb_add_balance_start(callback: CallbackQuery, callback_data: AdminCB, state: FSMContext):
-        tg_id = int(callback_data.data)
-        user = await db.get_user(tg_id)
-        if not user:
-            await callback.answer("❌ User not found.", show_alert=True)
-            return
-        
-        await state.update_data(add_balance_tg_id=tg_id)
-        await state.set_state(AdminStates.waiting_for_add_balance_amount)
-        await callback.message.edit_text(
-            f"💰 <b>Add Balance for {escape_html(user.get('first_name', 'User'))}</b>\n\n"
-            f"Current balance: {user.get('balance', 0):.0f} Toman\n\n"
-            f"Enter amount to add (in Toman):",
-            reply_markup=kb_cancel()
-        )
-        await callback.answer()
-    
-    @router.message(AdminStates.waiting_for_add_balance_amount)
-    async def ms_add_balance_amount(message: Message, state: FSMContext):
-        try:
-            amount = float(message.text.strip())
-            if amount <= 0:
-                await message.answer("❌ Amount must be positive. Try again:", reply_markup=kb_cancel())
-                return
-            
-            data = await state.get_data()
-            tg_id = data.get("add_balance_tg_id")
-            if not tg_id:
-                await message.answer("❌ Session expired. Please try again.", reply_markup=kb_cancel())
-                await state.clear()
-                return
-            
-            # Add balance to user
-            await db.update_user_balance(tg_id, amount, add=True)
-            
-            # Record transaction
-            await db.add_transaction(
-                user_tg_id=tg_id,
-                amount=amount,
-                type="deposit",
-                description="Manual balance increase by admin"
-            )
-            
-            # Update user totals
-            await db._db.execute(
-                "UPDATE users SET total_spent = total_spent + ? WHERE tg_id = ?",
-                (-amount, tg_id)  # Negative because it's a deposit (money added to user)
-            )
-            await db._db.commit()
-            
-            await state.clear()
-            
-            # Notify user
-            try:
-                await message.bot.send_message(
-                    tg_id,
-                    f"💰 <b>Balance Increased!</b>\n\n"
-                    f"Admin has added <b>{amount:.0f} Toman</b> to your balance.\n"
-                    f"Your new balance: <b>{(await db.get_user(tg_id))['balance']:.0f} Toman</b>"
-                )
-            except Exception:
-                pass  # User might have blocked the bot
-            
-            await message.answer(
-                f"✅ Successfully added {amount:.0f} Toman to user's balance.\n"
-                f"New balance: {(await db.get_user(tg_id))['balance']:.0f} Toman",
-                reply_markup=InlineKeyboardBuilder.from_button(
-                    InlineKeyboardButton(text="🔙 Back to Users", callback_data=AdminCB(action="users").pack())
-                ).as_markup()
-            )
-        except ValueError:
-            await message.answer("❌ Please enter a valid number. Try again:", reply_markup=kb_cancel())
     
     # --- Finance ---
     @router.callback_query(AdminCB.filter(F.action == "finance"))
@@ -3902,115 +3774,17 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             f"│ Referral GB:   {REFERRAL_BONUS_GB:>15} │\n"
             f"│ Currency: {CURRENCY:<19} │\n"
             f"└────────────────────────────┘</pre>\n"
-            f"💡 You can modify trial settings below."
+            f"💡 Settings are configured via .env file."
         )
         
         kb = InlineKeyboardBuilder()
-        kb.button(text="🎁 Trial Settings", callback_data=AdminCB(action="trial_settings").pack(), style="primary")
-        kb.button(text="🔄 Refresh Servers", callback_data=AdminCB(action="refresh_servers").pack())
+        kb.button(text="🔄 Refresh Servers", callback_data=AdminCB(action="refresh_servers").pack(), style="primary")
         kb.button(text="💾 Database Backup", callback_data=AdminCB(action="db_backup").pack())
         kb.button(text="🔙 Back", callback_data=AdminCB(action="main").pack(), style="danger")
-        kb.adjust(2, 1, 1)
-        
-        await callback.message.edit_text(text, reply_markup=kb.as_markup())
-        await callback.answer()
-    
-    @router.callback_query(AdminCB.filter(F.action == "trial_settings"))
-    async def cb_trial_settings(callback: CallbackQuery, state: FSMContext):
-        text = (
-            f"🎁 <b>Trial Configuration</b>\n\n"
-            f"Current settings:\n"
-            f"• Trial Enabled: {'✅ Yes' if TRIAL_ENABLED else '❌ No'}\n"
-            f"• Trial Duration: {TRIAL_DAYS} days\n"
-            f"• Trial Traffic: {TRIAL_GB} GB\n\n"
-            f"To change these settings, use the buttons below.\n"
-            f"Note: Changes will apply to new trial accounts only."
-        )
-        
-        kb = InlineKeyboardBuilder()
-        kb.button(text=f"{'✅' if TRIAL_ENABLED else '❌'} Toggle Trial ({'Enable' if not TRIAL_ENABLED else 'Disable'})", 
-                  callback_data=AdminCB(action="trial_toggle").pack(), style="primary")
-        kb.button(text=f"📅 Change Days ({TRIAL_DAYS})", callback_data=AdminCB(action="trial_days").pack())
-        kb.button(text=f"💾 Change GB ({TRIAL_GB})", callback_data=AdminCB(action="trial_gb").pack())
-        kb.button(text="🔙 Back", callback_data=AdminCB(action="settings").pack(), style="danger")
         kb.adjust(1, 1, 1)
         
         await callback.message.edit_text(text, reply_markup=kb.as_markup())
         await callback.answer()
-    
-    @router.callback_query(AdminCB.filter(F.action == "trial_toggle"))
-    async def cb_trial_toggle(callback: CallbackQuery):
-        global TRIAL_ENABLED
-        TRIAL_ENABLED = not TRIAL_ENABLED
-        # Save to database settings
-        await db.save_setting("trial_enabled", str(TRIAL_ENABLED))
-        await callback.answer(f"✅ Trial {'enabled' if TRIAL_ENABLED else 'disabled'}.", show_alert=True)
-        # Refresh the settings view
-        await cb_trial_settings(callback, FSMContext())
-    
-    @router.callback_query(AdminCB.filter(F.action == "trial_days"))
-    async def cb_trial_days_edit(callback: CallbackQuery, state: FSMContext):
-        await state.set_state(AdminStates.waiting_for_trial_days)
-        await callback.message.edit_text(
-            f"📅 <b>Change Trial Days</b>\n\n"
-            f"Current: {TRIAL_DAYS} days\n\n"
-            f"Enter new value:",
-            reply_markup=kb_cancel()
-        )
-        await callback.answer()
-    
-    @router.message(AdminStates.waiting_for_trial_days)
-    async def ms_trial_days(message: Message, state: FSMContext):
-        try:
-            days = int(message.text.strip())
-            if days <= 0:
-                await message.answer("❌ Days must be positive. Try again:", reply_markup=kb_cancel())
-                return
-            
-            global TRIAL_DAYS
-            TRIAL_DAYS = days
-            await db.save_setting("trial_days", str(days))
-            await state.clear()
-            await message.answer(
-                f"✅ Trial days updated to {days} days.",
-                reply_markup=InlineKeyboardBuilder.from_button(
-                    InlineKeyboardButton(text="🔙 Back to Trial Settings", callback_data=AdminCB(action="trial_settings").pack())
-                ).as_markup()
-            )
-        except ValueError:
-            await message.answer("❌ Please enter a valid number.", reply_markup=kb_cancel())
-    
-    @router.callback_query(AdminCB.filter(F.action == "trial_gb"))
-    async def cb_trial_gb_edit(callback: CallbackQuery, state: FSMContext):
-        await state.set_state(AdminStates.waiting_for_trial_gb)
-        await callback.message.edit_text(
-            f"💾 <b>Change Trial Traffic</b>\n\n"
-            f"Current: {TRIAL_GB} GB\n\n"
-            f"Enter new value:",
-            reply_markup=kb_cancel()
-        )
-        await callback.answer()
-    
-    @router.message(AdminStates.waiting_for_trial_gb)
-    async def ms_trial_gb(message: Message, state: FSMContext):
-        try:
-            gb = int(message.text.strip())
-            if gb <= 0:
-                await message.answer("❌ GB must be positive. Try again:", reply_markup=kb_cancel())
-                return
-            
-            global TRIAL_GB
-            TRIAL_GB = gb
-            await db.save_setting("trial_gb", str(gb))
-            await state.clear()
-            await message.answer(
-                f"✅ Trial traffic updated to {gb} GB.",
-                reply_markup=InlineKeyboardBuilder.from_button(
-                    InlineKeyboardButton(text="🔙 Back to Trial Settings", callback_data=AdminCB(action="trial_settings").pack())
-                ).as_markup()
-            )
-        except ValueError:
-            await message.answer("❌ Please enter a valid number.", reply_markup=kb_cancel())
     
     @router.callback_query(AdminCB.filter(F.action == "refresh_servers"))
     async def cb_refresh_servers(callback: CallbackQuery):
