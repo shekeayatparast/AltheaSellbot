@@ -3523,7 +3523,7 @@ def kb_main_menu(is_admin: bool, lang: str = "en") -> InlineKeyboardMarkup:
     kb.button(style="primary", text=t("guide", lang), callback_data=MenuCB(action="guide").pack())
     kb.button(style="primary", text=t("language", lang), callback_data=MenuCB(action="language").pack())
     if is_admin:
-        kb.button(text=t("admin_panel", lang), callback_data=AdminCB(action="dashboard").pack(), style="danger")
+        kb.button(text=t("admin_panel", lang), callback_data=AdminCB(action="main").pack(), style="danger")
     kb.adjust(2, 2, 2, 2, 2, 2, 1 if is_admin else 0)
     return kb.as_markup()
 
