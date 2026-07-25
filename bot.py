@@ -95,6 +95,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 
 # Optional QR-code support (graceful fallback if not installed)
@@ -161,7 +162,7 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "back": "🔙 Back",
         "back_menu": "🏠 Main Menu",
         "back_admin": "🔙 Admin Menu",
-        "action_cancelled": "❌ Action cancelled.\n\nBack to main menu 👇",
+        "action_cancelled": "❌ Action cancelled.\n\nReturning to main menu 👇",
         "yes": "Yes",
         "no": "No",
         "loading": "⏳ Please wait...",
@@ -202,7 +203,7 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "no_plans": "😔 No plans available yet. Please check back later or contact support.",
         "your_balance": "💳 Your balance: <b>{balance}</b>",
         "sufficient": "✅ You have enough balance.",
-        "insufficient": "⚠️ Insufficient balance. You need <b>{diff}</b> more.\n\nUse Charge Wallet or redeem a gift code.",
+        "insufficient": "⚠️ Insufficient balance. You need <b>{diff}</b> more.\n\n💡 Use Charge Wallet or redeem a gift code.",
         "ask_account_name": (
             "✏️ <b>Name your account</b>\n\n"
             "Send a friendly name (e.g. <code>phone</code>, <code>laptop</code>) — only letters, numbers, <code>-</code> and <code>_</code>.\n"
@@ -324,7 +325,8 @@ MESSAGES: Dict[str, Dict[str, str]] = {
             "After payment, send your receipt (photo or text) using the button below."
         ),
         "send_receipt": "📤 Send Receipt",
-        "enter_receipt_text": "📝 Type your receipt details (transaction ID, time, etc):",
+        "enter_receipt_text": "📸 <b>Send your receipt</b>\n\nYou can send a <b>photo</b> (screenshot of the payment) or <b>type</b> the details (transaction ID, time, etc).\n\nTip: a photo with a caption is best.",
+        "receipt_empty": "❌ Please send a photo or some text as the receipt.",
         "receipt_received": "✅ Receipt received! Your payment is pending admin review.\n\nAmount: {amount} Toman\nYou'll be notified once it's approved.",
         "payment_approved": "✅ <b>Payment Approved!</b>\n\n💰 {amount} Toman added to your balance.\n💳 New balance: {balance}",
         "payment_rejected": "❌ <b>Payment Rejected</b>\n\nReason: {reason}\n\nPlease contact support if you have questions.",
@@ -363,9 +365,9 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "invalid_number": "❌ لطفاً یک عدد معتبر وارد کنید.",
         "copied": "📋 کپی شد.",
         "welcome": (
-            "👋 <b>به ربات VPN خوش آمدید!</b>\n\n"
+            "👋 <b>به ربات {bot_name} خوش آمدید!</b>\n\n"
             "🔐 سرویس VPN پریمیوم با تحویل آنی.\n"
-            "📱 مدیریت اکانت‌ها مستقیم از همین تلگرام.\n\n"
+            "📱 مدیریت اکانت‌ها مستقیماً در تلگرام.\n\n"
             "<b>کارهایی که می‌توانید انجام دهید:</b>\n"
             "• 🛒 خرید اشتراک VPN به‌صورت آنی\n"
             "• 📱 مشاهدهٔ وضعیت اکانت و مصرف حجم\n"
@@ -390,7 +392,7 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "no_plans": "😔 هنوز پلنی تعریف نشده. بعداً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.",
         "your_balance": "💳 موجودی شما: <b>{balance}</b>",
         "sufficient": "✅ موجودی کافی است.",
-        "insufficient": "⚠️ موجودی کافی نیست. <b>{diff}</b> دیگر نیاز دارید.\n\nاز شارژ کیف پول استفاده کنید یا کد هدیه دریافت کنید.",
+        "insufficient": "⚠️ موجودی کافی نیست. <b>{diff}</b> دیگر نیاز دارید.\n\n💡 از شارژ کیف پول استفاده کنید یا کد هدیه بگیرید.",
         "ask_account_name": (
             "✏️ <b>نام اکانت</b>\n\n"
             "یک نام دلخواه بفرستید (مثلاً <code>phone</code> یا <code>laptop</code>) — فقط حروف انگلیسی، عدد، خط تیره و زیرخط.\n"
@@ -499,7 +501,8 @@ MESSAGES: Dict[str, Dict[str, str]] = {
             "پس از پرداخت، رسید خود (عکس یا متن) را با دکمهٔ زیر بفرستید."
         ),
         "send_receipt": "📤 ارسال رسید",
-        "enter_receipt_text": "📝 جزئیات رسید خود را بنویسید (شماره تراکنش، زمان و ...):",
+        "enter_receipt_text": "📸 <b>ارسال رسید</b>\n\nمی‌توانید یک <b>عکس</b> (اسکرین‌شات پرداخت) بفرستید یا جزئیات را <b>تایپ کنید</b> (شماره تراکنش، زمان و ...).\n\nپیشنهاد: عکس همراه با کپشن بهترین گزینه است.",
+        "receipt_empty": "❌ لطفاً یک عکس یا متن به‌عنوان رسید ارسال کنید.",
         "receipt_received": "✅ رسید دریافت شد! پرداخت شما در انتظار بررسی مدیریت است.\n\nمبلغ: {amount} تومان\nپس از تأیید، مبلغ به کیف پول شما اضافه می‌شود.",
         "payment_approved": "✅ <b>پرداخت تأیید شد!</b>\n\n💰 {amount} تومان به موجودی شما اضافه شد.\n💳 موجودی جدید: {balance}",
         "payment_rejected": "❌ <b>پرداخت رد شد</b>\n\nدلیل: {reason}\n\nاگر سؤالی دارید، با پشتیبانی تماس بگیرید.",
@@ -1624,8 +1627,10 @@ class PanelAPI:
                             tg_id: int = 0, flow: str = "", sub_id: str = "") -> dict:
         client: Dict[str, Any] = {"email": email, "enable": True}
         if total_gb > 0:
-            # 3x-ui API expects totalGB in gigabytes (not bytes)
-            client["totalGB"] = total_gb
+            # 3x-ui stores the `totalGB` value directly as the traffic `total`
+            # (in bytes) — despite the misleading field name. Sending 5 makes
+            # the limit 5 bytes; we must send bytes to get N GB.
+            client["totalGB"] = total_gb * GB
         if expiry_time > 0:
             client["expiryTime"] = expiry_time
         if limit_ip > 0:
@@ -2239,15 +2244,15 @@ class SettingsCatCB(CallbackData, prefix="scat"):
 def kb_main_menu(is_admin: bool, lang: str = "en") -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text=t("buy", lang), callback_data=MenuCB(action="buy").pack(), style="primary")
-    kb.button(text=t("my_accounts", lang), callback_data=MenuCB(action="my_accounts").pack())
+    kb.button(style="primary", text=t("my_accounts", lang), callback_data=MenuCB(action="my_accounts").pack())
     kb.button(text=t("trial", lang), callback_data=MenuCB(action="trial").pack(), style="success")
-    kb.button(text=t("charge_wallet_btn", lang), callback_data=MenuCB(action="charge_wallet").pack())
-    kb.button(text=t("balance", lang), callback_data=MenuCB(action="balance").pack())
-    kb.button(text=t("referral", lang), callback_data=MenuCB(action="referral").pack())
-    kb.button(text=t("gift", lang), callback_data=MenuCB(action="gift").pack())
-    kb.button(text=t("support", lang), callback_data=MenuCB(action="support").pack())
-    kb.button(text=t("guide", lang), callback_data=MenuCB(action="guide").pack())
-    kb.button(text=t("language", lang), callback_data=MenuCB(action="language").pack())
+    kb.button(style="success", text=t("charge_wallet_btn", lang), callback_data=MenuCB(action="charge_wallet").pack())
+    kb.button(style="primary", text=t("balance", lang), callback_data=MenuCB(action="balance").pack())
+    kb.button(style="primary", text=t("referral", lang), callback_data=MenuCB(action="referral").pack())
+    kb.button(style="success", text=t("gift", lang), callback_data=MenuCB(action="gift").pack())
+    kb.button(style="primary", text=t("support", lang), callback_data=MenuCB(action="support").pack())
+    kb.button(style="primary", text=t("guide", lang), callback_data=MenuCB(action="guide").pack())
+    kb.button(style="primary", text=t("language", lang), callback_data=MenuCB(action="language").pack())
     if is_admin:
         kb.button(text=t("admin_panel", lang), callback_data=AdminCB(action="dashboard").pack(), style="danger")
     kb.adjust(2, 2, 2, 2, 2, 2, 1 if is_admin else 0)
@@ -2257,17 +2262,17 @@ def kb_main_menu(is_admin: bool, lang: str = "en") -> InlineKeyboardMarkup:
 def kb_admin_menu(lang: str = "en") -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="📊 Dashboard", callback_data=AdminCB(action="dashboard").pack(), style="primary")
-    kb.button(text="🖥 Servers", callback_data=AdminCB(action="servers").pack())
-    kb.button(text="📦 Plans", callback_data=AdminCB(action="plans").pack())
-    kb.button(text="👥 Users", callback_data=AdminCB(action="users").pack())
-    kb.button(text="💰 Finance", callback_data=AdminCB(action="finance").pack())
-    kb.button(text="💰 Pending Pay", callback_data=AdminCB(action="pending_payments").pack())
-    kb.button(text="🎫 Promos", callback_data=AdminCB(action="promos").pack())
-    kb.button(text="🎁 Gift Codes", callback_data=AdminCB(action="gift_codes").pack())
-    kb.button(text="💬 Tickets", callback_data=AdminCB(action="tickets").pack())
-    kb.button(text="📣 Broadcast", callback_data=AdminCB(action="broadcast").pack())
-    kb.button(text="🧹 Cleanup", callback_data=AdminCB(action="cleanup").pack())
-    kb.button(text="⚙️ Settings", callback_data=AdminCB(action="settings").pack())
+    kb.button(style="primary", text="🖥 Servers", callback_data=AdminCB(action="servers").pack())
+    kb.button(style="primary", text="📦 Plans", callback_data=AdminCB(action="plans").pack())
+    kb.button(style="primary", text="👥 Users", callback_data=AdminCB(action="users").pack())
+    kb.button(style="primary", text="💰 Finance", callback_data=AdminCB(action="finance").pack())
+    kb.button(style="primary", text="💰 Pending Pay", callback_data=AdminCB(action="pending_payments").pack())
+    kb.button(style="primary", text="🎫 Promos", callback_data=AdminCB(action="promos").pack())
+    kb.button(style="success", text="🎁 Gift Codes", callback_data=AdminCB(action="gift_codes").pack())
+    kb.button(style="primary", text="💬 Tickets", callback_data=AdminCB(action="tickets").pack())
+    kb.button(style="primary", text="📣 Broadcast", callback_data=AdminCB(action="broadcast").pack())
+    kb.button(style="primary", text="🧹 Cleanup", callback_data=AdminCB(action="cleanup").pack())
+    kb.button(style="primary", text="⚙️ Settings", callback_data=AdminCB(action="settings").pack())
     kb.button(text=t("back_menu", lang), callback_data=MenuCB(action="main").pack(), style="danger")
     kb.adjust(2, 2, 2, 2, 2, 2, 1)
     return kb.as_markup()
@@ -2299,10 +2304,10 @@ def kb_account_details(email: str, is_active: bool, lang: str) -> InlineKeyboard
     kb = InlineKeyboardBuilder()
     kb.button(text=t("renew", lang), callback_data=AccountCB(action="renew", email=email).pack(), style="success")
     kb.button(text=t("topup_traffic", lang), callback_data=AccountCB(action="topup", email=email).pack(), style="primary")
-    kb.button(text=t("traffic", lang), callback_data=AccountCB(action="traffic", email=email).pack())
-    kb.button(text=t("get_link", lang), callback_data=AccountCB(action="links", email=email).pack())
-    kb.button(text=t("qr", lang), callback_data=AccountCB(action="qr", email=email).pack())
-    kb.button(text=t("set_label", lang), callback_data=AccountCB(action="label", email=email).pack())
+    kb.button(style="primary", text=t("traffic", lang), callback_data=AccountCB(action="traffic", email=email).pack())
+    kb.button(style="primary", text=t("get_link", lang), callback_data=AccountCB(action="links", email=email).pack())
+    kb.button(style="primary", text=t("qr", lang), callback_data=AccountCB(action="qr", email=email).pack())
+    kb.button(style="primary", text=t("set_label", lang), callback_data=AccountCB(action="label", email=email).pack())
     if is_active:
         kb.button(text=t("disable", lang), callback_data=AccountCB(action="disable", email=email).pack(), style="danger")
     else:
@@ -2319,7 +2324,7 @@ def kb_accounts_list(accounts: List[dict], lang: str) -> InlineKeyboardMarkup:
         status = "🟢" if acc["is_active"] else "🔴"
         trial = "🎁" if acc["is_trial"] else ""
         label = acc.get("label") or acc["email"][:20]
-        kb.button(
+        kb.button(style="primary", 
             text=f"{status}{trial} {label[:22]}",
             callback_data=AccountCB(action="view", email=acc["email"]).pack(),
         )
@@ -2334,7 +2339,7 @@ def kb_servers(servers: List[dict]) -> InlineKeyboardMarkup:
         status = "🟢" if srv["is_healthy"] else "🔴"
         if not srv["is_active"]:
             status = "⚪"
-        kb.button(text=f"{status} {srv['alias']}", callback_data=ServerCB(action="view", server_id=srv["id"]).pack())
+        kb.button(style="primary", text=f"{status} {srv['alias']}", callback_data=ServerCB(action="view", server_id=srv["id"]).pack())
     kb.button(text="➕ Add Server", callback_data=ServerCB(action="add").pack(), style="success")
     kb.button(text="🔄 Sync All", callback_data=ServerCB(action="sync_all").pack(), style="primary")
     kb.button(text="🔙 Admin", callback_data=AdminCB(action="main").pack(), style="danger")
@@ -2345,11 +2350,11 @@ def kb_servers(servers: List[dict]) -> InlineKeyboardMarkup:
 def kb_server_view(server_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="📊 Stats", callback_data=ServerCB(action="stats", server_id=server_id).pack(), style="primary")
-    kb.button(text="📡 Inbounds", callback_data=ServerCB(action="inbounds", server_id=server_id).pack())
-    kb.button(text="🔄 Sync", callback_data=ServerCB(action="sync", server_id=server_id).pack())
-    kb.button(text="✏️ Edit", callback_data=ServerCB(action="edit", server_id=server_id).pack())
-    kb.button(text="📶 Test", callback_data=ServerCB(action="test", server_id=server_id).pack())
-    kb.button(text="💾 Backup", callback_data=ServerCB(action="backup", server_id=server_id).pack())
+    kb.button(style="primary", text="📡 Inbounds", callback_data=ServerCB(action="inbounds", server_id=server_id).pack())
+    kb.button(style="primary", text="🔄 Sync", callback_data=ServerCB(action="sync", server_id=server_id).pack())
+    kb.button(style="primary", text="✏️ Edit", callback_data=ServerCB(action="edit", server_id=server_id).pack())
+    kb.button(style="primary", text="📶 Test", callback_data=ServerCB(action="test", server_id=server_id).pack())
+    kb.button(style="primary", text="💾 Backup", callback_data=ServerCB(action="backup", server_id=server_id).pack())
     kb.button(text="🔄 Restart", callback_data=ServerCB(action="restart", server_id=server_id).pack(), style="danger")
     kb.button(text="🗑 Delete", callback_data=ServerCB(action="delete_ask", server_id=server_id).pack(), style="danger")
     kb.button(text="🔙 Servers", callback_data=AdminCB(action="servers").pack(), style="danger")
@@ -2361,7 +2366,7 @@ def kb_admin_plans(plans: List[dict]) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for plan in plans:
         status = "✅" if plan["is_active"] else "❌"
-        kb.button(text=f"{status} {plan['name']}", callback_data=PlanCB(action="admin_view", plan_id=plan["id"]).pack())
+        kb.button(style="primary", text=f"{status} {plan['name']}", callback_data=PlanCB(action="admin_view", plan_id=plan["id"]).pack())
     kb.button(text="➕ Add Plan", callback_data=PlanCB(action="add", plan_id=0).pack(), style="success")
     kb.button(text="🔙 Admin", callback_data=AdminCB(action="main").pack(), style="danger")
     kb.adjust(1, 2, 1)
@@ -2371,7 +2376,7 @@ def kb_admin_plans(plans: List[dict]) -> InlineKeyboardMarkup:
 def kb_admin_plan_view(plan_id: int, is_active: bool) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="✏️ Edit", callback_data=PlanCB(action="edit", plan_id=plan_id).pack(), style="primary")
-    kb.button(text="🔗 Inbounds", callback_data=PlanCB(action="inbounds", plan_id=plan_id).pack())
+    kb.button(style="primary", text="🔗 Inbounds", callback_data=PlanCB(action="inbounds", plan_id=plan_id).pack())
     if is_active:
         kb.button(text="❌ Disable", callback_data=PlanCB(action="toggle", plan_id=plan_id).pack(), style="danger")
     else:
@@ -2391,7 +2396,7 @@ def kb_inbound_picker(server_alias: str, inbounds: List[dict], selected: set,
         mark = "✅" if key in selected else "⬜"
         proto = ib.get("protocol", "?")
         remark = ib.get("remark", "") or f"id{ib['inbound_id']}"
-        kb.button(
+        kb.button(style="primary", 
             text=f"{mark} {server_alias} · {remark} ({proto})",
             callback_data=InboundCB(action="toggle", key=key, plan_id=plan_id).pack(),
         )
@@ -2405,7 +2410,7 @@ def kb_tickets(tickets: List[dict], back_cb: str = "admin") -> InlineKeyboardMar
     kb = InlineKeyboardBuilder()
     for tk in tickets:
         status = "🟢" if tk["status"] == "open" else "🔴"
-        kb.button(text=f"{status} #{tk['id']} - {tk['subject'][:20]}",
+        kb.button(style="primary", text=f"{status} #{tk['id']} - {tk['subject'][:20]}",
                   callback_data=TicketCB(action="view", ticket_id=tk["id"]).pack())
     kb.button(text="🔙 Back", callback_data=AdminCB(action=back_cb).pack(), style="danger")
     kb.adjust(1)
@@ -2450,7 +2455,7 @@ def kb_broadcast_targets() -> InlineKeyboardMarkup:
     kb.button(text="👥 All", callback_data=AdminCB(action="broadcast_all").pack(), style="primary")
     kb.button(text="🟢 Active", callback_data=AdminCB(action="broadcast_active").pack(), style="success")
     kb.button(text="🔴 Expired", callback_data=AdminCB(action="broadcast_expired").pack(), style="danger")
-    kb.button(text="🎁 Trial", callback_data=AdminCB(action="broadcast_trial").pack())
+    kb.button(style="success", text="🎁 Trial", callback_data=AdminCB(action="broadcast_trial").pack())
     kb.button(text="🔙 Admin", callback_data=AdminCB(action="main").pack(), style="danger")
     kb.adjust(2, 2, 1)
     return kb.as_markup()
@@ -2468,8 +2473,8 @@ def kb_topup_packages(email: str, packages: List[int], lang: str, currency: str)
 
 def kb_language(lang: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="🇬🇧 English", callback_data=LangCB(code="en").pack())
-    kb.button(text="🇮🇷 فارسی", callback_data=LangCB(code="fa").pack())
+    kb.button(style="primary", text="🇬🇧 English", callback_data=LangCB(code="en").pack())
+    kb.button(style="primary", text="🇮🇷 فارسی", callback_data=LangCB(code="fa").pack())
     kb.button(text=t("back", lang), callback_data=MenuCB(action="main").pack(), style="danger")
     kb.adjust(2, 1)
     return kb.as_markup()
@@ -2606,9 +2611,9 @@ class AuthMiddleware:
                         for ch in not_joined:
                             username = ch.get("username", "")
                             if username:
-                                kb.button(text=f"📢 {username}", url=f"https://t.me/{username}")
+                                kb.button(style="primary", text=f"📢 {username}", url=f"https://t.me/{username}")
                         kb.button(text=t("verify_join", lang), callback_data=ForceJoinCB(action="verify").pack(), style="success")
-                        kb.button(text=t("language", lang), callback_data=MenuCB(action="language").pack())
+                        kb.button(style="primary", text=t("language", lang), callback_data=MenuCB(action="language").pack())
                         kb.adjust(1, 2)
                         try:
                             if isinstance(event, Message):
@@ -3001,9 +3006,9 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         delivery += f"\n{t('how_to_use', lang)}"
         kb = InlineKeyboardBuilder()
         kb.button(text=t("how_to_use", lang), callback_data=AccountCB(action="guide", email=email).pack(), style="primary")
-        kb.button(text=t("get_link", lang), callback_data=AccountCB(action="links", email=email).pack())
-        kb.button(text=t("my_accounts", lang), callback_data=MenuCB(action="my_accounts").pack())
-        kb.button(text=t("back_menu", lang), callback_data=MenuCB(action="main").pack())
+        kb.button(style="primary", text=t("get_link", lang), callback_data=AccountCB(action="links", email=email).pack())
+        kb.button(style="primary", text=t("my_accounts", lang), callback_data=MenuCB(action="my_accounts").pack())
+        kb.button(style="danger", text=t("back_menu", lang), callback_data=MenuCB(action="main").pack())
         kb.adjust(2, 2)
         await callback.message.edit_text(delivery, reply_markup=kb.as_markup(), disable_web_page_preview=True)
         await callback.answer("✅")
@@ -3091,7 +3096,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             "1. Install v2rayN\n2. Add subscription URL\n3. Select server → connect\n"
         )
         kb = InlineKeyboardBuilder()
-        kb.button(text=t("get_link", lang), callback_data=AccountCB(action="links", email=account["email"]).pack())
+        kb.button(style="primary", text=t("get_link", lang), callback_data=AccountCB(action="links", email=account["email"]).pack())
         kb.button(text=t("back", lang), callback_data=AccountCB(action="view", email=account["email"]).pack(), style="primary")
         kb.adjust(2)
         await callback.message.edit_text(text, reply_markup=kb.as_markup(), disable_web_page_preview=True)
@@ -3509,9 +3514,9 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         text += f"\n{t('how_to_use', lang)}"
         kb = InlineKeyboardBuilder()
         kb.button(text=t("how_to_use", lang), callback_data=AccountCB(action="guide", email=email).pack(), style="primary")
-        kb.button(text=t("get_link", lang), callback_data=AccountCB(action="links", email=email).pack())
+        kb.button(style="primary", text=t("get_link", lang), callback_data=AccountCB(action="links", email=email).pack())
         kb.button(text=t("buy", lang), callback_data=MenuCB(action="buy").pack(), style="success")
-        kb.button(text=t("back_menu", lang), callback_data=MenuCB(action="main").pack())
+        kb.button(style="danger", text=t("back_menu", lang), callback_data=MenuCB(action="main").pack())
         kb.adjust(2, 2)
         await callback.message.edit_text(text, reply_markup=kb.as_markup(), disable_web_page_preview=True)
         await callback.answer("✅")
@@ -3536,8 +3541,8 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         text += f"\n{t('topup_hint', lang)}"
         kb = InlineKeyboardBuilder()
         kb.button(text=t("charge_wallet_btn", lang), callback_data=MenuCB(action="charge_wallet").pack(), style="primary")
-        kb.button(text=t("gift", lang), callback_data=MenuCB(action="gift").pack())
-        kb.button(text=t("back_menu", lang), callback_data=MenuCB(action="main").pack())
+        kb.button(style="success", text=t("gift", lang), callback_data=MenuCB(action="gift").pack())
+        kb.button(style="danger", text=t("back_menu", lang), callback_data=MenuCB(action="main").pack())
         kb.adjust(2, 1)
         await callback.message.edit_text(text, reply_markup=kb.as_markup())
         await callback.answer()
@@ -3560,12 +3565,12 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         currency = await _currency()
         kb = InlineKeyboardBuilder()
         for amt in presets:
-            kb.button(
+            kb.button(style="primary", 
                 text=fmt_price(amt, lang, currency),
                 callback_data=PaymentCB(action="select_amount", amount=amt).pack(),
             )
         kb.button(text=t("custom_amount", lang), callback_data=PaymentCB(action="custom_amount").pack(), style="primary")
-        kb.button(text=t("gift", lang), callback_data=MenuCB(action="gift").pack())
+        kb.button(style="success", text=t("gift", lang), callback_data=MenuCB(action="gift").pack())
         kb.button(text=t("back_menu", lang), callback_data=MenuCB(action="main").pack(), style="danger")
         kb.adjust(2, 1, 2)
         await callback.message.edit_text(t("choose_amount", lang), reply_markup=kb.as_markup())
@@ -3583,8 +3588,8 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         await callback.message.edit_text(
             t("payment_info", lang, card_number=card_number, card_holder=card_holder, unique_amount=fmt_price(unique_amount, lang, await _currency())),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text=t("send_receipt", lang), callback_data=PaymentCB(action="send_receipt", amount=0).pack())],
-                [InlineKeyboardButton(text=t("back_menu", lang), callback_data=MenuCB(action="main").pack())],
+                [InlineKeyboardButton(style="success", text=t("send_receipt", lang), callback_data=PaymentCB(action="send_receipt", amount=0).pack())],
+                [InlineKeyboardButton(style="danger", text=t("back_menu", lang), callback_data=MenuCB(action="main").pack())],
             ]),
         )
         await callback.answer()
@@ -3619,8 +3624,8 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         await message.answer(
             t("payment_info", lang, card_number=card_number, card_holder=card_holder, unique_amount=fmt_price(unique_amount, lang, await _currency())),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text=t("send_receipt", lang), callback_data=PaymentCB(action="send_receipt", amount=0).pack())],
-                [InlineKeyboardButton(text=t("back_menu", lang), callback_data=MenuCB(action="main").pack())],
+                [InlineKeyboardButton(style="success", text=t("send_receipt", lang), callback_data=PaymentCB(action="send_receipt", amount=0).pack())],
+                [InlineKeyboardButton(style="danger", text=t("back_menu", lang), callback_data=MenuCB(action="main").pack())],
             ]),
         )
 
@@ -3638,15 +3643,42 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
     async def ms_receipt(message: Message, state: FSMContext, db_user: dict):
         lang = _lang(db_user)
         data = await state.get_data()
-        await state.clear()
         original_amount = data.get("original_amount", 0)
         unique_amount = data.get("unique_amount", 0)
-        receipt_text = (message.text or "").strip()
-        payment_id = await db.add_payment(
+
+        receipt_type = ""
+        receipt_file_id = ""
+        receipt_text = ""
+
+        if message.photo:
+            # message.photo is a list of PhotoSize, largest is the last one
+            receipt_type = "photo"
+            receipt_file_id = message.photo[-1].file_id
+            receipt_text = (message.caption or "").strip()
+        elif message.document:
+            receipt_type = "document"
+            receipt_file_id = message.document.file_id
+            receipt_text = (message.caption or "").strip()
+        elif message.text:
+            receipt_type = "text"
+            receipt_text = message.text.strip()
+        else:
+            # Unsupported content (sticker, voice, video note, etc.) — ask again
+            await message.answer(t("receipt_empty", lang), reply_markup=kb_cancel(lang))
+            return
+
+        # Require at least a file or some text
+        if not receipt_file_id and not receipt_text:
+            await message.answer(t("receipt_empty", lang), reply_markup=kb_cancel(lang))
+            return
+
+        await state.clear()
+        await db.add_payment(
             user_tg_id=message.from_user.id,
             amount=original_amount,
             unique_amount=unique_amount,
-            receipt_type="text",
+            receipt_type=receipt_type,
+            receipt_file_id=receipt_file_id,
             receipt_text=receipt_text,
         )
         await message.answer(
@@ -3750,8 +3782,8 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             text += f"\n{t('how_to_use', lang)}"
             kb = InlineKeyboardBuilder()
             kb.button(text=t("how_to_use", lang), callback_data=AccountCB(action="guide", email=email).pack(), style="primary")
-            kb.button(text=t("get_link", lang), callback_data=AccountCB(action="links", email=email).pack())
-            kb.button(text=t("back_menu", lang), callback_data=MenuCB(action="main").pack())
+            kb.button(style="primary", text=t("get_link", lang), callback_data=AccountCB(action="links", email=email).pack())
+            kb.button(style="danger", text=t("back_menu", lang), callback_data=MenuCB(action="main").pack())
             kb.adjust(2, 1)
             await message.answer(text, reply_markup=kb.as_markup(), disable_web_page_preview=True)
 
@@ -3761,7 +3793,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         lang = _lang(db_user)
         kb = InlineKeyboardBuilder()
         kb.button(text=t("new_ticket", lang), callback_data=MenuCB(action="new_ticket").pack(), style="success")
-        kb.button(text=t("my_tickets", lang), callback_data=MenuCB(action="my_tickets").pack())
+        kb.button(style="primary", text=t("my_tickets", lang), callback_data=MenuCB(action="my_tickets").pack())
         kb.button(text=t("back", lang), callback_data=MenuCB(action="main").pack(), style="danger")
         kb.adjust(2, 1)
         await callback.message.edit_text(f"{t('support_title', lang)}\n\n{t('support_desc', lang)}",
@@ -3817,7 +3849,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         kb = InlineKeyboardBuilder()
         for tk in tickets:
             status = "🟢" if tk["status"] == "open" else "🔴"
-            kb.button(text=f"{status} #{tk['id']} - {tk['subject'][:25]}",
+            kb.button(style="primary", text=f"{status} #{tk['id']} - {tk['subject'][:25]}",
                       callback_data=TicketCB(action="view", ticket_id=tk["id"]).pack())
         kb.button(text=t("back", lang), callback_data=MenuCB(action="support").pack(), style="danger")
         kb.adjust(1)
@@ -4200,12 +4232,12 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             await callback.answer("Not found", show_alert=True)
             return
         kb = InlineKeyboardBuilder()
-        kb.button(text="✏️ Alias", callback_data=AdminCB(action="srv_edit_field", data=f"{srv['id']}_alias").pack())
-        kb.button(text="⭐ Priority", callback_data=AdminCB(action="srv_edit_field", data=f"{srv['id']}_priority").pack())
-        kb.button(text="🔢 Capacity", callback_data=AdminCB(action="srv_edit_field", data=f"{srv['id']}_capacity").pack())
-        kb.button(text="🌍 Location", callback_data=AdminCB(action="srv_edit_field", data=f"{srv['id']}_location").pack())
-        kb.button(text="🔗 Sub URI", callback_data=AdminCB(action="srv_edit_field", data=f"{srv['id']}_sub_uri").pack())
-        kb.button(text="🔑 Token", callback_data=AdminCB(action="srv_edit_field", data=f"{srv['id']}_api_token").pack())
+        kb.button(style="primary", text="✏️ Alias", callback_data=AdminCB(action="srv_edit_field", data=f"{srv['id']}_alias").pack())
+        kb.button(style="primary", text="⭐ Priority", callback_data=AdminCB(action="srv_edit_field", data=f"{srv['id']}_priority").pack())
+        kb.button(style="primary", text="🔢 Capacity", callback_data=AdminCB(action="srv_edit_field", data=f"{srv['id']}_capacity").pack())
+        kb.button(style="primary", text="🌍 Location", callback_data=AdminCB(action="srv_edit_field", data=f"{srv['id']}_location").pack())
+        kb.button(style="primary", text="🔗 Sub URI", callback_data=AdminCB(action="srv_edit_field", data=f"{srv['id']}_sub_uri").pack())
+        kb.button(style="primary", text="🔑 Token", callback_data=AdminCB(action="srv_edit_field", data=f"{srv['id']}_api_token").pack())
         toggle = "⚪ Activate" if not srv["is_active"] else "🔴 Disable"
         kb.button(text=toggle, callback_data=ServerCB(action="toggle", server_id=srv["id"]).pack(), style="primary")
         kb.button(text="🔙 Back", callback_data=ServerCB(action="view", server_id=srv["id"]).pack(), style="danger")
@@ -4356,14 +4388,14 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         kb = InlineKeyboardBuilder()
         servers = await db.get_servers(active_only=True)
         for srv in servers:
-            kb.button(text=f"— {escape_html(srv['alias'])} —", callback_data="noop_0")
+            kb.button(style="primary", text=f"— {escape_html(srv['alias'])} —", callback_data="noop_0")
             inbounds = await db.get_inbounds(srv["id"], enabled_only=True)
             for ib in inbounds:
                 key = f"{srv['id']}_{ib['inbound_id']}"
                 mark = "✅" if key in selected else "⬜"
                 proto = ib.get("protocol", "?")
                 remark = ib.get("remark") or f"id{ib['inbound_id']}"
-                kb.button(
+                kb.button(style="primary", 
                     text=f"{mark} {remark} ({proto})",
                     callback_data=InboundCB(action="toggle", key=key, plan_id=plan_id).pack(),
                 )
@@ -4465,7 +4497,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         for field, label in [("name", "📛 Name"), ("description", "📝 Description"),
                              ("traffic_gb", "💾 Traffic (GB)"), ("duration_days", "📅 Duration (days)"),
                              ["price", "💵 Price"], ["limit_ip", "🔢 Max IPs"]]:
-            kb.button(text=label, callback_data=AdminCB(action="plan_edit_field", data=f"{plan['id']}_{field}").pack())
+            kb.button(style="primary", text=label, callback_data=AdminCB(action="plan_edit_field", data=f"{plan['id']}_{field}").pack())
         kb.button(text="🔙 Back", callback_data=PlanCB(action="admin_view", plan_id=plan["id"]).pack(), style="danger")
         kb.adjust(2, 2, 2, 1)
         await callback.message.edit_text("✏️ <b>Edit plan — pick a field</b>", reply_markup=kb.as_markup())
@@ -4543,6 +4575,37 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             await db.set_setting(data["key"], str(val))
             await message.answer(f"✅ {data.get('label','Setting')} = {val}", reply_markup=kb_admin_menu())
 
+        # ---- bot setting (string or JSON list) ----
+        elif edit_type == "setting_str":
+            key = data["key"]
+            label = data.get("label", "Setting")
+            # List-type settings are stored as JSON arrays
+            if key in ("topup_packages", "payment_presets"):
+                try:
+                    vals = [int(x.strip()) for x in raw.split(",") if x.strip()]
+                except ValueError:
+                    await state.clear()
+                    await message.answer("❌ Enter comma-separated numbers (e.g. 5, 10, 20).",
+                                         reply_markup=kb_admin_menu())
+                    return
+                if not vals:
+                    await state.clear()
+                    await message.answer("❌ No values entered.", reply_markup=kb_admin_menu())
+                    return
+                await state.clear()
+                await db.set_setting(key, json.dumps(vals))
+                await message.answer(f"✅ {label} = {vals}", reply_markup=kb_admin_menu())
+            else:
+                # Plain string setting (card number, card holder, help text, ...)
+                val = raw if raw != "-" else ""
+                await state.clear()
+                await db.set_setting(key, val)
+                if key in ("payment_card_number", "payment_card_holder", "api_token"):
+                    shown = "••••" if val else "(empty)"
+                else:
+                    shown = val[:80] + ("…" if len(val) > 80 else "")
+                await message.answer(f"✅ {label} set: {shown}", reply_markup=kb_admin_menu())
+
         # ---- admin extends a user account (days GB) ----
         elif edit_type == "acc_extend":
             parts = raw.split()
@@ -4611,7 +4674,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         text += "</pre>"
         kb = InlineKeyboardBuilder()
         for u in users[:10]:
-            kb.button(text=f"👤 {u['tg_id']} · {(u.get('username') or '-')[:15]}",
+            kb.button(style="primary", text=f"👤 {u['tg_id']} · {(u.get('username') or '-')[:15]}",
                       callback_data=AdminCB(action="user_view", data=str(u["tg_id"])).pack())
         kb.button(text="🔙 Admin", callback_data=AdminCB(action="main").pack(), style="danger")
         kb.adjust(1)
@@ -4654,7 +4717,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         # per-account actions
         for a in accounts[:6]:
             label_acc = a.get("label") or a["email"][:16]
-            kb.button(text=f"⚙️ {label_acc}",
+            kb.button(style="primary", text=f"⚙️ {label_acc}",
                       callback_data=AdminCB(action="user_account", data=f"{tg_id}_{a['email']}").pack())
         kb.button(text="🔙 Search", callback_data=AdminCB(action="users").pack(), style="danger")
         kb.adjust(2, 2, 1, 1, 1)
@@ -4765,7 +4828,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         await state.update_data(tg_id=tg_id)
         kb = InlineKeyboardBuilder()
         for p in plans:
-            kb.button(text=f"{p['name']} — {fmt_price(p['price'], 'en', await _currency())}",
+            kb.button(style="primary", text=f"{p['name']} — {fmt_price(p['price'], 'en', await _currency())}",
                       callback_data=AdminCB(action="create_account_pick", data=f"{tg_id}_{p['id']}").pack())
         kb.button(text="❌ Cancel", callback_data=AdminCB(action="user_view", data=str(tg_id)).pack(), style="danger")
         kb.adjust(1)
@@ -5051,7 +5114,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         await state.set_state(AdminStates.waiting_for_gift_plan)
         kb = InlineKeyboardBuilder()
         for p in plans:
-            kb.button(text=p["name"],
+            kb.button(style="primary", text=p["name"],
                       callback_data=AdminCB(action="gift_plan_pick", data=str(p["id"])).pack())
         kb.button(text="❌ Cancel", callback_data=AdminCB(action="gift_codes").pack(), style="danger")
         kb.adjust(1)
@@ -5209,9 +5272,9 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         kb.button(text="📢 Force Join", callback_data=SettingsCatCB(category="force_join").pack(), style="primary")
         kb.button(text="➕ Topup", callback_data=SettingsCatCB(category="topup").pack(), style="primary")
         kb.button(text="📚 Help Text", callback_data=SettingsCatCB(category="help_text").pack(), style="primary")
-        kb.button(text="💵 Currency", callback_data=AdminCB(action="set_currency").pack())
+        kb.button(style="primary", text="💵 Currency", callback_data=AdminCB(action="set_currency").pack())
         kb.button(text="🔄 Refresh servers", callback_data=AdminCB(action="refresh_servers").pack(), style="primary")
-        kb.button(text="💾 DB Backup", callback_data=AdminCB(action="db_backup").pack())
+        kb.button(style="primary", text="💾 DB Backup", callback_data=AdminCB(action="db_backup").pack())
         kb.button(text="🔙 Admin", callback_data=AdminCB(action="main").pack(), style="danger")
         kb.adjust(2, 2, 2, 2, 2, 1)
         await callback.message.edit_text(text, reply_markup=kb.as_markup())
@@ -5232,10 +5295,10 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             f"└──────────────────────────────┘</pre>"
         )
         kb = InlineKeyboardBuilder()
-        kb.button(text=f"{'✅' if trial_en else '❌'} Toggle Trial", callback_data=AdminCB(action="toggle_trial").pack())
-        kb.button(text="📅 Days", callback_data=AdminCB(action="set_trial_days").pack())
-        kb.button(text="💾 GB", callback_data=AdminCB(action="set_trial_gb").pack())
-        kb.button(text="🔗 Inbounds", callback_data=AdminCB(action="set_trial_inbounds").pack())
+        kb.button(style="primary", text=f"{'✅' if trial_en else '❌'} Toggle Trial", callback_data=AdminCB(action="toggle_trial").pack())
+        kb.button(style="primary", text="📅 Days", callback_data=AdminCB(action="set_trial_days").pack())
+        kb.button(style="primary", text="💾 GB", callback_data=AdminCB(action="set_trial_gb").pack())
+        kb.button(style="primary", text="🔗 Inbounds", callback_data=AdminCB(action="set_trial_inbounds").pack())
         kb.button(text="🔙 Settings", callback_data=AdminCB(action="settings").pack(), style="danger")
         kb.adjust(2, 2, 1)
         await callback.message.edit_text(text, reply_markup=kb.as_markup())
@@ -5253,8 +5316,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             f"└──────────────────────────────┘</pre>"
         )
         kb = InlineKeyboardBuilder()
-        kb.button(text="🎁 Bonus Days", callback_data=AdminCB(action="set_ref_days").pack())
-        kb.button(text="🎁 Bonus GB", callback_data=AdminCB(action="set_ref_gb").pack())
+        kb.button(style="success", text="🎁 Bonus Days", callback_data=AdminCB(action="set_ref_days").pack())
+        kb.button(style="success", text="🎁 Bonus GB", callback_data=AdminCB(action="set_ref_gb").pack())
         kb.button(text="🔙 Settings", callback_data=AdminCB(action="settings").pack(), style="danger")
         kb.adjust(2, 1)
         await callback.message.edit_text(text, reply_markup=kb.as_markup())
@@ -5276,11 +5339,11 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             f"└──────────────────────────────┘</pre>"
         )
         kb = InlineKeyboardBuilder()
-        kb.button(text=f"{'✅' if pay_en else '❌'} Toggle", callback_data=AdminCB(action="toggle_payment").pack())
-        kb.button(text="💳 Card Number", callback_data=AdminCB(action="set_card_number").pack())
-        kb.button(text="👤 Card Holder", callback_data=AdminCB(action="set_card_holder").pack())
-        kb.button(text="🔢 Min Amount", callback_data=AdminCB(action="set_payment_min").pack())
-        kb.button(text="📋 Presets", callback_data=AdminCB(action="set_payment_presets").pack())
+        kb.button(style="primary", text=f"{'✅' if pay_en else '❌'} Toggle", callback_data=AdminCB(action="toggle_payment").pack())
+        kb.button(style="primary", text="💳 Card Number", callback_data=AdminCB(action="set_card_number").pack())
+        kb.button(style="primary", text="👤 Card Holder", callback_data=AdminCB(action="set_card_holder").pack())
+        kb.button(style="primary", text="🔢 Min Amount", callback_data=AdminCB(action="set_payment_min").pack())
+        kb.button(style="primary", text="📋 Presets", callback_data=AdminCB(action="set_payment_presets").pack())
         kb.button(text="💰 Pending Payments", callback_data=AdminCB(action="pending_payments").pack(), style="success")
         kb.button(text="🔙 Settings", callback_data=AdminCB(action="settings").pack(), style="danger")
         kb.adjust(2, 2, 2, 1)
@@ -5303,7 +5366,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             for ch in channels:
                 text += f"• {ch.get('title', ch.get('username', 'Unknown'))} ({ch.get('chat_id', '')})\n"
         kb = InlineKeyboardBuilder()
-        kb.button(text=f"{'✅' if fj_en else '❌'} Toggle", callback_data=AdminCB(action="toggle_force_join").pack())
+        kb.button(style="primary", text=f"{'✅' if fj_en else '❌'} Toggle", callback_data=AdminCB(action="toggle_force_join").pack())
         kb.button(text="➕ Add Channel", callback_data=AdminCB(action="add_force_join_channel").pack(), style="success")
         if channels:
             kb.button(text="🗑 Remove Channel", callback_data=AdminCB(action="remove_force_join_channel").pack(), style="danger")
@@ -5324,8 +5387,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             f"└──────────────────────────────┘</pre>"
         )
         kb = InlineKeyboardBuilder()
-        kb.button(text="➕ Price/GB", callback_data=AdminCB(action="set_topup_price").pack())
-        kb.button(text="📦 Packages", callback_data=AdminCB(action="set_topup_packages").pack())
+        kb.button(style="success", text="➕ Price/GB", callback_data=AdminCB(action="set_topup_price").pack())
+        kb.button(style="primary", text="📦 Packages", callback_data=AdminCB(action="set_topup_packages").pack())
         kb.button(text="🔙 Settings", callback_data=AdminCB(action="settings").pack(), style="danger")
         kb.adjust(2, 1)
         await callback.message.edit_text(text, reply_markup=kb.as_markup())
@@ -5341,8 +5404,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             f"<b>🇮🇷 فارسی:</b>\n<i>{escape_html(fa_help[:100])}...</i>"
         )
         kb = InlineKeyboardBuilder()
-        kb.button(text="🇬🇧 Edit English", callback_data=AdminCB(action="edit_help_en").pack())
-        kb.button(text="🇮🇷 Edit فارسی", callback_data=AdminCB(action="edit_help_fa").pack())
+        kb.button(style="primary", text="🇬🇧 Edit English", callback_data=AdminCB(action="edit_help_en").pack())
+        kb.button(style="primary", text="🇮🇷 Edit فارسی", callback_data=AdminCB(action="edit_help_fa").pack())
         kb.button(text="🔙 Settings", callback_data=AdminCB(action="settings").pack(), style="danger")
         kb.adjust(2, 1)
         await callback.message.edit_text(text, reply_markup=kb.as_markup())
@@ -5359,7 +5422,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_set_currency(callback: CallbackQuery):
         kb = InlineKeyboardBuilder()
         kb.button(text="🇮🇷 Toman", callback_data=AdminCB(action="set_currency_val", data="toman").pack(), style="primary")
-        kb.button(text="💵 USD", callback_data=AdminCB(action="set_currency_val", data="usd").pack())
+        kb.button(style="primary", text="💵 USD", callback_data=AdminCB(action="set_currency_val", data="usd").pack())
         kb.button(text="🔙 Back", callback_data=AdminCB(action="settings").pack(), style="danger")
         kb.adjust(2, 1)
         await callback.message.edit_text("💵 <b>Currency</b>", reply_markup=kb.as_markup())
@@ -5437,12 +5500,12 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         kb = InlineKeyboardBuilder()
         servers = await db.get_servers(active_only=True)
         for srv in servers:
-            kb.button(text=f"— {escape_html(srv['alias'])} —", callback_data="noop_0")
+            kb.button(style="primary", text=f"— {escape_html(srv['alias'])} —", callback_data="noop_0")
             inbounds = await db.get_inbounds(srv["id"], enabled_only=True)
             for ib in inbounds:
                 key = f"{srv['id']}_{ib['inbound_id']}"
                 mark = "✅" if key in selected else "⬜"
-                kb.button(text=f"{mark} {ib.get('remark') or ib['inbound_id']} ({ib.get('protocol','?')})",
+                kb.button(style="primary", text=f"{mark} {ib.get('remark') or ib['inbound_id']} ({ib.get('protocol','?')})",
                           callback_data=AdminCB(action="trial_ib_toggle", data=key).pack())
         kb.button(text="💾 Save", callback_data=AdminCB(action="settings").pack(), style="success")
         kb.button(text="⬜ Clear (use all)", callback_data=AdminCB(action="trial_ib_clear").pack(), style="danger")
@@ -5550,7 +5613,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             user = await db.get_user(p["user_tg_id"])
             uname = escape_html(user.get("first_name") or user.get("username") or str(p["user_tg_id"]))
             text += f"• #{p['id']} — {uname}: {fmt_num(p['unique_amount'], 'fa')} تومان\n"
-            kb.button(
+            kb.button(style="primary", 
                 text=f"#{p['id']} {uname[:15]} — {int(p['unique_amount'])}T",
                 callback_data=PaymentCB(action="view", payment_id=p["id"]).pack(),
             )
@@ -5580,18 +5643,22 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         kb = InlineKeyboardBuilder()
         kb.button(text="✅ Approve", callback_data=PaymentCB(action="approve", payment_id=payment["id"]).pack(), style="success")
         kb.button(text="❌ Reject", callback_data=PaymentCB(action="reject_ask", payment_id=payment["id"]).pack(), style="danger")
-        kb.button(text="🔙 Pending", callback_data=AdminCB(action="pending_payments").pack())
+        kb.button(style="danger", text="🔙 Pending", callback_data=AdminCB(action="pending_payments").pack())
         kb.adjust(2, 1)
 
-        # If receipt is a photo, send it
-        if payment.get("receipt_file_id"):
+        # If receipt is a photo/document, send the media with the details as caption
+        file_id = payment.get("receipt_file_id")
+        rtype = (payment.get("receipt_type") or "").lower()
+        if file_id:
             try:
-                await bot.send_photo(
-                    callback.from_user.id,
-                    payment["receipt_file_id"],
-                    caption=text,
-                    reply_markup=kb.as_markup(),
-                )
+                if rtype == "document":
+                    await bot.send_document(
+                        callback.from_user.id, file_id, caption=text, reply_markup=kb.as_markup()
+                    )
+                else:
+                    await bot.send_photo(
+                        callback.from_user.id, file_id, caption=text, reply_markup=kb.as_markup()
+                    )
                 try:
                     await callback.message.delete()
                 except Exception:
@@ -5827,7 +5894,7 @@ async def task_expiry_checker(bot: Bot, db: Database, api: PanelAPI):
                         kb.button(text=t("renew", lang),
                                   callback_data=AccountCB(action="renew", email=acc["email"]).pack(),
                                   style="success")
-                        kb.button(text=t("my_accounts", lang),
+                        kb.button(style="primary", text=t("my_accounts", lang),
                                   callback_data=MenuCB(action="my_accounts").pack())
                         kb.adjust(2)
                         await bot.send_message(
@@ -5857,7 +5924,7 @@ async def task_expiry_checker(bot: Bot, db: Database, api: PanelAPI):
                         kb = InlineKeyboardBuilder()
                         kb.button(text=t("renew", lang),
                                   callback_data=AccountCB(action="renew", email=acc["email"]).pack(), style="success")
-                        kb.button(text=t("buy", lang), callback_data=MenuCB(action="buy").pack())
+                        kb.button(style="success", text=t("buy", lang), callback_data=MenuCB(action="buy").pack())
                         kb.adjust(2)
                         await bot.send_message(
                             acc["user_tg_id"],
@@ -6000,7 +6067,7 @@ async def main():
     api = PanelAPI()
     lb = LoadBalancer(db, api)
 
-    bot = Bot(token=BOT_TOKEN, default=ParseMode.HTML)
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
 
     auth_mw = AuthMiddleware(db, bot)
