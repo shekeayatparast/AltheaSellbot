@@ -69,11 +69,13 @@ import time
 import io
 import re
 import string
-import random
 import secrets
 import uuid
+import signal
+import contextvars
+import contextlib
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional, Dict, List, Tuple, Callable
+from typing import Any, Optional, Dict, List, Tuple, Callable, Iterable, Sequence
 
 import httpx
 import aiosqlite
@@ -86,6 +88,12 @@ from aiogram.types import (
     User as TgUser,
     FSInputFile,
     BufferedInputFile,
+    InputRichMessage,
+    InputRichBlockDivider,
+    InputRichBlockParagraph,
+    InputRichBlockSectionHeading,
+    InputRichBlockTable,
+    RichBlockTableCell,
 )
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.filters.callback_data import CallbackData
@@ -104,6 +112,376 @@ try:
     _HAS_QR = True
 except Exception:  # pragma: no cover
     _HAS_QR = False
+
+# ---------------------------------------------------------------------------
+# Rich Messages table builders — INLINED (was a separate rich_tables.py module).
+#
+# Pure, side-effect-free builders for aiogram 3.30+ / Telegram Bot API 10.2
+# native tables (InputRichMessage + InputRichBlockTable + RichBlockTableCell).
+# Used by show_view() throughout the admin panel to render bordered/striped
+# tables instead of the old ASCII-art <pre> boxes.
+#
+# Why a namespace class instead of a separate module:
+#   The whole bot is delivered as a SINGLE bot.py file (per user request), so
+#   these builders are inlined here. All functions are @staticmethod and
+#   reference siblings via rich_tables.X(...) so existing call sites
+#   (rich_tables.dashboard_rich(...), rich_tables.kv_table(...), …) work
+#   unchanged.
+#
+# NOTE: Telegram Rich Messages CANNOT be edited in place — aiogram 3.30
+# exposes only Message.answer_rich with no edit_rich. So the bot sends them
+# as fresh messages via show_view() (delete + answer_rich).
+#
+# Formatters (fmt_price, fmt_bytes) are injected so the class stays
+# dependency-free and unit-testable.
+# ---------------------------------------------------------------------------
+
+# Type aliases for the injected formatters (kept at module level for clarity).
+PriceFmt = Callable[..., str]
+BytesFmt = Callable[[int], str]
+
+
+class rich_tables:
+    """Inlined Rich Messages table builders (aiogram 3.30+ / Bot API 10.2).
+
+    All methods are @staticmethod and reference siblings via
+    ``rich_tables.X(...)`` so existing call sites keep working unchanged.
+    """
+
+    _ALIGN_OK = {"left", "center", "right", "start", "end"}
+
+    # ------------------------------------------------------------------
+    # low-level cell / block factories
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _align(a: str) -> str:
+        return a if a in rich_tables._ALIGN_OK else "left"
+
+    @staticmethod
+    def hcell(text: str, align: str = "center") -> RichBlockTableCell:
+        """Header cell (bold, centered by default)."""
+        return RichBlockTableCell(align=rich_tables._align(align), valign="middle",
+                                  text="" if text is None else str(text), is_header=True)
+
+    @staticmethod
+    def cell(text, align: str = "left") -> RichBlockTableCell:
+        """Data cell."""
+        return RichBlockTableCell(align=rich_tables._align(align), valign="middle",
+                                  text="" if text is None else str(text))
+
+    @staticmethod
+    def heading(text: str, size: int = 3) -> InputRichBlockSectionHeading:
+        """Section heading block. ``size`` is 1..6 (smaller number = bigger)."""
+        if size not in (1, 2, 3, 4, 5, 6):
+            size = 3
+        return InputRichBlockSectionHeading(text=str(text), size=size)
+
+    @staticmethod
+    def divider() -> InputRichBlockDivider:
+        return InputRichBlockDivider()
+
+    @staticmethod
+    def paragraph(text: str) -> InputRichBlockParagraph:
+        """Paragraph block (plain text). Accepts a plain string."""
+        return InputRichBlockParagraph(text="" if text is None else str(text))
+
+    # ------------------------------------------------------------------
+    # table builders
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def kv_table(pairs: Sequence[Tuple[str, object]],
+                 align_key: str = "left",
+                 align_val: str = "right") -> InputRichBlockTable:
+        """Two-column key/value table with a header row."""
+        cells: List[List[RichBlockTableCell]] = [[rich_tables.hcell("Field", align_key),
+                                                  rich_tables.hcell("Value", align_val)]]
+        for k, v in pairs:
+            cells.append([rich_tables.cell(k, align_key), rich_tables.cell(v, align_val)])
+        return InputRichBlockTable(cells=cells, is_bordered=True, is_striped=True)
+
+    @staticmethod
+    def grid_table(headers: Sequence[str],
+                   rows: Iterable[Sequence[object]],
+                   aligns: Optional[Sequence[str]] = None,
+                   is_striped: bool = True) -> InputRichBlockTable:
+        """N-column table with a header row."""
+        headers = list(headers)
+        n = len(headers)
+        if aligns is None:
+            aligns = ["left"] * n
+        aligns = list(aligns) + ["left"] * (n - len(aligns))
+
+        cells: List[List[RichBlockTableCell]] = [[rich_tables.hcell(headers[i], aligns[i]) for i in range(n)]]
+        for row in rows:
+            row = list(row)
+            cells.append([rich_tables.cell(row[i] if i < len(row) else "", aligns[i]) for i in range(n)])
+        return InputRichBlockTable(cells=cells, is_bordered=True, is_striped=is_striped)
+
+    @staticmethod
+    def rich_message(*blocks, is_rtl: bool = False) -> InputRichMessage:
+        """Assemble an InputRichMessage from the given blocks."""
+        return InputRichMessage(blocks=list(blocks), is_rtl=is_rtl or None)
+
+    # ==================================================================
+    # View-specific builders (one per admin screen)
+    # ==================================================================
+
+    @staticmethod
+    def dashboard_rich(stats: dict, currency: str, top_plans: Optional[list],
+                       fmt: PriceFmt) -> InputRichMessage:
+        blocks: List = [rich_tables.heading("📊 Admin Dashboard")]
+        blocks.append(rich_tables.kv_table([
+            ("Date", datetime.now(TEHRAN_TZ).strftime("%Y-%m-%d")),
+            ("Total Users", stats.get("total_users", 0)),
+            ("Active Accounts", stats.get("active_accounts", 0)),
+            ("Total Accounts", stats.get("total_accounts", 0)),
+            ("Open Tickets", stats.get("open_tickets", 0)),
+            ("Servers Online", stats.get("servers_online", 0)),
+            ("Revenue 30d", fmt(stats.get("revenue_30d", 0), "en", currency)),
+            ("Revenue Today", fmt(stats.get("revenue_today", 0), "en", currency)),
+            ("Revenue All", fmt(stats.get("revenue_all", 0), "en", currency)),
+        ]))
+        if top_plans:
+            blocks.append(rich_tables.divider())
+            blocks.append(rich_tables.heading("🏆 Top Plans (30d)", size=4))
+            blocks.append(rich_tables.grid_table(
+                ["Plan", "#", "Revenue"],
+                [(p.get("name") or "—", p.get("cnt", 0), fmt(p.get("revenue") or 0, "en", currency))
+                 for p in top_plans],
+                aligns=["left", "center", "right"],
+            ))
+        return rich_tables.rich_message(*blocks)
+
+    @staticmethod
+    def finance_rich(rev: dict, currency: str, fmt: PriceFmt) -> InputRichMessage:
+        avg = rev["total_revenue"] / max(rev.get("transaction_count", 1), 1)
+        blocks: List = [rich_tables.heading("💰 Finance (30d)")]
+        blocks.append(rich_tables.kv_table([
+            ("Revenue 30d", fmt(rev.get("total_revenue", 0), "en", currency)),
+            ("Today", fmt(rev.get("today_revenue", 0), "en", currency)),
+            ("All-time", fmt(rev.get("all_time_revenue", 0), "en", currency)),
+            ("Transactions", rev.get("transaction_count", 0)),
+            ("Avg order", fmt(avg, "en", currency)),
+        ]))
+        if rev.get("top_plans"):
+            blocks.append(rich_tables.divider())
+            blocks.append(rich_tables.heading("🏆 Top Plans", size=4))
+            blocks.append(rich_tables.grid_table(
+                ["Plan", "#", "Revenue"],
+                [(p.get("name") or "—", p.get("cnt", 0), fmt(p.get("revenue") or 0, "en", currency))
+                 for p in rev["top_plans"]],
+                aligns=["left", "center", "right"],
+            ))
+        return rich_tables.rich_message(*blocks)
+
+    @staticmethod
+    def server_health_rich(server: dict, online_count: int, fmt_b: BytesFmt) -> InputRichMessage:
+        is_active = server.get("is_active", False)
+        is_healthy = server.get("is_healthy", False)
+        if not is_active:
+            status = "⚪ Disabled"
+        elif is_healthy:
+            status = "🟢 Healthy"
+        else:
+            status = "🔴 Unhealthy"
+        cap = server.get("capacity", 0)
+        cap_s = f"{server.get('total_clients', 0)}/{cap}" if cap > 0 else f"{server.get('total_clients', 0)}/∞"
+        pairs = [
+            ("Alias", server.get("alias", "")),
+            ("Status", status),
+            ("URL", server.get("panel_url", "")),
+            ("Location", server.get("location") or "-"),
+            ("Priority", server.get("priority", 10)),
+            ("Clients", cap_s),
+            ("Online", online_count),
+            ("Traffic", fmt_b(server.get("total_traffic", 0))),
+        ]
+        if server.get("last_check"):
+            pairs.append(("Last check", fmt_iso(server["last_check"], "%Y-%m-%d %H:%M:%S")))
+        if server.get("last_error"):
+            pairs.append(("Last error", str(server["last_error"])[:60]))
+        return rich_tables.rich_message(rich_tables.heading(f"🖥 Server: {server.get('alias','')}"),
+                                        rich_tables.kv_table(pairs))
+
+    @staticmethod
+    def server_summary_rich(alias: str, summary: dict, total: int, online_count: int) -> InputRichMessage:
+        return rich_tables.rich_message(
+            rich_tables.heading(f"📊 {alias}"),
+            rich_tables.kv_table([
+                ("Total", total),
+                ("Active", summary.get("active", 0)),
+                ("Online", online_count),
+                ("Depleted", len(summary.get("depleted", []))),
+                ("Expiring", len(summary.get("expiring", []))),
+                ("Deactive", len(summary.get("deactive", []))),
+            ]),
+        )
+
+    @staticmethod
+    def server_clients_rich(alias: str, items: list) -> InputRichMessage:
+        rows = []
+        for it in items[:10]:
+            em = (it.get("email") or "—")
+            st = "Active" if it.get("enable") else "Off"
+            ex = rich_tables._short_ts(it.get("expiryTime", 0))
+            rows.append((em, st, ex))
+        return rich_tables.rich_message(
+            rich_tables.heading(f"📋 Clients — {alias}", size=4),
+            rich_tables.grid_table(["Email", "Status", "Expiry"], rows,
+                                   aligns=["left", "center", "center"]),
+        )
+
+    @staticmethod
+    def inbounds_rich(alias: str, inbounds: list) -> InputRichMessage:
+        rows = [(ib.get("inbound_id", 0), ib.get("protocol", "?"), ib.get("port", ""),
+                 ib.get("remark") or "") for ib in inbounds]
+        return rich_tables.rich_message(
+            rich_tables.heading(f"📡 Inbounds — {alias}"),
+            rich_tables.grid_table(["ID", "Proto", "Port", "Remark"], rows,
+                                   aligns=["center", "center", "center", "left"]),
+        )
+
+    @staticmethod
+    def user_search_rich(users: list, currency: str, fmt: PriceFmt) -> InputRichMessage:
+        rows = [(u["tg_id"], (u.get("username") or "-"), fmt(u.get("balance", 0), "en", currency),
+                 u.get("total_orders", 0)) for u in users[:20]]
+        return rich_tables.rich_message(
+            rich_tables.heading(f"👥 Results ({len(users)})"),
+            rich_tables.grid_table(["TG ID", "Username", "Balance", "Orders"], rows,
+                                   aligns=["left", "left", "right", "center"]),
+        )
+
+    @staticmethod
+    def user_detail_rich(user: dict, currency: str, fmt: PriceFmt) -> InputRichMessage:
+        return rich_tables.rich_message(
+            rich_tables.heading("👤 User"),
+            rich_tables.kv_table([
+                ("TG ID", user["tg_id"]),
+                ("Username", (user.get("username") or "-")),
+                ("Balance", fmt(user.get("balance", 0), "en", currency)),
+                ("Orders", user.get("total_orders", 0)),
+                ("Spent", fmt(user.get("total_spent", 0), "en", currency)),
+                ("Banned", "Yes" if user.get("is_banned") else "No"),
+                ("Joined", fmt_iso(user.get("created_at"), "%Y-%m-%d %H:%M:%S")),
+            ]),
+        )
+
+    @staticmethod
+    def promos_rich(promos: list, currency: str, fmt: PriceFmt) -> InputRichMessage:
+        rows = []
+        for p in promos:
+            disc = (f"{p['discount_percent']}%" if p.get("discount_percent", 0) > 0
+                    else fmt(p.get("discount_amount", 0), "en", currency))
+            rows.append((p.get("code", ""), disc, p.get("used_count", 0),
+                         p.get("max_uses") or "∞"))
+        return rich_tables.rich_message(
+            rich_tables.heading("🎫 Promo Codes"),
+            rich_tables.grid_table(["Code", "Discount", "Used", "Max"], rows,
+                                   aligns=["left", "right", "center", "center"]),
+        )
+
+    @staticmethod
+    def gift_codes_rich(gifts: list) -> InputRichMessage:
+        rows = [(g.get("code", ""), g.get("type", ""), (g.get("value") or "")[:12],
+                 "Yes" if g.get("is_used") else "No") for g in gifts[:25]]
+        return rich_tables.rich_message(
+            rich_tables.heading("🎁 Gift Codes"),
+            rich_tables.grid_table(["Code", "Type", "Value", "Used"], rows,
+                                   aligns=["left", "center", "left", "center"]),
+        )
+
+    @staticmethod
+    def settings_overview_rich(cur: str, trial_en: int, pay_en: int, fj_en: int) -> InputRichMessage:
+        return rich_tables.rich_message(
+            rich_tables.heading("⚙️ Settings"),
+            rich_tables.kv_table([
+                ("Currency", cur),
+                ("Trial", "✅" if trial_en else "❌"),
+                ("Payment", "✅" if pay_en else "❌"),
+                ("Force Join", "✅" if fj_en else "❌"),
+            ]),
+        )
+
+    @staticmethod
+    def trial_settings_rich(trial_en: int, trial_days: int, trial_gb: int) -> InputRichMessage:
+        return rich_tables.rich_message(
+            rich_tables.heading("🎉 Trial Settings"),
+            rich_tables.kv_table([
+                ("Enabled", "Yes" if trial_en else "No"),
+                ("Days", trial_days),
+                ("GB", trial_gb),
+            ]),
+        )
+
+    @staticmethod
+    def referral_settings_rich(ref_en: int, ref_days: int, ref_gb: int) -> InputRichMessage:
+        return rich_tables.rich_message(
+            rich_tables.heading("🔗 Referral Settings"),
+            rich_tables.kv_table([
+                ("Enabled", "Yes" if ref_en else "No"),
+                ("Bonus days", ref_days),
+                ("Bonus GB", ref_gb),
+            ]),
+        )
+
+    @staticmethod
+    def payment_settings_rich(pay_en: int, card: str, holder: str, min_amt: int) -> InputRichMessage:
+        return rich_tables.rich_message(
+            rich_tables.heading("💳 Payment Settings"),
+            rich_tables.kv_table([
+                ("Enabled", "Yes" if pay_en else "No"),
+                ("Card", card or "-"),
+                ("Holder", holder or "-"),
+                ("Min amount", min_amt),
+            ]),
+        )
+
+    @staticmethod
+    def force_join_settings_rich(fj_en: int, channels: list) -> InputRichMessage:
+        blocks: List = [
+            rich_tables.heading("📢 Force Join Settings"),
+            rich_tables.kv_table([
+                ("Enabled", "Yes" if fj_en else "No"),
+                ("Channels", len(channels)),
+            ]),
+        ]
+        if channels:
+            rows = [(ch.get("title", ch.get("username", "Unknown")), str(ch.get("chat_id", "")))
+                    for ch in channels]
+            blocks.append(rich_tables.divider())
+            blocks.append(rich_tables.heading("Channels", size=4))
+            blocks.append(rich_tables.grid_table(["Title", "Chat ID"], rows, aligns=["left", "right"]))
+        return rich_tables.rich_message(*blocks)
+
+    @staticmethod
+    def topup_settings_rich(topup_price: int, packages: list) -> InputRichMessage:
+        return rich_tables.rich_message(
+            rich_tables.heading("➕ Topup Settings"),
+            rich_tables.kv_table([
+                ("Price/GB", topup_price),
+                ("Packages", ", ".join(str(p) for p in packages) if packages else "-"),
+            ]),
+        )
+
+    # ------------------------------------------------------------------
+    # small helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _short_ts(ts_ms: int) -> str:
+        """Render a unix-ms timestamp as YYYY-MM-DD in Iran time (or '-' if 0/None)."""
+        if not ts_ms:
+            return "-"
+        try:
+            return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone(TEHRAN_TZ).strftime("%Y-%m-%d")
+        except Exception:
+            return "-"
+
+
+# Rich Messages support is now ALWAYS available (inlined, no external module).
+_HAS_RICH = True
 
 # Load environment variables
 load_dotenv()
@@ -128,12 +506,30 @@ if not ADMIN_IDS:
     print("FATAL: ADMIN_IDS is not set. Please configure the .env file.")
     sys.exit(1)
 
-# Logging
+# Logging — L6: log to BOTH stdout and a rotating file (5 MB x 3 backups by
+# default). The rotating file lets admins inspect prior startup cycles without
+# needing to scrape journald; the stdout handler keeps systemd/docker logs
+# working as before.
+from logging.handlers import RotatingFileHandler
+
+file_handler = RotatingFileHandler(
+    os.getenv("LOG_FILE", "bot.log"),
+    maxBytes=int(os.getenv("LOG_MAX_BYTES", str(5 * 1024 * 1024))),  # 5 MB
+    backupCount=int(os.getenv("LOG_BACKUP_COUNT", "3")),
+    encoding="utf-8",
+)
+file_handler.setFormatter(logging.Formatter(
+    "%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+))
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        file_handler,
+    ],
 )
 logger = logging.getLogger("vpnbot")
 logging.getLogger("aiogram").setLevel(logging.WARNING)
@@ -143,6 +539,45 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 GB = 1073741824            # 1 GB in bytes
 MS_PER_DAY = 86_400_000    # milliseconds per day
 SUPPORTED_LANGS = ("en", "fa")
+# Display timezone — all user/admin-facing timestamps are rendered in Iran
+# Standard Time (UTC+03:30). Storage stays UTC; conversion happens at display.
+TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30), name="IRST")
+
+# ---------------------------------------------------------------------------
+# Tunable constants (L1) — values that may need to be tweaked per deployment
+# without editing the source. Centralised here so they don't get sprinkled
+# through the code as magic numbers.
+# ---------------------------------------------------------------------------
+HTTP_TIMEOUT_SECONDS = 30.0                # httpx default timeout for panel API
+HTTP_CONNECT_TIMEOUT = 10.0                # httpx connect timeout
+TRIAL_DEFAULT_DAYS = 3                     # default trial duration (days)
+TRIAL_DEFAULT_GB = 5                       # default trial traffic (GB)
+TOPUP_DEFAULT_PRICE_PER_GB = 2000          # default top-up price per GB (toman)
+PAYMENT_UNIQUE_SUFFIX_MIN = 1000           # cryptographic 4-digit suffix lower bound
+PAYMENT_UNIQUE_SUFFIX_RANGE = 9000         # cryptographic 4-digit suffix range
+EXPIRY_CHECK_INTERVAL_SECONDS = 3600       # expiry-checker task cadence (1h)
+TRAFFIC_CHECK_INTERVAL_SECONDS = 600       # traffic-alert task cadence (10min)
+SERVER_HEALTH_INTERVAL_SECONDS = 300       # server-health task cadence (5min)
+SYNC_COUNTS_INTERVAL_SECONDS = 1800        # client-count sync cadence (30min)
+DATA_RETENTION_INTERVAL_SECONDS = 86400    # data-retention task cadence (24h)
+BROADCAST_THROTTLE_SECONDS = 0.05          # per-user delay between broadcast sends
+PANEL_API_CONCURRENCY = 5                  # max concurrent panel API calls
+TICKET_MESSAGE_MAX_CHARS = 800             # truncate ticket message body in views
+TICKET_REPLY_MAX_CHARS = 2000              # max length of a ticket reply (caption/text)
+GIFT_CODE_GROUPS = 4                       # gift code: number of "-"-separated groups
+GIFT_CODE_GROUP_LEN = 4                    # gift code: chars per group
+REFERRAL_CODE_LEN = 6                      # length of random suffix in REFxxxxxx
+EMAIL_ENTROPY_BYTES = 8                    # bytes of entropy in gen_email
+DEFAULT_PAYMENT_MIN_AMOUNT = 50000         # default payment minimum amount (toman)
+BROADCAST_MAX_TEXT_CHARS = 4000            # truncate broadcast text (Telegram limit)
+DB_BACKUP_INTERVAL_SECONDS = 86400         # scheduled DB backup cadence (24h)
+
+# Concurrency limiter for panel API calls from background tasks (M15).
+# The bot runs on a 1-core / 1 GB RAM box alongside the 3x-ui panel, so we
+# cannot fire 100 concurrent HTTP requests when iterating servers/accounts.
+# PANEL_API_CONCURRENCY is a safe ceiling that keeps memory predictable while
+# still parallelising.
+PANEL_API_SEMAPHORE = asyncio.Semaphore(PANEL_API_CONCURRENCY)
 FA_DIGITS = "۰۱۲۳۴۵۶۷۸۹"
 
 
@@ -162,7 +597,7 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "back": "🔙 Back",
         "back_menu": "🏠 Main Menu",
         "back_admin": "🔙 Admin Menu",
-        "action_cancelled": "❌ Action cancelled.\n\nReturning to main menu 👇",
+        "action_cancelled": "❌ Action cancelled.\n\nBack to main menu 👇",
         "yes": "Yes",
         "no": "No",
         "loading": "⏳ Please wait...",
@@ -203,7 +638,7 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "no_plans": "😔 No plans available yet. Please check back later or contact support.",
         "your_balance": "💳 Your balance: <b>{balance}</b>",
         "sufficient": "✅ You have enough balance.",
-        "insufficient": "⚠️ Insufficient balance. You need <b>{diff}</b> more.\n\n💡 Use Charge Wallet or redeem a gift code.",
+        "insufficient": "⚠️ Insufficient balance. You need <b>{diff}</b> more.\n\nUse Charge Wallet or redeem a gift code.",
         "ask_account_name": (
             "✏️ <b>Name your account</b>\n\n"
             "Send a friendly name (e.g. <code>phone</code>, <code>laptop</code>) — only letters, numbers, <code>-</code> and <code>_</code>.\n"
@@ -256,19 +691,28 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "topup_success": "✅ <b>Traffic added!</b>\n+{gb} GB added to <code>{email}</code>.",
         # trial
         "trial_disabled": "😔 Free trials are currently disabled.\n\nPlease check back later.",
-        "trial_used": "🎁 <b>Free Trial</b>\n\nYou have already used your free trial.\nEach user is limited to one trial.\n\n🛒 Check out our affordable plans!",
+        "trial_used": "🎁 <b>Free Trial</b>\n\nYou have already used your free trial.\nEach user is limited to one trial — even if the trial account is deleted.\n\n🛒 Check out our affordable plans!",
         "trial_offer": "🎁 <b>Free Trial Offer</b>",
         "get_trial": "✅ Get Free Trial",
         "trial_created": "🎉 <b>Trial account created!</b>",
         "trial_failed": "❌ Failed to create trial: {msg}",
+        "trial_no_renew": "🎁 Trial accounts cannot be renewed or topped up.\nBuy a paid plan to continue.",
         # balance
         "balance_title": "💳 <b>Your Balance</b>",
         "recent_tx": "📋 <b>Recent transactions</b>",
         "topup_hint": "💡 Use Charge Wallet to add balance, or redeem a gift code.",
         # referral
         "referral_title": "🔗 <b>Referral Program</b>",
+        "referral_disabled": "😔 The referral program is currently disabled.",
         "referral_desc": "Invite friends and earn rewards automatically when they buy their first plan!",
+        "referral_how": "📤 <b>How it works</b>\n1️⃣ Share your referral link with friends\n2️⃣ They sign up and buy their first plan\n3️⃣ You instantly get +{days} days and +{gb} GB on your account",
         "your_link": "📤 <b>Your referral link</b>",
+        "share_link": "📤 Share Link",
+        "referral_stats": "📊 <b>Your Stats</b>",
+        "referral_history": "📋 <b>Recent referrals</b>",
+        "referral_no_history": "No referrals yet — share your link to start earning!",
+        "ref_status_bought": "✅ Bought",
+        "ref_status_pending": "⏳ Pending",
         # gift
         "enter_gift": "🎫 <b>Redeem gift code</b>\n\nSend me your code:",
         "gift_invalid": "❌ Invalid gift code. Try again:",
@@ -280,16 +724,37 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "support_desc": "Need help? Open a ticket and our team will assist you.\n\n• 🎫 Create a ticket for any issue\n• ⏱ We usually reply within a few hours\n• 🔒 Your conversation is private",
         "new_ticket": "🎫 New Ticket",
         "my_tickets": "📋 My Tickets",
-        "ask_subject": "🎫 <b>New support ticket</b>\n\nSend a short subject:",
+        "choose_category": "🎫 <b>New support ticket</b>\n\nChoose a category:",
+        "cat_technical": "🔧 Technical",
+        "cat_payment": "💰 Payment",
+        "cat_account": "👤 Account",
+        "cat_other": "📝 Other",
+        "ask_subject": "📝 <b>Category:</b> {category}\n\nNow send a short subject for your ticket:",
         "ask_message": "📝 <b>Subject:</b> {subject}\n\nNow describe your issue in detail:",
-        "ticket_created": "✅ <b>Ticket #{id} created!</b>\n\n📝 Subject: {subject}\n⏱ We will respond as soon as possible.",
+        "ticket_created": "✅ <b>Ticket #{id} created!</b>\n\n📝 Subject: {subject}\n🏷 Category: {category}\n⏱ We will respond as soon as possible.",
         "reply": "💬 Reply",
+        "reopen": "🔓 Reopen",
         "close": "🔒 Close",
-        "ask_reply": "💬 <b>Reply to ticket</b>\n\nType your message:",
+        "ask_reply": "💬 <b>Reply to ticket #{id}</b>\n📝 {subject}\n\nType your message:",
+        "ask_reply_with_media": "💬 Send your reply (text or attach a photo/screenshot as evidence):",
+        "manage_user": "👤 Manage User",
+        "view_media": "📎 View Media",
+        "media_photo": "Photo",
+        "media_document": "Document",
+        "media_video": "Video",
+        "media_voice": "Voice",
+        "media_sent": "✅ Media sent.",
         "reply_sent_admin": "✅ Reply sent to user.",
         "reply_sent_user": "✅ Reply sent to admin.",
-        "ticket_closed": "🔒 <b>Ticket #{id} has been closed.</b>\n\nIf you need further help, open a new ticket.",
+        "ticket_closed": "🔒 <b>Ticket #{id} has been closed.</b>\n\nIf you need further help, reopen it or open a new ticket.",
+        "ticket_reopened": "🔓 <b>Ticket #{id} reopened.</b>\n\nOur team will respond shortly.",
         "no_tickets": "📋 <b>My Tickets</b>\n\nYou have no tickets yet.",
+        "ticket_status_open": "🟢 Open",
+        "ticket_status_waiting_admin": "🟡 Waiting for admin",
+        "ticket_status_waiting_user": "🔵 Waiting for you",
+        "ticket_status_closed": "🔴 Closed",
+        "tickets_filter_open": "🟢 Open",
+        "tickets_filter_all": "📋 All",
         # guide
         "guide_title": "📚 <b>VPN Setup Guide</b>",
         # language
@@ -298,6 +763,8 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         # delivery
         "conn_links": "🔗 <b>Connection links</b>",
         "sub_url": "📡 <b>Subscription URL</b> (auto-updates all servers)",
+        "links_sub_only": "📡 <b>Your subscription link</b>\n\nUse this single URL in any V2Ray client (v2rayNG, Streisand, v2rayN, Foxray…) — it auto-syncs all servers and stays up to date.",
+        "qr_sub": "🖼 QR Code",
         "how_to_use": "📱 <b>How to connect</b>",
         # misc
         "help_text": (
@@ -320,7 +787,7 @@ MESSAGES: Dict[str, Dict[str, str]] = {
             "💳 <b>Payment Details</b>\n\n"
             "💳 Card: <code>{card_number}</code>\n"
             "👤 Card holder: {card_holder}\n\n"
-            "💰 <b>Pay EXACTLY this amount:</b> {unique_amount} Toman\n\n"
+            "💰 <b>Pay EXACTLY this amount:</b> {unique_amount} {unit}\n\n"
             "⚠️ The extra digits are for verification. Pay the exact amount shown above.\n\n"
             "After payment, send your receipt (photo or text) using the button below."
         ),
@@ -346,6 +813,26 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "no_inbounds_configured": "❌ This plan has no configured inbounds. Please contact admin.",
         "broadcast_header_en": "📢 <b>Public Announcement</b>\n\n",
         "charge_wallet_btn": "💳 Charge Wallet",
+        # background-task subject lines (M5 — moved out of inline if/else)
+        "expiry_reminder_subject": "Subscription expiring soon!",
+        "account_expired_subject": "Account expired",
+        "traffic_depleted_subject": "Traffic depleted",
+        # admin panel i18n (M11) — most-used admin strings
+        "admin_dashboard": "⚙️ Admin Dashboard",
+        "servers": "Servers",
+        "users": "Users",
+        "tickets": "Tickets",
+        "plans": "Plans",
+        "promos": "Promo Codes",
+        "gift_codes": "Gift Codes",
+        "settings": "Settings",
+        "broadcast": "Broadcast",
+        "cleanup": "Cleanup",
+        "approved": "✅ Approved",
+        "rejected": "❌ Rejected",
+        "toggled": "✅ Toggled",
+        "not_pending": "Not pending.",
+        "already_processed": "⚠️ Already processed by another admin.",
     },
     # ------------------------------------------------------------------ Farsi
     "fa": {
@@ -365,9 +852,9 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "invalid_number": "❌ لطفاً یک عدد معتبر وارد کنید.",
         "copied": "📋 کپی شد.",
         "welcome": (
-            "👋 <b>به ربات {bot_name} خوش آمدید!</b>\n\n"
+            "👋 <b>به ربات VPN خوش آمدید!</b>\n\n"
             "🔐 سرویس VPN پریمیوم با تحویل آنی.\n"
-            "📱 مدیریت اکانت‌ها مستقیماً در تلگرام.\n\n"
+            "📱 مدیریت اکانت‌ها مستقیم از همین تلگرام.\n\n"
             "<b>کارهایی که می‌توانید انجام دهید:</b>\n"
             "• 🛒 خرید اشتراک VPN به‌صورت آنی\n"
             "• 📱 مشاهدهٔ وضعیت اکانت و مصرف حجم\n"
@@ -392,7 +879,7 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "no_plans": "😔 هنوز پلنی تعریف نشده. بعداً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.",
         "your_balance": "💳 موجودی شما: <b>{balance}</b>",
         "sufficient": "✅ موجودی کافی است.",
-        "insufficient": "⚠️ موجودی کافی نیست. <b>{diff}</b> دیگر نیاز دارید.\n\n💡 از شارژ کیف پول استفاده کنید یا کد هدیه بگیرید.",
+        "insufficient": "⚠️ موجودی کافی نیست. <b>{diff}</b> دیگر نیاز دارید.\n\nاز شارژ کیف پول استفاده کنید یا کد هدیه دریافت کنید.",
         "ask_account_name": (
             "✏️ <b>نام اکانت</b>\n\n"
             "یک نام دلخواه بفرستید (مثلاً <code>phone</code> یا <code>laptop</code>) — فقط حروف انگلیسی، عدد، خط تیره و زیرخط.\n"
@@ -440,17 +927,26 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "topup_title": "➕ <b>افزایش حجم</b>\n\nیک بسته انتخاب کنید تا بدون تغییر تاریخ انقضا، حجم اکانت افزایش یابد:",
         "topup_success": "✅ <b>حجم اضافه شد!</b>\n+{gb} GB به <code>{email}</code> اضافه شد.",
         "trial_disabled": "😔 در حال حاضر اکانت رایگان غیرفعال است.\n\nبعداً دوباره تلاش کنید.",
-        "trial_used": "🎁 <b>اکانت رایگان</b>\n\nشما قبلاً اکانت رایگان دریافت کرده‌اید.\nهر کاربر فقط یک‌بار می‌تواند استفاده کند.\n\n🛒 پلن‌های مقرون‌به‌صرفه ما را ببینید!",
+        "trial_used": "🎁 <b>اکانت رایگان</b>\n\nشما قبلاً اکانت رایگان دریافت کرده‌اید.\nهر کاربر فقط یک‌بار می‌تواند استفاده کند — حتی اگر اکانت تریال حذف شده باشد.\n\n🛒 پلن‌های مقرون‌به‌صرفه ما را ببینید!",
         "trial_offer": "🎁 <b>پیشنهاد اکانت رایگان</b>",
         "get_trial": "✅ دریافت اکانت رایگان",
         "trial_created": "🎉 <b>اکانت آزمایشی ساخته شد!</b>",
         "trial_failed": "❌ ساخت اکانت آزمایشی ناموفق بود: {msg}",
+        "trial_no_renew": "🎁 اکانت‌های آزمایشی قابل تمدید یا افزایش حجم نیستند.\nبرای ادامه، یک پلن خریداری کنید.",
         "balance_title": "💳 <b>موجودی شما</b>",
         "recent_tx": "📋 <b>تراکنش‌های اخیر</b>",
         "topup_hint": "💡 از شارژ کیف پول برای افزایش موجودی استفاده کنید یا کد هدیه دریافت کنید.",
         "referral_title": "🔗 <b>برنامهٔ دعوت دوستان</b>",
+        "referral_disabled": "😔 برنامهٔ دعوت دوستان در حال حاضر غیرفعال است.",
         "referral_desc": "دوستان خود را دعوت کنید و با اولین خریدشان، به‌طور خودکار پاداش بگیرید!",
+        "referral_how": "📤 <b>نحوهٔ کار</b>\n۱️⃣ لینک دعوت خود را برای دوستان بفرستید\n۲️⃣ آن‌ها ثبت‌نام می‌کنند و اولین پلن را می‌خرند\n۳️⃣ شما فوراً +{days} روز و +{gb} گیگابایت روی اکانت خود دریافت می‌کنید",
         "your_link": "📤 <b>لینک دعوت شما</b>",
+        "share_link": "📤 اشتراک‌گذاری",
+        "referral_stats": "📊 <b>آمار شما</b>",
+        "referral_history": "📋 <b>دعوت‌های اخیر</b>",
+        "referral_no_history": "هنوز دعوتی ندارید — لینک خود را اشتراک بگذارید تا پاداش بگیرید!",
+        "ref_status_bought": "✅ خرید کرده",
+        "ref_status_pending": "⏳ در انتظار",
         "enter_gift": "🎫 <b>کد هدیه</b>\n\nکد خود را بفرستید:",
         "gift_invalid": "❌ کد هدیه نامعتبر است. دوباره تلاش کنید:",
         "gift_used_code": "❌ این کد قبلاً استفاده شده است.",
@@ -460,21 +956,44 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "support_desc": "نیاز به کمک دارید؟ یک تیکت باز کنید تا تیم ما کمکتان کند.\n\n• 🎫 برای هر مشکلی تیکت بزنید\n• ⏱ معمولاً ظرف چند ساعت پاسخ می‌دهیم\n• 🔒 گفتگو کاملاً محرمانه است",
         "new_ticket": "🎫 تیکت جدید",
         "my_tickets": "📋 تیکت‌های من",
-        "ask_subject": "🎫 <b>تیکت پشتیبانی جدید</b>\n\nموضوع کوتاهی بنویسید:",
+        "choose_category": "🎫 <b>تیکت پشتیبانی جدید</b>\n\nیک دسته‌بندی انتخاب کنید:",
+        "cat_technical": "🔧 فنی",
+        "cat_payment": "💰 پرداخت",
+        "cat_account": "👤 اکانت",
+        "cat_other": "📝 سایر",
+        "ask_subject": "📝 <b>دسته:</b> {category}\n\nحالا یک موضوع کوتاه برای تیکت بنویسید:",
         "ask_message": "📝 <b>موضوع:</b> {subject}\n\nحالا مشکل خود را شرح دهید:",
-        "ticket_created": "✅ <b>تیکت #{id} ساخته شد!</b>\n\n📝 موضوع: {subject}\n⏱ به‌زودی پاسخ می‌دهیم.",
+        "ticket_created": "✅ <b>تیکت #{id} ساخته شد!</b>\n\n📝 موضوع: {subject}\n🏷 دسته: {category}\n⏱ به‌زودی پاسخ می‌دهیم.",
         "reply": "💬 پاسخ",
+        "reopen": "🔓 باز کردن مجدد",
         "close": "🔒 بستن",
-        "ask_reply": "💬 <b>پاسخ به تیکت</b>\n\nپیام خود را بنویسید:",
+        "ask_reply": "💬 <b>پاسخ به تیکت #{id}</b>\n📝 {subject}\n\nپیام خود را بنویسید:",
+        "ask_reply_with_media": "💬 پاسخ خود را بفرستید (متن یا عکس/اسکرین‌شات به‌عنوان مدرک پیوست کنید):",
+        "manage_user": "👤 مدیریت کاربر",
+        "view_media": "📎 مشاهده رسانه",
+        "media_photo": "عکس",
+        "media_document": "فایل",
+        "media_video": "ویدیو",
+        "media_voice": "پیام صوتی",
+        "media_sent": "✅ رسانه ارسال شد.",
         "reply_sent_admin": "✅ پاسخ به کاربر ارسال شد.",
         "reply_sent_user": "✅ پاسخ به مدیریت ارسال شد.",
-        "ticket_closed": "🔒 <b>تیکت #{id} بسته شد.</b>\n\nاگر کمک بیشتری نیاز دارید، تیکت جدیدی باز کنید.",
+        "ticket_closed": "🔒 <b>تیکت #{id} بسته شد.</b>\n\nاگر کمک بیشتری نیاز دارید، دوباره بازش کنید یا تیکت جدیدی بزنید.",
+        "ticket_reopened": "🔓 <b>تیکت #{id} دوباره باز شد.</b>\n\nبه‌زودی پاسخ می‌دهیم.",
         "no_tickets": "📋 <b>تیکت‌های من</b>\n\nهنوز تیکتی ندارید.",
+        "ticket_status_open": "🟢 باز",
+        "ticket_status_waiting_admin": "🟡 در انتظار پاسخ مدیریت",
+        "ticket_status_waiting_user": "🔵 در انتظار پاسخ شما",
+        "ticket_status_closed": "🔴 بسته شده",
+        "tickets_filter_open": "🟢 باز",
+        "tickets_filter_all": "📋 همه",
         "guide_title": "📚 <b>راهنمای راه‌اندازی VPN</b>",
         "lang_title": "🌐 <b>Language / زبان</b>\n\nزبان خود را انتخاب کنید:",
         "lang_set": "✅ زبان به فارسی تغییر یافت.",
         "conn_links": "🔗 <b>لینک‌های اتصال</b>",
         "sub_url": "📡 <b>لینک سابسکریپشن</b> (همهٔ سرورها را خودکار به‌روز می‌کند)",
+        "links_sub_only": "📡 <b>لینک سابسکریپشن شما</b>\n\nاز همین یک لینک در هر کلاینت V2Ray (v2rayNG، Streisand، v2rayN، Foxray…) استفاده کنید — همهٔ سرورها را خودکار همگام و همیشه به‌روز نگه می‌دارد.",
+        "qr_sub": "🖼 بارکد QR",
         "how_to_use": "📱 <b>نحوهٔ اتصال</b>",
         "help_text": (
             "ℹ️ <b>راهنما</b>\n\n"
@@ -496,7 +1015,7 @@ MESSAGES: Dict[str, Dict[str, str]] = {
             "💳 <b>اطلاعات پرداخت</b>\n\n"
             "💳 شماره کارت: <code>{card_number}</code>\n"
             "👤 صاحب کارت: {card_holder}\n\n"
-            "💰 <b>دقیقاً این مبلغ را پرداخت کنید:</b> {unique_amount} تومان\n\n"
+            "💰 <b>دقیقاً این مبلغ را پرداخت کنید:</b> {unique_amount} {unit}\n\n"
             "⚠️ ارقام مازاد برای تأیید تراکنش هستند. دقیقاً همین مبلغ را پرداخت کنید.\n\n"
             "پس از پرداخت، رسید خود (عکس یا متن) را با دکمهٔ زیر بفرستید."
         ),
@@ -522,6 +1041,26 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "no_inbounds_configured": "❌ این پلن اینباند تنظیم‌شده ندارد. با مدیریت تماس بگیرید.",
         "broadcast_header_fa": "📢 <b>اطلاعیه همگانی</b>\n\n",
         "charge_wallet_btn": "💳 شارژ کیف پول",
+        # background-task subject lines (M5 — moved out of inline if/else)
+        "expiry_reminder_subject": "اشتراک شما به‌زودی منقضی می‌شود!",
+        "account_expired_subject": "اکانت منقضی شد",
+        "traffic_depleted_subject": "حجم تمام شد",
+        # admin panel i18n (M11) — most-used admin strings
+        "admin_dashboard": "⚙️ داشبورد مدیریت",
+        "servers": "سرورها",
+        "users": "کاربران",
+        "tickets": "تیکت‌ها",
+        "plans": "پلن‌ها",
+        "promos": "کدهای تخفیف",
+        "gift_codes": "کدهای هدیه",
+        "settings": "تنظیمات",
+        "broadcast": "اطلاعیه همگانی",
+        "cleanup": "پاک‌سازی",
+        "approved": "✅ تأیید شد",
+        "rejected": "❌ رد شد",
+        "toggled": "✅ تغییر کرد",
+        "not_pending": "در انتظار نیست.",
+        "already_processed": "⚠️ قبلاً توسط مدیریت دیگری پردازش شده است.",
     },
 }
 
@@ -571,6 +1110,20 @@ def fmt_price(amount, lang: str = "en", currency: str = "toman") -> str:
     return f"${s}"
 
 
+def payment_unit_str(currency: str, lang: str) -> str:
+    """Localised currency-unit word for the ``{unit}`` placeholder in
+    ``payment_info`` (L8).
+
+    Kept separate from :func:`fmt_price` because the ``payment_info`` template
+    splits the amount and the unit into two placeholders — so the amount is
+    rendered via :func:`fmt_num` (no unit) and the unit is rendered via this
+    helper. This avoids the pre-L8 bug where ``fmt_price`` already appended
+    "Toman" / "تومان" and the template then appended *another* "Toman"."""
+    if currency == "usd":
+        return "دلار" if lang == "fa" else "USD"
+    return "تومان" if lang == "fa" else "Toman"
+
+
 def L(lang: str) -> str:
     """Normalise a language code to one we support."""
     return lang if lang in SUPPORTED_LANGS else DEFAULT_LANGUAGE
@@ -591,18 +1144,65 @@ class Database:
     async def connect(self):
         self._db = await aiosqlite.connect(self.db_path)
         self._db.row_factory = aiosqlite.Row
+        # ---- Tuning for low-RAM single-core host (1GB RAM, 1 vCPU) ----
+        # WAL = concurrent readers + 1 writer, fewer lock conflicts.
+        # cache_size negative = KB; 2048 KB ≈ 2 MB page-cache (small but enough).
+        # synchronous=NORMAL is safe under WAL and dramatically faster than FULL.
+        # temp_store=MEMORY keeps temporary tables/indexes out of disk.
+        # mmap_size=0 disables memory-mapped I/O (avoids RSS bloat on low RAM).
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA foreign_keys=ON")
+        await self._db.execute("PRAGMA synchronous=NORMAL")
+        await self._db.execute("PRAGMA cache_size=-2048")
+        await self._db.execute("PRAGMA temp_store=MEMORY")
+        await self._db.execute("PRAGMA mmap_size=0")
         await self._create_tables()
         await self._migrate()
         await self._seed_settings()
-        await self._db.commit()
+        await self._auto_commit()
         logger.info("Database initialised")
 
     async def disconnect(self):
         if self._db:
             await self._db.close()
             logger.info("Database connection closed")
+
+    # ---- Transaction context manager (C7/H10) ----
+    # Allows multi-step writes to be wrapped in BEGIN IMMEDIATE / COMMIT,
+    # so a crash mid-flow can't leave partial state. Use:
+    #     async with db.transaction():
+    #         await db.add_account(...)
+    #         await db.update_user_balance(...)
+    # All db.* methods inside auto-detect the active transaction and skip
+    # their own commit() — see `_auto_commit()`.
+    _TXN: contextvars.ContextVar[bool] = contextvars.ContextVar("_db_txn", default=False)
+
+    @contextlib.asynccontextmanager
+    async def transaction(self):
+        """BEGIN IMMEDIATE ... COMMIT (or ROLLBACK on exception).
+
+        Acquires a write lock up-front so no other writer can interleave.
+        Inner db methods that auto-commit will detect the active transaction
+        and skip their own commit (the context manager commits everything at once).
+        """
+        token = self._TXN.set(True)
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            await self._db.commit()
+        except Exception:
+            try:
+                await self._db.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            self._TXN.reset(token)
+
+    async def _auto_commit(self):
+        """Commit only if NOT inside an explicit transaction()."""
+        if not self._TXN.get():
+            await self._db.commit()
 
     async def _create_tables(self):
         await self._db.executescript("""
@@ -611,7 +1211,7 @@ class Database:
                 username         TEXT,
                 first_name       TEXT,
                 language         TEXT DEFAULT 'fa',
-                balance          REAL DEFAULT 0,
+                balance          REAL DEFAULT 0  CHECK (balance >= 0),
                 is_banned        INTEGER DEFAULT 0,
                 referred_by      INTEGER,
                 referral_code    TEXT UNIQUE,
@@ -730,23 +1330,28 @@ class Database:
             );
 
             CREATE TABLE IF NOT EXISTS tickets (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_tg_id INTEGER NOT NULL,
-                subject    TEXT,
-                status     TEXT DEFAULT 'open',
-                priority   TEXT DEFAULT 'normal',
-                created_at TEXT DEFAULT (datetime('now')),
-                updated_at TEXT,
-                closed_at  TEXT,
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_tg_id   INTEGER NOT NULL,
+                subject      TEXT,
+                category     TEXT DEFAULT 'other',     -- technical|payment|account|other
+                status       TEXT DEFAULT 'open',       -- open|closed
+                last_sender  TEXT DEFAULT 'user',       -- user|admin (for waiting indicator)
+                priority     TEXT DEFAULT 'normal',
+                created_at   TEXT DEFAULT (datetime('now')),
+                updated_at   TEXT,
+                closed_at    TEXT,
                 FOREIGN KEY (user_tg_id) REFERENCES users(tg_id)
             );
 
             CREATE TABLE IF NOT EXISTS ticket_messages (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticket_id  INTEGER NOT NULL,
-                sender     TEXT NOT NULL,        -- user | admin
-                message    TEXT,
-                created_at TEXT DEFAULT (datetime('now')),
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id      INTEGER NOT NULL,
+                sender         TEXT NOT NULL,        -- user | admin
+                message        TEXT,
+                media_type     TEXT,                 -- photo | document | video | voice | None
+                media_file_id  TEXT,                 -- Telegram file_id of the attached media
+                media_caption  TEXT,                 -- original caption (already in message for text-only)
+                created_at     TEXT DEFAULT (datetime('now')),
                 FOREIGN KEY (ticket_id) REFERENCES tickets(id) ON DELETE CASCADE
             );
 
@@ -823,7 +1428,8 @@ class Database:
     async def _migrate(self):
         """Add columns that may not exist on legacy databases."""
         add_cols = {
-            "users": [("referral_rewarded", "INTEGER DEFAULT 0"), ("language_selected", "INTEGER DEFAULT 0")],
+            "users": [("referral_rewarded", "INTEGER DEFAULT 0"), ("language_selected", "INTEGER DEFAULT 0"),
+                      ("trial_used_at", "TEXT")],
             "servers": [
                 ("sub_uri", "TEXT"),
                 ("capacity", "INTEGER DEFAULT 0"),
@@ -833,6 +1439,8 @@ class Database:
             "plans": [("inbound_ids", "TEXT")],
             "accounts": [("label", "TEXT")],
             "transactions": [("admin_id", "INTEGER")],
+            "tickets": [("category", "TEXT DEFAULT 'other'"), ("last_sender", "TEXT DEFAULT 'user'")],
+            "ticket_messages": [("media_type", "TEXT"), ("media_file_id", "TEXT"), ("media_caption", "TEXT")],
         }
         for table, cols in add_cols.items():
             async with self._db.execute(f"PRAGMA table_info({table})") as cur:
@@ -841,6 +1449,49 @@ class Database:
                 if col not in existing:
                     await self._db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
                     logger.info("Migrated: added %s.%s", table, col)
+
+        # ---- Versioned migrations (M8) ----
+        # Each numbered migration is applied in order and recorded. This
+        # replaces ad-hoc ALTER TABLE calls with a traceable schema history.
+        await self._db.execute(
+            "CREATE TABLE IF NOT EXISTS schema_version ("
+            "  version INTEGER PRIMARY KEY,"
+            "  applied_at TEXT DEFAULT (datetime('now'))"
+            ")"
+        )
+        await self._db.commit()
+        async with self._db.execute("SELECT MAX(version) AS v FROM schema_version") as cur:
+            row = await cur.fetchone()
+            current = (row["v"] if row else None) or 0
+
+        migrations = [
+            (1, "schema_v1_baseline", []),
+            (2, "balance_nonnegative", [
+                # C8 — clamp any pre-existing negative balances to 0 so the
+                # CHECK constraint (added on fresh DBs by _create_tables)
+                # won't reject the row. Old installs may have -X from a race.
+                "UPDATE users SET balance = 0 WHERE balance < 0",
+            ]),
+            (3, "tickets_user_index", [
+                # Speed up admin ticket list (which joins users).
+                "CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);",
+            ]),
+            (4, "payments_pending_index", [
+                # Speed up admin "pending payments" view.
+                "CREATE INDEX IF NOT EXISTS idx_payments_pending "
+                "  ON payments(status) WHERE status = 'pending';",
+            ]),
+        ]
+        for ver, name, stmts in migrations:
+            if ver <= current:
+                continue
+            for stmt in stmts:
+                await self._db.execute(stmt)
+            await self._db.execute(
+                "INSERT INTO schema_version (version) VALUES (?)", (ver,)
+            )
+            logger.info("Migrated: applied v%d (%s)", ver, name)
+        await self._db.commit()
 
     async def _seed_settings(self):
         defaults = {
@@ -851,6 +1502,7 @@ class Database:
             "trial_inbounds": "[]",   # JSON list of "server_id_inbound_id"
             "referral_bonus_days": str(int(os.getenv("REFERRAL_BONUS_DAYS", "5"))),
             "referral_bonus_gb": str(int(os.getenv("REFERRAL_BONUS_GB", "2"))),
+            "referral_enabled": "1",   # admin can disable the whole referral program
             "currency": DEFAULT_CURRENCY,
             "default_language": DEFAULT_LANGUAGE,
             "topup_packages": json.dumps([5, 10, 20, 50]),  # GB options
@@ -877,12 +1529,12 @@ class Database:
         if row:
             await self._db.execute(
                 "UPDATE users SET last_activity = ?, username = ?, first_name = ? WHERE tg_id = ?",
-                (datetime.now().isoformat(), username, first_name, tg_id),
+                (datetime.now(timezone.utc).isoformat(), username, first_name, tg_id),
             )
-            await self._db.commit()
+            await self._auto_commit()
             return dict(row)
 
-        ref_code_generated = self._gen_referral_code()
+        ref_code_generated = await self._gen_referral_code()
         referred_by = None
         if ref_code and ref_code != ref_code_generated:
             async with self._db.execute(
@@ -898,15 +1550,36 @@ class Database:
                (tg_id, username, first_name, language, referred_by, referral_code, last_activity)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (tg_id, username, first_name, L(lang), referred_by, ref_code_generated,
-             datetime.now().isoformat()),
+             datetime.now(timezone.utc).isoformat()),
         )
-        await self._db.commit()
+        await self._auto_commit()
         async with self._db.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,)) as cur:
             return dict(await cur.fetchone())
 
-    def _gen_referral_code(self) -> str:
+    async def _gen_referral_code(self) -> str:
+        """Generate a 'REFxxxxxx' code using cryptographic RNG (C6), guaranteed
+        DB-unique (L7).
+
+        ``secrets.choice`` is used instead of ``random.choices`` because
+        referral codes are security-sensitive (they grant bonuses).
+
+        L7 — the legacy generator picked a 6-char suffix with no uniqueness
+        check. ``get_or_create_user`` does not catch ``IntegrityError``, so a
+        collision (5.4 × 36^6 ≈ 1 in 2 billion chance per attempt) would
+        crash the /start handler for that user. We now retry up to 5 times,
+        each time probing the DB for an existing row, and fall back to
+        ``secrets.token_hex(4).upper()`` (still unique by entropy) if every
+        retry collides (astronomically unlikely)."""
         chars = string.ascii_uppercase + string.digits
-        return "REF" + "".join(random.choices(chars, k=6))
+        for _ in range(5):
+            code = "REF" + "".join(secrets.choice(chars) for _ in range(REFERRAL_CODE_LEN))
+            async with self._db.execute(
+                "SELECT 1 FROM users WHERE referral_code = ?", (code,)
+            ) as cur:
+                if not await cur.fetchone():
+                    return code
+        # Extremely unlikely fallback — 4 bytes of hex (8 chars) of entropy.
+        return "REF" + secrets.token_hex(4).upper()
 
     async def get_user(self, tg_id: int) -> Optional[dict]:
         async with self._db.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,)) as cur:
@@ -917,36 +1590,73 @@ class Database:
         await self._db.execute(
             "UPDATE users SET language = ? WHERE tg_id = ?", (L(lang), tg_id)
         )
-        await self._db.commit()
+        await self._auto_commit()
 
-    async def update_user_balance(self, tg_id: int, amount: float, add: bool = True):
+    async def update_user_balance(self, tg_id: int, amount: float, add: bool = True) -> bool:
+        """Atomically adjust balance.
+
+        Returns True on success. For deductions (add=False), the operation is
+        conditional: it only succeeds if the resulting balance would be >= 0,
+        preventing race-condition double-spending (C8).
+        """
         if add:
             await self._db.execute(
                 "UPDATE users SET balance = balance + ? WHERE tg_id = ?", (amount, tg_id)
             )
-        else:
-            await self._db.execute(
-                "UPDATE users SET balance = balance - ? WHERE tg_id = ?", (amount, tg_id)
-            )
-        await self._db.commit()
+            await self._auto_commit()
+            return True
+        # Deduction: conditional to prevent balance going negative (C8).
+        cur = await self._db.execute(
+            "UPDATE users SET balance = balance - ? WHERE tg_id = ? AND balance >= ?",
+            (amount, tg_id, amount),
+        )
+        await self._auto_commit()
+        return cur.rowcount == 1
+
+    async def try_deduct_balance(self, tg_id: int, amount: float) -> bool:
+        """Atomic check-and-deduct. Returns False if balance is insufficient.
+
+        This replaces the dangerous pattern:
+            balance = db_user.get('balance')
+            if balance < price: return
+            await db.update_user_balance(uid, price, add=False)
+        which has a TOCTOU race window between the read and the write.
+        Use this method instead so the check and the deduction are a single
+        atomic SQL operation.
+        """
+        cur = await self._db.execute(
+            "UPDATE users SET balance = balance - ? WHERE tg_id = ? AND balance >= ?",
+            (amount, tg_id, amount),
+        )
+        await self._auto_commit()
+        return cur.rowcount == 1
 
     async def set_user_balance(self, tg_id: int, amount: float):
         await self._db.execute(
             "UPDATE users SET balance = ? WHERE tg_id = ?", (amount, tg_id)
         )
-        await self._db.commit()
+        await self._auto_commit()
 
-    async def mark_referral_rewarded(self, tg_id: int):
-        await self._db.execute(
-            "UPDATE users SET referral_rewarded = 1 WHERE tg_id = ?", (tg_id,)
+    async def mark_referral_rewarded(self, tg_id: int) -> bool:
+        """Atomic claim: marks the user as referral-rewarded.
+
+        Returns True if THIS call actually performed the transition (i.e. the
+        user was previously unrewarded). Returns False if the user was already
+        marked rewarded — this prevents double-reward races (C2): if two
+        concurrent purchases both reach this point, only one wins the row.
+        """
+        cur = await self._db.execute(
+            "UPDATE users SET referral_rewarded = 1 WHERE tg_id = ? AND referral_rewarded = 0",
+            (tg_id,),
         )
-        await self._db.commit()
+        await self._auto_commit()
+        return cur.rowcount == 1
 
     async def ban_user(self, tg_id: int, banned: bool = True):
         await self._db.execute(
             "UPDATE users SET is_banned = ? WHERE tg_id = ?", (1 if banned else 0, tg_id)
         )
-        await self._db.commit()
+        await self._auto_commit()
 
     async def get_all_users(self) -> List[dict]:
         async with self._db.execute("SELECT * FROM users ORDER BY created_at DESC") as cur:
@@ -978,16 +1688,37 @@ class Database:
         async with self._db.execute(sql) as cur:
             return [r["tg_id"] for r in await cur.fetchall()]
 
+    async def get_user_languages_by_ids(self, tg_ids: Iterable[int]) -> Dict[int, str]:
+        """Batch-fetch languages for many users in ONE query (H2 — N+1 fix).
+
+        Returns {tg_id: language_code}. Missing users are omitted from the
+        result; callers should default to DEFAULT_LANGUAGE for them.
+        """
+        ids = list(tg_ids)
+        if not ids:
+            return {}
+        # SQLite parameter limit is typically 999 — chunk if needed.
+        out: Dict[int, str] = {}
+        chunk_size = 500
+        for i in range(0, len(ids), chunk_size):
+            chunk = ids[i:i + chunk_size]
+            placeholders = ",".join("?" * len(chunk))
+            q = f"SELECT tg_id, language FROM users WHERE tg_id IN ({placeholders})"
+            async with self._db.execute(q, chunk) as cur:
+                async for row in cur:
+                    out[row["tg_id"]] = row["language"] or DEFAULT_LANGUAGE
+        return out
+
     async def search_user(self, query: str) -> List[dict]:
         results: List[dict] = []
         seen = set()
         if query.isdigit():
-            async with self._db.execute("SELECT * FROM users WHERE tg_id = ?", (int(query),)) as cur:
+            async with self._db.execute("SELECT * FROM users WHERE tg_id = ? LIMIT 20", (int(query),)) as cur:
                 for r in await cur.fetchall():
                     results.append(dict(r))
                     seen.add(r["tg_id"])
         async with self._db.execute(
-            "SELECT * FROM users WHERE username LIKE ? OR first_name LIKE ?",
+            "SELECT * FROM users WHERE username LIKE ? OR first_name LIKE ? LIMIT 20",
             (f"%{query}%", f"%{query}%"),
         ) as cur:
             for r in await cur.fetchall():
@@ -996,7 +1727,7 @@ class Database:
                     seen.add(r["tg_id"])
         async with self._db.execute(
             """SELECT u.* FROM users u JOIN accounts a ON u.tg_id = a.user_tg_id
-               WHERE a.email LIKE ?""", (f"%{query}%",),
+               WHERE a.email LIKE ? LIMIT 20""", (f"%{query}%",),
         ) as cur:
             for r in await cur.fetchall():
                 if r["tg_id"] not in seen:
@@ -1013,7 +1744,7 @@ class Database:
                VALUES (?, ?, ?, ?, ?, ?)""",
             (alias, panel_url.rstrip("/"), api_token, capacity, priority, location),
         )
-        await self._db.commit()
+        await self._auto_commit()
         return cur.lastrowid
 
     async def get_servers(self, active_only: bool = False) -> List[dict]:
@@ -1029,13 +1760,27 @@ class Database:
             row = await cur.fetchone()
             return dict(row) if row else None
 
+    # Allowlists for safe dynamic UPDATE column names (C5 — SQL-injection
+    # hardening). Any column name outside this list is rejected.
+    _SERVER_FIELDS = {"alias", "panel_url", "api_token", "sub_uri", "capacity",
+                      "priority", "location", "is_active"}
+    _PLAN_FIELDS = {"name", "description", "traffic_gb", "duration_days", "price",
+                    "limit_ip", "inbound_ids", "is_active", "sort_order"}
+    _ACCOUNT_FIELDS = {"label", "plan_id", "traffic_gb", "expiry_time", "limit_ip",
+                       "inbound_ids", "is_active", "is_trial", "server_id"}
+
     async def update_server(self, server_id: int, **kwargs):
+        """Update a server row. Column names are validated against a strict
+        allowlist to prevent SQL injection via crafted callback_data (C5)."""
         if not kwargs:
             return
+        bad = set(kwargs) - self._SERVER_FIELDS
+        if bad:
+            raise ValueError(f"Invalid server field(s): {bad}")
         sets = ", ".join(f"{k} = ?" for k in kwargs)
         vals = list(kwargs.values()) + [server_id]
         await self._db.execute(f"UPDATE servers SET {sets} WHERE id = ?", vals)
-        await self._db.commit()
+        await self._auto_commit()
 
     async def update_server_health(self, server_id: int, healthy: bool,
                                    error: str = "", total_clients: int = 0,
@@ -1043,21 +1788,21 @@ class Database:
         await self._db.execute(
             """UPDATE servers SET is_healthy = ?, last_check = ?, last_error = ?,
                total_clients = ?, total_traffic = ? WHERE id = ?""",
-            (1 if healthy else 0, datetime.now().isoformat(),
+            (1 if healthy else 0, datetime.now(timezone.utc).isoformat(),
              error, total_clients, total_traffic, server_id),
         )
-        await self._db.commit()
+        await self._auto_commit()
 
     async def toggle_server(self, server_id: int, active: bool):
         await self._db.execute(
             "UPDATE servers SET is_active = ? WHERE id = ?",
             (1 if active else 0, server_id),
         )
-        await self._db.commit()
+        await self._auto_commit()
 
     async def delete_server(self, server_id: int):
         await self._db.execute("DELETE FROM servers WHERE id = ?", (server_id,))
-        await self._db.commit()
+        await self._auto_commit()
 
     # ------------------------------------------------------------ inbounds
     async def sync_inbounds(self, server_id: int, inbounds: List[dict]):
@@ -1072,7 +1817,7 @@ class Database:
                  1 if ib.get("enable", True) else 0, ib.get("tag", ""),
                  1 if ib.get("tlsFlowCapable", False) else 0),
             )
-        await self._db.commit()
+        await self._auto_commit()
 
     async def get_inbounds(self, server_id: int, enabled_only: bool = False) -> List[dict]:
         q = "SELECT * FROM inbounds WHERE server_id = ?"
@@ -1094,6 +1839,15 @@ class Database:
     async def add_plan(self, name: str, description: str, traffic_gb: int,
                        duration_days: int, price: float, limit_ip: int = 0,
                        inbound_ids: Optional[List[str]] = None) -> int:
+        """Insert a new plan row.
+
+        ``inbound_ids`` is a list of ``"server_id_inbound_id"`` strings (e.g.
+        ``["1_3", "2_5"]``) which is JSON-encoded into the ``plans.inbound_ids``
+        column. A plan may span multiple servers, so each entry MUST carry its
+        server context — this is the OPPOSITE of ``accounts.inbound_ids`` which
+        stores bare integers because ``accounts.server_id`` already pins the
+        server. See M13 (inbound_ids format standardisation).
+        """
         cur = await self._db.execute(
             """INSERT INTO plans
                (name, description, traffic_gb, duration_days, price, limit_ip, inbound_ids)
@@ -1101,7 +1855,7 @@ class Database:
             (name, description, traffic_gb, duration_days, price, limit_ip,
              json.dumps(inbound_ids or [])),
         )
-        await self._db.commit()
+        await self._auto_commit()
         return cur.lastrowid
 
     async def get_plans(self, active_only: bool = True) -> List[dict]:
@@ -1121,25 +1875,37 @@ class Database:
         await self._db.execute(
             "UPDATE plans SET is_active = ? WHERE id = ?", (1 if active else 0, plan_id)
         )
-        await self._db.commit()
+        await self._auto_commit()
 
     async def delete_plan(self, plan_id: int):
         await self._db.execute("DELETE FROM plans WHERE id = ?", (plan_id,))
-        await self._db.commit()
+        await self._auto_commit()
 
     async def update_plan(self, plan_id: int, **kwargs):
+        """Update a plan row. Column names validated against allowlist (C5)."""
         if not kwargs:
             return
+        bad = set(kwargs) - self._PLAN_FIELDS
+        if bad:
+            raise ValueError(f"Invalid plan field(s): {bad}")
         sets = ", ".join(f"{k} = ?" for k in kwargs)
         vals = list(kwargs.values()) + [plan_id]
         await self._db.execute(f"UPDATE plans SET {sets} WHERE id = ?", vals)
-        await self._db.commit()
+        await self._auto_commit()
 
     # ------------------------------------------------------------ accounts
     async def add_account(self, user_tg_id: int, server_id: int, email: str,
                           sub_id: str, plan_id: Optional[int], traffic_gb: int,
                           expiry_time: int, limit_ip: int, inbound_ids: str,
                           is_trial: bool = False, label: str = "") -> int:
+        """Insert a new account row.
+
+        ``inbound_ids`` MUST be a JSON string of BARE inbound_id integers
+        (e.g. ``'[3, 5]'``) — NOT the ``"server_id_inbound_id"`` strings used
+        by ``plans.inbound_ids``. The server context is already pinned by the
+        ``accounts.server_id`` column, so the server prefix would be redundant.
+        See M13 (inbound_ids format standardisation).
+        """
         cur = await self._db.execute(
             """INSERT INTO accounts
                (user_tg_id, server_id, email, sub_id, label, plan_id, traffic_gb,
@@ -1148,8 +1914,72 @@ class Database:
             (user_tg_id, server_id, email, sub_id, label, plan_id, traffic_gb,
              expiry_time, limit_ip, inbound_ids, 1 if is_trial else 0),
         )
-        await self._db.commit()
+        await self._auto_commit()
         return cur.lastrowid
+
+    async def upsert_user_minimal(self, tg_id: int, username: str = "",
+                                  first_name: str = "") -> None:
+        """Ensure a ``users`` row exists for ``tg_id`` without clobbering an
+        existing row. Used by the panel-client import flow (MIGRATE-1) so an
+        imported account is linked to a user stub immediately; when the real
+        user later runs ``/start``, :meth:`get_or_create_user` finds the row
+        and only refreshes ``username``/``first_name``/``last_activity``.
+
+        A real referral code is generated (NULL would permanently break that
+        user's ability to act as a referrer, since ``get_or_create_user``
+        does not backfill it on an existing row)."""
+        if not tg_id:
+            return
+        async with self._db.execute(
+            "SELECT 1 FROM users WHERE tg_id = ?", (tg_id,)
+        ) as cur:
+            if await cur.fetchone():
+                return
+        ref_code = await self._gen_referral_code()
+        lang = await self.get_setting("default_language", DEFAULT_LANGUAGE)
+        await self._db.execute(
+            """INSERT OR IGNORE INTO users
+               (tg_id, username, first_name, language, referral_code, last_activity)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (tg_id, username, first_name, L(lang), ref_code,
+             datetime.now(timezone.utc).isoformat()),
+        )
+        await self._auto_commit()
+
+    async def upsert_account(self, user_tg_id: int, server_id: int, email: str,
+                             sub_id: str, traffic_gb: int, expiry_time: int,
+                             limit_ip: int, inbound_ids: str,
+                             is_active: bool = True, is_trial: bool = False,
+                             plan_id: Optional[int] = None, label: str = "") -> int:
+        """Idempotent insert-or-update of an account row keyed by ``email``
+        (UNIQUE). Used by the panel-client import flow (MIGRATE-1) so
+        re-importing the same client updates the row instead of crashing
+        with an IntegrityError. Returns the account row id."""
+        await self._db.execute(
+            """INSERT INTO accounts
+               (user_tg_id, server_id, email, sub_id, label, plan_id, traffic_gb,
+                expiry_time, limit_ip, inbound_ids, is_active, is_trial)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(email) DO UPDATE SET
+                 user_tg_id  = excluded.user_tg_id,
+                 server_id   = excluded.server_id,
+                 sub_id      = excluded.sub_id,
+                 traffic_gb  = excluded.traffic_gb,
+                 expiry_time = excluded.expiry_time,
+                 limit_ip    = excluded.limit_ip,
+                 inbound_ids = excluded.inbound_ids,
+                 is_active   = excluded.is_active,
+                 is_trial    = excluded.is_trial""",
+            (user_tg_id, server_id, email, sub_id, label, plan_id, traffic_gb,
+             expiry_time, limit_ip, inbound_ids, 1 if is_active else 0,
+             1 if is_trial else 0),
+        )
+        await self._auto_commit()
+        async with self._db.execute(
+            "SELECT id FROM accounts WHERE email = ?", (email,)
+        ) as cur:
+            row = await cur.fetchone()
+            return row["id"] if row else 0
 
     async def get_account(self, email: str) -> Optional[dict]:
         async with self._db.execute("SELECT * FROM accounts WHERE email = ?", (email,)) as cur:
@@ -1168,24 +1998,28 @@ class Database:
             return [dict(r) for r in await cur.fetchall()]
 
     async def update_account(self, email: str, **kwargs):
+        """Update an account row. Column names validated against allowlist (C5)."""
         if not kwargs:
             return
+        bad = set(kwargs) - self._ACCOUNT_FIELDS
+        if bad:
+            raise ValueError(f"Invalid account field(s): {bad}")
         sets = ", ".join(f"{k} = ?" for k in kwargs)
         vals = list(kwargs.values()) + [email]
         await self._db.execute(f"UPDATE accounts SET {sets} WHERE email = ?", vals)
-        await self._db.commit()
+        await self._auto_commit()
 
     async def delete_account(self, email: str):
         await self._db.execute("DELETE FROM accounts WHERE email = ?", (email,))
-        await self._db.commit()
+        await self._auto_commit()
 
     async def get_all_active_accounts(self) -> List[dict]:
         async with self._db.execute("SELECT * FROM accounts WHERE is_active = 1") as cur:
             return [dict(r) for r in await cur.fetchall()]
 
     async def get_expiring_accounts(self, days: int) -> List[dict]:
-        future = int((datetime.now() + timedelta(days=days)).timestamp() * 1000)
-        now = int(datetime.now().timestamp() * 1000)
+        future = int((datetime.now(timezone.utc) + timedelta(days=days)).timestamp() * 1000)
+        now = int(datetime.now(timezone.utc).timestamp() * 1000)
         async with self._db.execute(
             """SELECT * FROM accounts WHERE is_active = 1
                AND expiry_time > 0 AND expiry_time <= ? AND expiry_time > ?""",
@@ -1194,11 +2028,51 @@ class Database:
             return [dict(r) for r in await cur.fetchall()]
 
     async def has_used_trial(self, tg_id: int) -> bool:
+        """Check if a user has EVER used their free trial.
+
+        We check TWO sources so that deleting the trial account manually
+        does NOT let the user claim another trial:
+          1) users.trial_used_at  — set once, the moment a trial is created.
+          2) accounts WHERE is_trial = 1  — still-existing trial accounts.
+        """
         async with self._db.execute(
             "SELECT COUNT(*) AS cnt FROM accounts WHERE user_tg_id = ? AND is_trial = 1",
             (tg_id,),
         ) as cur:
-            return (await cur.fetchone())["cnt"] > 0
+            if (await cur.fetchone())["cnt"] > 0:
+                return True
+        async with self._db.execute(
+            "SELECT trial_used_at FROM users WHERE tg_id = ?", (tg_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return bool(row and row["trial_used_at"])
+
+    async def mark_trial_used(self, tg_id: int) -> bool:
+        """Permanently record that this user has consumed their free trial.
+
+        Atomic claim: returns True only if THIS call set the timestamp (i.e.
+        the user had NOT consumed a trial before). Returns False if the user
+        already had a trial — prevents double-claim races (C4).
+
+        Callers MUST check the return value: if False, abort trial creation
+        because another concurrent request already claimed it.
+        """
+        cur = await self._db.execute(
+            "UPDATE users SET trial_used_at = ? WHERE tg_id = ? AND trial_used_at IS NULL",
+            (datetime.now(timezone.utc).isoformat(), tg_id),
+        )
+        await self._auto_commit()
+        return cur.rowcount == 1
+
+    async def _unmark_trial_used(self, tg_id: int):
+        """Undo a trial claim. Used by cb_trial_activate as COMPENSATION when
+        a downstream step (panel API, server selection, DB write) fails AFTER
+        mark_trial_used succeeded. Without this, a transient failure would
+        permanently block the user from getting a trial."""
+        await self._db.execute(
+            "UPDATE users SET trial_used_at = NULL WHERE tg_id = ?", (tg_id,)
+        )
+        await self._auto_commit()
 
     # --------------------------------------------------------- transactions
     async def add_transaction(self, user_tg_id: int, amount: float, type_: str,
@@ -1216,7 +2090,7 @@ class Database:
                 "UPDATE users SET total_spent = total_spent + ?, total_orders = total_orders + 1 WHERE tg_id = ?",
                 (amount, user_tg_id),
             )
-        await self._db.commit()
+        await self._auto_commit()
         return cur.lastrowid
 
     async def get_user_transactions(self, tg_id: int, limit: int = 10) -> List[dict]:
@@ -1227,7 +2101,10 @@ class Database:
             return [dict(r) for r in await cur.fetchall()]
 
     async def get_revenue_stats(self, days: int = 30) -> dict:
-        since = (datetime.now() - timedelta(days=days)).isoformat()
+        # transactions.created_at is stored via SQLite datetime('now') which
+        # yields UTC 'YYYY-MM-DD HH:MM:SS'. Compare in that same format so the
+        # string comparison is chronologically correct.
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
         async with self._db.execute(
             """SELECT SUM(amount) AS total, COUNT(*) AS cnt
                FROM transactions
@@ -1236,11 +2113,16 @@ class Database:
         ) as cur:
             row = await cur.fetchone()
 
-        today = datetime.now().strftime("%Y-%m-%d")
+        # "Today" = since start of today in TEHRAN, expressed in UTC to match
+        # the stored format. At Tehran midnight (00:00 +03:30) the UTC clock
+        # reads 20:30 the previous day, so we compute that boundary explicitly.
+        now_tehran = datetime.now(TEHRAN_TZ)
+        start_today_tehran = now_tehran.replace(hour=0, minute=0, second=0, microsecond=0)
+        since_today_utc = start_today_tehran.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         async with self._db.execute(
             """SELECT SUM(amount) AS total FROM transactions
-               WHERE type IN ('purchase','renewal','topup') AND created_at LIKE ?""",
-            (f"{today}%",),
+               WHERE type IN ('purchase','renewal','topup') AND created_at >= ?""",
+            (since_today_utc,),
         ) as cur:
             today_row = await cur.fetchone()
 
@@ -1277,7 +2159,7 @@ class Database:
                VALUES (?, ?, ?, ?, ?)""",
             (code.upper(), discount_percent, discount_amount, max_uses, expires_at),
         )
-        await self._db.commit()
+        await self._auto_commit()
         return cur.lastrowid
 
     async def validate_promo_code(self, code: str) -> Optional[dict]:
@@ -1289,7 +2171,7 @@ class Database:
                 return None
             if row["max_uses"] > 0 and row["used_count"] >= row["max_uses"]:
                 return None
-            if row["expires_at"] and datetime.fromisoformat(row["expires_at"]) < datetime.now():
+            if row["expires_at"] and datetime.fromisoformat(row["expires_at"]) < datetime.now(timezone.utc):
                 return None
             return dict(row)
 
@@ -1297,7 +2179,7 @@ class Database:
         await self._db.execute(
             "UPDATE promo_codes SET used_count = used_count + 1 WHERE code = ?", (code.upper(),)
         )
-        await self._db.commit()
+        await self._auto_commit()
 
     async def get_promo_codes(self) -> List[dict]:
         async with self._db.execute("SELECT * FROM promo_codes ORDER BY created_at DESC") as cur:
@@ -1305,7 +2187,7 @@ class Database:
 
     async def delete_promo_code(self, code_id: int):
         await self._db.execute("DELETE FROM promo_codes WHERE id = ?", (code_id,))
-        await self._db.commit()
+        await self._auto_commit()
 
     # ----------------------------------------------------------- gift codes
     async def create_gift_code(self, code: str, type_: str, value: str,
@@ -1317,7 +2199,7 @@ class Database:
                VALUES (?, ?, ?, ?, ?, ?)""",
             (code.upper(), type_, value, plan_id, created_by, expires_at),
         )
-        await self._db.commit()
+        await self._auto_commit()
         return cur.lastrowid
 
     async def get_gift_code(self, code: str) -> Optional[dict]:
@@ -1325,12 +2207,20 @@ class Database:
             row = await cur.fetchone()
             return dict(row) if row else None
 
-    async def use_gift_code(self, code: str, user_tg_id: int):
-        await self._db.execute(
-            "UPDATE gift_codes SET is_used = 1, used_by = ?, used_at = ? WHERE code = ?",
-            (user_tg_id, datetime.now().isoformat(), code.upper()),
+    async def use_gift_code(self, code: str, user_tg_id: int) -> bool:
+        """Atomic claim: marks a gift code as used.
+
+        Returns True if THIS call claimed the code (it was previously unused).
+        Returns False if the code was already used or doesn't exist — this
+        prevents double-redemption races (C3).
+        """
+        cur = await self._db.execute(
+            "UPDATE gift_codes SET is_used = 1, used_by = ?, used_at = ? "
+            "WHERE code = ? AND is_used = 0",
+            (user_tg_id, datetime.now(timezone.utc).isoformat(), code.upper()),
         )
-        await self._db.commit()
+        await self._auto_commit()
+        return cur.rowcount == 1
 
     async def get_gift_codes(self, unused_only: bool = False) -> List[dict]:
         q = "SELECT * FROM gift_codes"
@@ -1341,22 +2231,29 @@ class Database:
             return [dict(r) for r in await cur.fetchall()]
 
     # -------------------------------------------------------------- tickets
-    async def create_ticket(self, user_tg_id: int, subject: str) -> int:
+    async def create_ticket(self, user_tg_id: int, subject: str, category: str = "other") -> int:
         cur = await self._db.execute(
-            "INSERT INTO tickets (user_tg_id, subject) VALUES (?, ?)", (user_tg_id, subject)
+            "INSERT INTO tickets (user_tg_id, subject, category, last_sender) VALUES (?, ?, ?, 'user')",
+            (user_tg_id, subject, category),
         )
-        await self._db.commit()
+        await self._auto_commit()
         return cur.lastrowid
 
-    async def add_ticket_message(self, ticket_id: int, sender: str, message: str):
+    async def add_ticket_message(self, ticket_id: int, sender: str, message: str,
+                                  media_type: str = "", media_file_id: str = "",
+                                  media_caption: str = ""):
+        """Append a message to a ticket. Supports optional media attachments
+        (photo/document/video/voice) for the ticket-system media feature."""
         await self._db.execute(
-            "INSERT INTO ticket_messages (ticket_id, sender, message) VALUES (?, ?, ?)",
-            (ticket_id, sender, message),
+            "INSERT INTO ticket_messages (ticket_id, sender, message, media_type, media_file_id, media_caption) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (ticket_id, sender, message, media_type, media_file_id, media_caption),
         )
         await self._db.execute(
-            "UPDATE tickets SET updated_at = ? WHERE id = ?", (datetime.now().isoformat(), ticket_id)
+            "UPDATE tickets SET updated_at = ?, last_sender = ?, status = 'open' WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(), sender, ticket_id),
         )
-        await self._db.commit()
+        await self._auto_commit()
 
     async def get_ticket(self, ticket_id: int) -> Optional[dict]:
         async with self._db.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)) as cur:
@@ -1371,22 +2268,37 @@ class Database:
 
     async def get_user_tickets(self, tg_id: int) -> List[dict]:
         async with self._db.execute(
-            "SELECT * FROM tickets WHERE user_tg_id = ? ORDER BY created_at DESC", (tg_id,)
+            "SELECT * FROM tickets WHERE user_tg_id = ? ORDER BY updated_at DESC", (tg_id,)
         ) as cur:
             return [dict(r) for r in await cur.fetchall()]
 
     async def get_open_tickets(self) -> List[dict]:
         async with self._db.execute(
-            "SELECT * FROM tickets WHERE status = 'open' ORDER BY created_at DESC"
+            "SELECT * FROM tickets WHERE status = 'open' ORDER BY updated_at DESC"
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def get_all_tickets(self, limit: int = 100) -> List[dict]:
+        async with self._db.execute(
+            "SELECT * FROM tickets ORDER BY updated_at DESC LIMIT ?", (limit,)
         ) as cur:
             return [dict(r) for r in await cur.fetchall()]
 
     async def close_ticket(self, ticket_id: int):
         await self._db.execute(
-            "UPDATE tickets SET status = 'closed', closed_at = ? WHERE id = ?",
-            (datetime.now().isoformat(), ticket_id),
+            "UPDATE tickets SET status = 'closed', closed_at = ?, last_sender = 'admin' WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(), ticket_id),
         )
-        await self._db.commit()
+        await self._auto_commit()
+
+    async def reopen_ticket(self, ticket_id: int):
+        """Reopen a previously closed ticket (user continues the same issue)."""
+        await self._db.execute(
+            "UPDATE tickets SET status = 'open', closed_at = NULL, last_sender = 'user', "
+            "updated_at = ? WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(), ticket_id),
+        )
+        await self._auto_commit()
 
     async def count_open_tickets(self) -> int:
         async with self._db.execute("SELECT COUNT(*) AS cnt FROM tickets WHERE status = 'open'") as cur:
@@ -1398,7 +2310,7 @@ class Database:
             "INSERT INTO broadcasts (admin_id, message, target) VALUES (?, ?, ?)",
             (admin_id, message, target),
         )
-        await self._db.commit()
+        await self._auto_commit()
         return cur.lastrowid
 
     async def update_broadcast_stats(self, broadcast_id: int, sent: int, failed: int,
@@ -1407,13 +2319,53 @@ class Database:
             "UPDATE broadcasts SET total_sent = ?, total_failed = ?, status = ? WHERE id = ?",
             (sent, failed, status, broadcast_id),
         )
-        await self._db.commit()
+        await self._auto_commit()
 
     async def get_broadcasts(self, limit: int = 10) -> List[dict]:
         async with self._db.execute(
             "SELECT * FROM broadcasts ORDER BY created_at DESC LIMIT ?", (limit,)
         ) as cur:
             return [dict(r) for r in await cur.fetchall()]
+
+    # ----------------------------------------------------- data retention (M9)
+    async def purge_old_data(self) -> Dict[str, int]:
+        """Delete old rows that are no longer needed for day-to-day operation.
+
+        Policy (parameters are passed in via ?, never interpolated):
+          * ticket_messages older than 180 days WHERE the ticket is closed
+          * payments older than 365 days WHERE status != 'pending'
+          * broadcasts older than 90 days
+
+        Returns a dict with the per-table purge counts:
+          ``{"ticket_messages": N, "payments": N, "broadcasts": N}``.
+        """
+        now = datetime.now(timezone.utc)
+        cutoff_msgs = (now - timedelta(days=180)).strftime("%Y-%m-%d %H:%M:%S")
+        cutoff_pay = (now - timedelta(days=365)).strftime("%Y-%m-%d %H:%M:%S")
+        cutoff_bcast = (now - timedelta(days=90)).strftime("%Y-%m-%d %H:%M:%S")
+
+        cur = await self._db.execute(
+            """DELETE FROM ticket_messages
+               WHERE created_at < ?
+                 AND ticket_id IN (SELECT id FROM tickets WHERE status = 'closed')""",
+            (cutoff_msgs,),
+        )
+        n_msgs = cur.rowcount or 0
+
+        cur = await self._db.execute(
+            "DELETE FROM payments WHERE created_at < ? AND status != ?",
+            (cutoff_pay, "pending"),
+        )
+        n_pay = cur.rowcount or 0
+
+        cur = await self._db.execute(
+            "DELETE FROM broadcasts WHERE created_at < ?",
+            (cutoff_bcast,),
+        )
+        n_bcast = cur.rowcount or 0
+
+        await self._auto_commit()
+        return {"ticket_messages": n_msgs, "payments": n_pay, "broadcasts": n_bcast}
 
     # ------------------------------------------------------- alert tracking
     async def has_traffic_alert(self, email: str, threshold: int) -> bool:
@@ -1428,11 +2380,11 @@ class Database:
             "INSERT OR IGNORE INTO traffic_alerts (account_email, threshold) VALUES (?, ?)",
             (email, threshold),
         )
-        await self._db.commit()
+        await self._auto_commit()
 
     async def clear_traffic_alerts(self, email: str):
         await self._db.execute("DELETE FROM traffic_alerts WHERE account_email = ?", (email,))
-        await self._db.commit()
+        await self._auto_commit()
 
     async def has_expiry_reminder(self, email: str, days: int) -> bool:
         async with self._db.execute(
@@ -1446,11 +2398,11 @@ class Database:
             "INSERT OR IGNORE INTO expiry_reminders (account_email, days_before) VALUES (?, ?)",
             (email, days),
         )
-        await self._db.commit()
+        await self._auto_commit()
 
     async def clear_expiry_reminders(self, email: str):
         await self._db.execute("DELETE FROM expiry_reminders WHERE account_email = ?", (email,))
-        await self._db.commit()
+        await self._auto_commit()
 
     # ------------------------------------------------------------- referrals
     async def add_referral_reward(self, referrer_tg_id: int, referred_tg_id: int,
@@ -1461,18 +2413,56 @@ class Database:
                VALUES (?, ?, ?, ?, ?)""",
             (referrer_tg_id, referred_tg_id, account_email, bonus_days, bonus_gb),
         )
-        await self._db.commit()
+        await self._auto_commit()
 
     async def get_referral_stats(self, tg_id: int) -> dict:
+        """Return referral stats for the user.
+
+        total_referrals   — everyone who signed up with this user's code
+        completed         — those who went on to make a paid purchase
+        pending           — signed up but haven't bought yet
+        bonus_days_total  — total bonus days ever earned
+        bonus_gb_total    — total bonus GB ever earned
+        """
+        async with self._db.execute(
+            "SELECT COUNT(*) AS cnt FROM users WHERE referred_by = ?", (tg_id,)
+        ) as cur:
+            total = (await cur.fetchone())["cnt"]
         async with self._db.execute(
             "SELECT COUNT(*) AS cnt FROM referral_rewards WHERE referrer_tg_id = ?", (tg_id,)
         ) as cur:
             completed = (await cur.fetchone())["cnt"]
         async with self._db.execute(
-            "SELECT COUNT(*) AS cnt FROM users WHERE referred_by = ?", (tg_id,)
+            "SELECT COALESCE(SUM(bonus_days),0) AS s FROM referral_rewards WHERE referrer_tg_id = ?",
+            (tg_id,),
         ) as cur:
-            total = (await cur.fetchone())["cnt"]
-        return {"total_referrals": total, "completed_referrals": completed}
+            bonus_days_total = (await cur.fetchone())["s"]
+        async with self._db.execute(
+            "SELECT COALESCE(SUM(bonus_gb),0) AS s FROM referral_rewards WHERE referrer_tg_id = ?",
+            (tg_id,),
+        ) as cur:
+            bonus_gb_total = (await cur.fetchone())["s"]
+        return {
+            "total_referrals": total,
+            "completed_referrals": completed,
+            "pending_referrals": max(0, total - completed),
+            "bonus_days_total": bonus_days_total,
+            "bonus_gb_total": bonus_gb_total,
+        }
+
+    async def get_referral_history(self, tg_id: int, limit: int = 10) -> List[dict]:
+        """Recent referrals: each row has the referred user's tg_id, username,
+        whether they completed a purchase (referral_rewarded=1), and join date."""
+        async with self._db.execute(
+            """SELECT u.tg_id, u.username, u.first_name, u.referral_rewarded, u.created_at,
+                      (SELECT MAX(created_at) FROM transactions
+                         WHERE user_tg_id = u.tg_id AND type IN ('purchase','renewal')) AS purchased_at
+               FROM users u
+               WHERE u.referred_by = ?
+               ORDER BY u.created_at DESC LIMIT ?""",
+            (tg_id, limit),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
 
     # ------------------------------------------------------------- payments
     async def add_payment(self, user_tg_id: int, amount: float, unique_amount: float,
@@ -1487,7 +2477,7 @@ class Database:
             (user_tg_id, amount, unique_amount, card_number, card_holder,
              receipt_type, receipt_file_id, receipt_text),
         )
-        await self._db.commit()
+        await self._auto_commit()
         return cur.lastrowid
 
     async def get_payment(self, payment_id: int) -> Optional[dict]:
@@ -1508,38 +2498,64 @@ class Database:
         ) as cur:
             return [dict(r) for r in await cur.fetchall()]
 
-    async def approve_payment(self, payment_id: int, admin_id: int):
-        await self._db.execute(
-            "UPDATE payments SET status = 'approved', admin_id = ?, reviewed_at = ? WHERE id = ?",
-            (admin_id, datetime.now().isoformat(), payment_id),
-        )
-        await self._db.commit()
+    async def approve_payment(self, payment_id: int, admin_id: int) -> bool:
+        """Atomic approve: only succeeds if the payment is still pending.
 
-    async def reject_payment(self, payment_id: int, admin_id: int, note: str = ""):
-        await self._db.execute(
-            "UPDATE payments SET status = 'rejected', admin_id = ?, admin_note = ?, reviewed_at = ? WHERE id = ?",
-            (admin_id, note, datetime.now().isoformat(), payment_id),
+        Returns True if THIS call performed the transition (pending → approved).
+        Returns False if the payment was already approved/rejected by another
+        admin — prevents double-credit races (C1) when two admins click
+        "Approve" simultaneously.
+        """
+        cur = await self._db.execute(
+            "UPDATE payments SET status = 'approved', admin_id = ?, reviewed_at = ? "
+            "WHERE id = ? AND status = 'pending'",
+            (admin_id, datetime.now(timezone.utc).isoformat(), payment_id),
         )
-        await self._db.commit()
+        await self._auto_commit()
+        return cur.rowcount == 1
+
+    async def reject_payment(self, payment_id: int, admin_id: int, note: str = "") -> bool:
+        """Atomic reject: only succeeds if the payment is still pending."""
+        cur = await self._db.execute(
+            "UPDATE payments SET status = 'rejected', admin_id = ?, admin_note = ?, reviewed_at = ? "
+            "WHERE id = ? AND status = 'pending'",
+            (admin_id, note, datetime.now(timezone.utc).isoformat(), payment_id),
+        )
+        await self._auto_commit()
+        return cur.rowcount == 1
 
     async def update_language_selected(self, tg_id: int, selected: bool = True):
         await self._db.execute(
             "UPDATE users SET language_selected = ? WHERE tg_id = ?",
             (1 if selected else 0, tg_id),
         )
-        await self._db.commit()
+        await self._auto_commit()
 
     # ------------------------------------------------------------- settings
+    # TTL cache for settings — they're read on nearly every request but change
+    # rarely. Caching eliminates a DB roundtrip per read. The cache is
+    # invalidated on `set_setting`. TTL is a safety net in case a set_setting
+    # happens via raw SQL (rare).
+    _SETTINGS_CACHE: Dict[str, Tuple[float, Optional[str]]] = {}
+    _SETTINGS_CACHE_TTL = 60.0  # seconds
+
     async def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        # Check TTL cache first.
+        cached = self._SETTINGS_CACHE.get(key)
+        now = time.time()
+        if cached and (now - cached[0]) < self._SETTINGS_CACHE_TTL:
+            return cached[1] if cached[1] is not None else default
         async with self._db.execute("SELECT value FROM settings WHERE key = ?", (key,)) as cur:
             row = await cur.fetchone()
-            return row["value"] if row else default
+            value = row["value"] if row else None
+        self._SETTINGS_CACHE[key] = (now, value)
+        return value if value is not None else default
 
     async def get_setting_int(self, key: str, default: int = 0) -> int:
         v = await self.get_setting(key)
         try:
             return int(v) if v is not None else default
-        except Exception:
+        except (TypeError, ValueError):
             return default
 
     async def get_setting_json(self, key: str, default: Any = None) -> Any:
@@ -1548,14 +2564,23 @@ class Database:
             return default
         try:
             return json.loads(v)
-        except Exception:
+        except (TypeError, ValueError):
             return default
 
     async def set_setting(self, key: str, value: str):
         await self._db.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value)
         )
-        await self._db.commit()
+        await self._auto_commit()
+        # Invalidate cache for this key.
+        self._SETTINGS_CACHE[key] = (time.time(), value)
+
+    def invalidate_settings_cache(self, key: Optional[str] = None):
+        """Force-clear the settings cache. If `key` is None, clears all."""
+        if key is None:
+            self._SETTINGS_CACHE.clear()
+        else:
+            self._SETTINGS_CACHE.pop(key, None)
 
 
 # ============================================================================
@@ -1566,10 +2591,19 @@ class PanelAPI:
     """Async client for the 3X-UI panel API with multi-panel support."""
 
     def __init__(self):
+        # Resource-constrained tuning: cap the connection pool so a burst of
+        # panel calls can't exhaust file descriptors or RAM on our 1-core/1GB
+        # host. The PANEL_API_SEMAPHORE already bounds concurrency to 5, so
+        # the pool max keepalive is set to match.
         self.client = httpx.AsyncClient(
-            timeout=httpx.Timeout(30.0, connect=10.0),
+            timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS, connect=HTTP_CONNECT_TIMEOUT),
             verify=False,            # panels often use self-signed certs
             follow_redirects=True,
+            limits=httpx.Limits(
+                max_connections=PANEL_API_CONCURRENCY + 2,
+                max_keepalive_connections=PANEL_API_CONCURRENCY,
+                keepalive_expiry=30.0,
+            ),
         )
 
     async def close(self):
@@ -1663,9 +2697,25 @@ class PanelAPI:
         return r.get("obj", []) if r.get("success") else []
 
     async def update_client(self, panel_url: str, token: str, email: str,
-                            client_data: dict) -> dict:
+                            client_data: dict,
+                            inbound_ids: Optional[List[int]] = None) -> dict:
+        """Update a client via ``/clients/update/{email}``.
+
+        Per the 3X-UI API reference, the body must have the SAME shape as
+        ``/clients/add`` — i.e. ``{"client": {...}, "inboundIds": [...]}`` —
+        NOT the bare client object. Sending the bare object makes the panel
+        return ``"client email is required"`` because it looks for
+        ``body.client.email`` and finds nothing.
+
+        ``inbound_ids`` is optional; if omitted, the client's existing inbound
+        memberships are preserved (the panel keeps them when the field is
+        absent from the body).
+        """
+        body: Dict[str, Any] = {"client": client_data}
+        if inbound_ids is not None:
+            body["inboundIds"] = inbound_ids
         return await self._request(
-            "POST", panel_url, token, f"/panel/api/clients/update/{email}", json=client_data
+            "POST", panel_url, token, f"/panel/api/clients/update/{email}", json=body
         )
 
     async def delete_client(self, panel_url: str, token: str, email: str,
@@ -1743,6 +2793,55 @@ class PanelAPI:
             params["filter"] = filter_type
         r = await self._request("GET", panel_url, token, "/panel/api/clients/list/paged", params=params)
         return r.get("obj", {}) if r.get("success") else {}
+
+    async def get_all_clients(self, panel_url: str, token: str,
+                              max_count: int = 2000) -> List[dict]:
+        """Fetch every client on the panel with FULL details (MIGRATE-1).
+
+        Uses ``GET /panel/api/clients/list`` (non-paged) because the paged
+        endpoint ``/clients/list/paged`` returns a SLIM object that does NOT
+        include ``tgId`` — so admins would see "NO ID" for every client even
+        when the panel has tgId set. The non-paged list returns full client
+        objects including ``tgId``, ``email``, ``subId``, ``totalGB``,
+        ``expiryTime``, ``limitIp``, ``inboundIds``, ``enable``.
+
+        Capped at ``max_count`` to protect the low-resource server; 2000 is
+        well above typical sales-bot scale. If the panel is larger, only the
+        first ``max_count`` clients are returned.
+        """
+        r = await self._request("GET", panel_url, token, "/panel/api/clients/list")
+        if not r.get("success"):
+            return []
+        items = r.get("obj", []) or []
+        if not isinstance(items, list):
+            return []
+        return items[:max_count]
+
+    async def set_client_tg_id(self, panel_url: str, token: str,
+                               email: str, tg_id: int) -> dict:
+        """Set the ``tgId`` field on a panel client (MIGRATE-1).
+
+        ``/clients/update/{email}`` expects the FULL client JSON wrapped as
+        ``{"client": {...}, "inboundIds": [...]}`` (same shape as ``add``),
+        so we fetch the current record via :meth:`get_client`, set ``tgId``,
+        and PUT it back. We extract ``inboundIds`` from the fetched record and
+        pass it explicitly so the panel keeps the client attached to the same
+        inbounds — previously we stripped it, which on some panel versions
+        detached the client from all inbounds.
+        """
+        client = await self.get_client(panel_url, token, email)
+        if not client or not isinstance(client, dict):
+            return {"success": False, "msg": "client not found on panel", "obj": None}
+        client = dict(client)
+        # inboundIds is a top-level field on the get response (not inside the
+        # client object); extract it for the update wrapper.
+        inbound_ids = client.pop("inboundIds", None)
+        # Strip DB-metadata fields the panel's Go unmarshaler may reject.
+        for k in ("id", "createdAt", "updatedAt", "traffic"):
+            client.pop(k, None)
+        client["tgId"] = tg_id
+        # Pass inbound_ids back so the panel preserves attachments.
+        return await self.update_client(panel_url, token, email, client, inbound_ids=inbound_ids)
 
     async def attach_client(self, panel_url: str, token: str, email: str,
                             inbound_ids: List[int]) -> dict:
@@ -1980,10 +3079,30 @@ def fmt_days(days: int, lang: str = "en") -> str:
     return to_fa_digits(s) if lang == "fa" else s
 
 
+def fmt_iso(iso_str, fmt: str = "%Y-%m-%d %H:%M") -> str:
+    """Render a stored ISO-8601 timestamp (kept in UTC) in Iran time.
+
+    Handles both forms stored in the DB:
+      * explicit-UTC:  '2026-07-25T22:41:06.123456+00:00'  (Python isoformat)
+      * SQLite default: '2026-07-25 22:41:06'              (datetime('now'), naive UTC)
+    Returns '' for empty input and the raw string (truncated) on parse failure.
+    """
+    if not iso_str:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(iso_str))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(TEHRAN_TZ).strftime(fmt)
+    except Exception:
+        return str(iso_str)[:19]
+
+
 def fmt_ts(ts_ms: int, lang: str = "en") -> str:
     if ts_ms == 0:
         return "∞" if lang == "en" else "نامحدود"
-    dt = datetime.fromtimestamp(ts_ms / 1000)
+    # fromtimestamp with explicit UTC, then convert to Tehran for display.
+    dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone(TEHRAN_TZ)
     s = dt.strftime("%Y-%m-%d %H:%M")
     return to_fa_digits(s) if lang == "fa" else s
 
@@ -1991,7 +3110,7 @@ def fmt_ts(ts_ms: int, lang: str = "en") -> str:
 def fmt_remaining(expiry_ms: int, lang: str = "en") -> str:
     if expiry_ms == 0:
         return "∞" if lang == "en" else "نامحدود"
-    now_ms = int(datetime.now().timestamp() * 1000)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     diff = expiry_ms - now_ms
     if diff <= 0:
         return "Expired" if lang == "en" else "منقضی"
@@ -2022,18 +3141,27 @@ def sanitize_name(name: str) -> Optional[str]:
 
 
 def gen_email(tg_id: int, name: str = "") -> str:
-    """Generate a panel-unique email (used as client ID)."""
-    suffix = secrets.token_hex(4)
-    short_id = str(tg_id)[-6:]
+    """Generate a panel-unique email (used as client ID).
+
+    Uses 64 bits of cryptographic entropy (secrets.token_hex(EMAIL_ENTROPY_BYTES))
+    and does NOT embed the user's Telegram ID, so a screenshot of the email
+    can't leak the user's identity (C6/H12)."""
+    suffix = secrets.token_hex(EMAIL_ENTROPY_BYTES)
     if name:
-        return f"{name}_{short_id}_{suffix}"
-    ts = int(time.time()) % 1000000
-    return f"tg{short_id}_{ts}_{suffix}"
+        return f"{name}_{suffix}"
+    return f"tg_{suffix}"
 
 
 def gen_gift_code() -> str:
+    """Generate a 16-char gift code (4 groups of 4) using cryptographic RNG.
+
+    Uses secrets.choice instead of random.choices (C6) — gift codes grant real
+    balance/plans and must not be predictable."""
     chars = string.ascii_uppercase + string.digits
-    return "-".join("".join(random.choices(chars, k=4)) for _ in range(4))
+    return "-".join(
+        "".join(secrets.choice(chars) for _ in range(GIFT_CODE_GROUP_LEN))
+        for _ in range(GIFT_CODE_GROUPS)
+    )
 
 
 def gen_sub_id() -> str:
@@ -2047,7 +3175,103 @@ def escape_html(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+async def safe_notify(coro, context: str = "notify"):
+    """Await a bot.send_message / send_document / send_photo coroutine and
+    swallow only the *expected* Telegram errors:
+
+      * ``TelegramForbiddenError`` — the user blocked the bot.
+      * ``TelegramBadRequest`` whose message contains "chat not found" or
+        "blocked" — the user deleted the chat or blocked the bot.
+
+    Any other ``TelegramBadRequest`` (e.g. malformed HTML, message too long)
+    is logged as a warning. Any non-Telegram exception is logged with
+    ``exc_info`` so silent swallows never hide real bugs. (M2)
+
+    Use this for out-of-band notifications (ticket replies, payment receipts,
+    expiry reminders, …) where a single blocked user must NOT abort the whole
+    handler or background-task iteration.
+    """
+    try:
+        return await coro
+    except TelegramForbiddenError:
+        # User blocked the bot — expected, swallow silently.
+        pass
+    except TelegramBadRequest as e:
+        msg = str(e).lower()
+        if "chat not found" in msg or "blocked" in msg:
+            # User deleted the chat or blocked the bot — expected.
+            pass
+        else:
+            logger.warning("%s — TelegramBadRequest: %s", context, e)
+    except Exception as e:
+        logger.warning("%s — unexpected error: %s", context, e, exc_info=True)
+
+
+async def _send_ticket_reply_notify(bot: Bot, chat_id: int, notify_text: str,
+                                    media_type: str, media_file_id: str,
+                                    reply_markup: Optional[InlineKeyboardMarkup] = None,
+                                    context: str = "ticket-reply notify"):
+    """Send a ticket-reply notification, optionally carrying the attached media.
+
+    If ``media_type`` is one of ``photo`` / ``document`` / ``video`` / ``voice``
+    and ``media_file_id`` is non-empty, the message is delivered via the matching
+    ``bot.send_*`` method with ``notify_text`` as caption (Telegram allows
+    captions up to 1024 chars). Otherwise a plain ``bot.send_message`` is used.
+
+    All Telegram-side errors are funnelled through :func:`safe_notify` so a
+    blocked admin / user never aborts the surrounding handler. (TICKET-1)
+    """
+    notify_text = notify_text[:1000]  # leave headroom under the 1024 caption cap
+    if media_type == "photo" and media_file_id:
+        coro = bot.send_photo(chat_id, photo=media_file_id, caption=notify_text,
+                              reply_markup=reply_markup)
+    elif media_type == "document" and media_file_id:
+        coro = bot.send_document(chat_id, document=media_file_id, caption=notify_text,
+                                 reply_markup=reply_markup)
+    elif media_type == "video" and media_file_id:
+        coro = bot.send_video(chat_id, video=media_file_id, caption=notify_text,
+                              reply_markup=reply_markup)
+    elif media_type == "voice" and media_file_id:
+        coro = bot.send_voice(chat_id, voice=media_file_id, caption=notify_text,
+                              reply_markup=reply_markup)
+    else:
+        coro = bot.send_message(chat_id, notify_text, reply_markup=reply_markup)
+    await safe_notify(coro, context=context)
+
+
 # ---- Localised account / plan cards ----------------------------------------
+
+def _category_emoji(category: str) -> str:
+    """Small emoji prefix for a ticket category, used in lists."""
+    return {"technical": "🔧", "payment": "💰", "account": "👤", "other": "📝"}.get(category, "📝")
+
+
+def _ticket_status_label(ticket: dict, lang: str) -> str:
+    """Human-readable ticket status with a waiting indicator.
+
+    open + last_sender=user  → 'Waiting for admin' (admin owes a reply)
+    open + last_sender=admin → 'Waiting for user'   (user owes a reply)
+    closed                   → 'Closed'
+    """
+    status = ticket.get("status", "open")
+    if status == "closed":
+        return t("ticket_status_closed", lang)
+    last = ticket.get("last_sender", "user")
+    if last == "user":
+        return t("ticket_status_waiting_admin", lang)
+    return t("ticket_status_waiting_user", lang)
+
+
+def _ticket_status_badge(ticket: dict, lang: str) -> str:
+    """One-emoji badge for a ticket, used in compact lists."""
+    status = ticket.get("status", "open")
+    if status == "closed":
+        return "🔴"
+    last = ticket.get("last_sender", "user")
+    if last == "user":
+        return "🟡"   # waiting for admin
+    return "🔵"       # waiting for user
+
 
 def fmt_account_card(account: dict, lang: str = "en", traffic_data: Optional[dict] = None,
                      server_alias: str = "", plan_name: str = "",
@@ -2098,48 +3322,55 @@ def fmt_plan_card(plan: dict, lang: str = "en", currency: str = "toman") -> str:
     return "\n".join(lines)
 
 
-def fmt_dashboard(stats: dict, lang: str = "en", currency: str = "toman") -> str:
-    """Admin dashboard — English box table for alignment."""
-    today = datetime.now().strftime("%Y-%m-%d")
-    html = "<b>📊 Admin Dashboard</b>\n"
-    html += f"<pre>┌──────────────────────────────┐\n"
-    html += f"│ Date:          {today:<12} │\n"
-    html += f"├──────────────────────────────┤\n"
-    html += f"│ Total Users:   {stats.get('total_users',0):>12} │\n"
-    html += f"│ Active Accts:  {stats.get('active_accounts',0):>12} │\n"
-    html += f"│ Total Accts:   {stats.get('total_accounts',0):>12} │\n"
-    html += f"│ Open Tickets:  {stats.get('open_tickets',0):>12} │\n"
-    html += f"│ Servers Online:{stats.get('servers_online',0):>12} │\n"
-    html += f"├──────────────────────────────┤\n"
-    html += f"│ Revenue 30d:   {fmt_price(stats.get('revenue_30d',0),'en',currency):>18} │\n"
-    html += f"│ Revenue Today: {fmt_price(stats.get('revenue_today',0),'en',currency):>18} │\n"
-    html += f"│ Revenue All:   {fmt_price(stats.get('revenue_all',0),'en',currency):>18} │\n"
-    html += f"└──────────────────────────────┘</pre>"
-    return html
+# (M4 — removed dead code: fmt_dashboard and fmt_server_health were
+#  superseded by rich_tables.dashboard_rich / server_summary_rich and
+#  never called anywhere in the codebase.)
 
 
-def fmt_server_health(server: dict, online_count: int = 0) -> str:
-    status = "🟢 Healthy" if server["is_healthy"] else "🔴 Unhealthy"
-    if not server["is_active"]:
-        status = "⚪ Disabled"
-    cap = server.get("capacity", 0)
-    cap_s = f"{server.get('total_clients',0)}/{cap}" if cap > 0 else f"{server.get('total_clients',0)}/∞"
-    html = f"<b>🖥 Server: {escape_html(server['alias'])}</b>\n"
-    html += f"<pre>┌──────────────────────────────┐\n"
-    html += f"│ Status:   {status:<19} │\n"
-    html += f"│ URL:      {server['panel_url'][:19]:<19} │\n"
-    html += f"│ Location: {escape_html(server.get('location') or '-'):<19} │\n"
-    html += f"│ Priority: {str(server.get('priority',10)):<19} │\n"
-    html += f"│ Clients:  {cap_s:<19} │\n"
-    html += f"│ Online:   {str(online_count):<19} │\n"
-    html += f"│ Traffic:  {fmt_bytes(server.get('total_traffic',0)):<19} │\n"
-    if server.get("last_check"):
-        dt = datetime.fromisoformat(server["last_check"])
-        html += f"│ Check:    {dt.strftime('%Y-%m-%d %H:%M'):<19} │\n"
-    if server.get("last_error"):
-        html += f"│ Error:    {server['last_error'][:19]:<19} │\n"
-    html += f"└──────────────────────────────┘</pre>"
-    return html
+async def show_view(message: Message,
+                    *,
+                    text: Optional[str] = None,
+                    rich: Optional[InputRichMessage] = None,
+                    reply_markup=None) -> Message:
+    """Replace the current chat message with a new view.
+
+    Why this exists
+    ---------------
+    Telegram Rich Messages (tables, headings …) **cannot be edited in place**
+    — aiogram 3.30 exposes only ``Message.answer_rich`` (send new) with no
+    ``edit_rich``.  The admin panel is driven by ``callback.message.edit_text``
+    which edits the existing message in place.  Once a screen sends a rich
+    table, the *next* ``edit_text`` would target a rich message and fail.
+
+    ``show_view`` unifies both worlds:
+
+    * ``rich`` provided  → delete the old message and send a fresh rich message
+      (with the inline keyboard attached).  Returns the new ``Message``.
+    * ``text`` provided  → try ``edit_text`` first (keeps the message id, so
+      multi-step "⏳ … → ✅ done" status updates within one handler keep
+      working).  If that fails — because the current message is a rich message
+      or otherwise uneditable — fall back to delete + send a new text message.
+
+    This lets every admin screen call ``show_view`` uniformly and mix plain
+    text and rich tables freely, while preserving the original edit-in-place
+    UX wherever a rich table is not used.
+    """
+    if rich is not None:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        return await message.answer_rich(rich_message=rich, reply_markup=reply_markup)
+    # Text view: edit in place when possible (best UX, stable message id),
+    # otherwise delete + resend (handles rich→text and already-deleted cases).
+    try:
+        return await message.edit_text(text, reply_markup=reply_markup)
+    except Exception:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        return await message.answer(text, reply_markup=reply_markup)
 
 
 def make_qr_png(data: str) -> Optional[bytes]:
@@ -2201,6 +3432,15 @@ class TicketCB(CallbackData, prefix="ticket"):
     ticket_id: int = 0
 
 
+class TicketMediaCB(CallbackData, prefix="tmedia"):
+    """Dedicated callback for the per-message "View Media" button. Kept separate
+    from :class:`TicketCB` so adding a new field does not break in-flight
+    ``ticket:view:N`` / ``ticket:reply:N`` callbacks already sitting in users'
+    Telegram clients. (TICKET-1 Feature 3)"""
+    ticket_id: int = 0
+    message_id: int = 0
+
+
 class BuyCB(CallbackData, prefix="buy"):
     action: str
     plan_id: int = 0
@@ -2235,6 +3475,35 @@ class ForceJoinCB(CallbackData, prefix="fj"):
 
 class SettingsCatCB(CallbackData, prefix="scat"):
     category: str
+
+
+class NoopCB(CallbackData, prefix="noop"):
+    """Empty callback used for section-header buttons (L5).
+
+    Telegram inline-keyboard buttons MUST carry callback_data, but section
+    headers (e.g. "— Server alias —" rows) are non-interactive labels. The
+    catch-all :func:`cb_noop` handler acknowledges the tap silently so the
+    user does not see a "loading…" spinner. Using a typed CallbackData class
+    rather than the raw ``"noop_0"`` literal keeps the packed prefix stable
+    ("noop") so the existing ``F.data.startswith("noop")`` filter — and any
+    in-flight old callbacks — keep working."""
+    pass
+
+
+class ImportCB(CallbackData, prefix="imp"):
+    """Panel-client import flow (MIGRATE-1). Actions:
+      main      -> server picker (admin menu entry)
+      server    -> paginated client list for one server
+      client    -> single client detail + actions
+      set_tgid  -> enter FSM to assign a Telegram numeric ID to this client
+      do        -> import this single client (must already have tgId)
+      all       -> bulk-import every client on this server that has tgId set
+      page      -> change page in the client list
+    """
+    action: str
+    server_id: int = 0
+    email: str = ""
+    page: int = 1
 
 
 # ============================================================================
@@ -2278,6 +3547,16 @@ def kb_admin_menu(lang: str = "en") -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
+def kb_payment_admin_menu(lang: str = "en") -> InlineKeyboardMarkup:
+    """Limited menu for payment-only admins — just pending payments + back."""
+    kb = InlineKeyboardBuilder()
+    kb.button(style="success", text="💰 Pending Payments",
+              callback_data=AdminCB(action="pending_payments").pack())
+    kb.button(text=t("back_menu", lang), callback_data=MenuCB(action="main").pack(), style="danger")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 def kb_plans(plans: List[dict], lang: str, currency: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for plan in plans:
@@ -2300,10 +3579,12 @@ def kb_plan_view(plan_id: int, lang: str) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def kb_account_details(email: str, is_active: bool, lang: str) -> InlineKeyboardMarkup:
+def kb_account_details(email: str, is_active: bool, lang: str, is_trial: bool = False) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text=t("renew", lang), callback_data=AccountCB(action="renew", email=email).pack(), style="success")
-    kb.button(text=t("topup_traffic", lang), callback_data=AccountCB(action="topup", email=email).pack(), style="primary")
+    # Trial accounts cannot be renewed or topped up (one-shot free account).
+    if not is_trial:
+        kb.button(text=t("renew", lang), callback_data=AccountCB(action="renew", email=email).pack(), style="success")
+        kb.button(text=t("topup_traffic", lang), callback_data=AccountCB(action="topup", email=email).pack(), style="primary")
     kb.button(style="primary", text=t("traffic", lang), callback_data=AccountCB(action="traffic", email=email).pack())
     kb.button(style="primary", text=t("get_link", lang), callback_data=AccountCB(action="links", email=email).pack())
     kb.button(style="primary", text=t("qr", lang), callback_data=AccountCB(action="qr", email=email).pack())
@@ -2314,7 +3595,10 @@ def kb_account_details(email: str, is_active: bool, lang: str) -> InlineKeyboard
         kb.button(text=t("enable", lang), callback_data=AccountCB(action="enable", email=email).pack(), style="success")
     kb.button(text=t("delete", lang), callback_data=AccountCB(action="delete_ask", email=email).pack(), style="danger")
     kb.button(text=t("back", lang), callback_data=MenuCB(action="my_accounts").pack(), style="primary")
-    kb.adjust(2, 2, 2, 2, 1)
+    if is_trial:
+        kb.adjust(2, 2, 2, 1)
+    else:
+        kb.adjust(2, 2, 2, 2, 1)
     return kb.as_markup()
 
 
@@ -2340,6 +3624,7 @@ def kb_servers(servers: List[dict]) -> InlineKeyboardMarkup:
         if not srv["is_active"]:
             status = "⚪"
         kb.button(style="primary", text=f"{status} {srv['alias']}", callback_data=ServerCB(action="view", server_id=srv["id"]).pack())
+    kb.button(text="📥 Import from Panel", callback_data=AdminCB(action="import_main").pack(), style="primary")
     kb.button(text="➕ Add Server", callback_data=ServerCB(action="add").pack(), style="success")
     kb.button(text="🔄 Sync All", callback_data=ServerCB(action="sync_all").pack(), style="primary")
     kb.button(text="🔙 Admin", callback_data=AdminCB(action="main").pack(), style="danger")
@@ -2355,10 +3640,100 @@ def kb_server_view(server_id: int) -> InlineKeyboardMarkup:
     kb.button(style="primary", text="✏️ Edit", callback_data=ServerCB(action="edit", server_id=server_id).pack())
     kb.button(style="primary", text="📶 Test", callback_data=ServerCB(action="test", server_id=server_id).pack())
     kb.button(style="primary", text="💾 Backup", callback_data=ServerCB(action="backup", server_id=server_id).pack())
+    kb.button(style="primary", text="📥 Import", callback_data=ImportCB(action="server", server_id=server_id, page=1).pack())
     kb.button(text="🔄 Restart", callback_data=ServerCB(action="restart", server_id=server_id).pack(), style="danger")
     kb.button(text="🗑 Delete", callback_data=ServerCB(action="delete_ask", server_id=server_id).pack(), style="danger")
     kb.button(text="🔙 Servers", callback_data=AdminCB(action="servers").pack(), style="danger")
-    kb.adjust(2, 2, 2, 2, 1)
+    kb.adjust(2, 2, 2, 1, 2, 1)
+    return kb.as_markup()
+
+
+def kb_import_server_picker(servers: List[dict]) -> InlineKeyboardMarkup:
+    """Server picker for the panel-client import flow (MIGRATE-1)."""
+    kb = InlineKeyboardBuilder()
+    for srv in servers:
+        if not srv["is_active"]:
+            continue
+        status = "🟢" if srv["is_healthy"] else "🔴"
+        kb.button(style="primary",
+            text=f"{status} {srv['alias']}",
+            callback_data=ImportCB(action="server", server_id=srv["id"], page=1).pack())
+    kb.button(text="🔙 Admin", callback_data=AdminCB(action="main").pack(), style="danger")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def kb_import_client_list(server_id: int, clients: List[dict], page: int,
+                          per_page: int = 10) -> InlineKeyboardMarkup:
+    """Paginated list of panel clients for the import flow. Each row shows the
+    client email, enabled status, and whether a Telegram ID is set. The nav
+    row (Prev / page / Next) is grouped, then the bulk-import and back
+    buttons follow."""
+    kb = InlineKeyboardBuilder()
+    total = len(clients)
+    pages = max(1, (total + per_page - 1) // per_page)
+    if page < 1:
+        page = 1
+    if page > pages:
+        page = pages
+    start = (page - 1) * per_page
+    page_items = clients[start:start + per_page]
+    for c in page_items:
+        email = c.get("email") or "—"
+        has_tg = bool(c.get("tgId"))
+        mark = "✅" if has_tg else "➖"
+        tg_disp = f" · tg:{c.get('tgId')}" if has_tg else " · no TG"
+        en = "🟢" if c.get("enable") else "🔴"
+        kb.button(style="primary",
+            text=f"{mark}{en} {email[:28]}{tg_disp}",
+            callback_data=ImportCB(action="client", server_id=server_id,
+                                   email=email, page=page).pack())
+    if page > 1:
+        kb.button(style="primary", text="◀️ Prev",
+                  callback_data=ImportCB(action="page", server_id=server_id,
+                                         page=page - 1).pack())
+    kb.button(style="primary", text=f"{page}/{pages}", callback_data=NoopCB().pack())
+    if page < pages:
+        kb.button(style="primary", text="Next ▶️",
+                  callback_data=ImportCB(action="page", server_id=server_id,
+                                         page=page + 1).pack())
+    with_tg = sum(1 for c in clients if c.get("tgId"))
+    footer_sizes = [(1 if page > 1 else 0) + 1 + (1 if page < pages else 0)]
+    if with_tg > 0:
+        kb.button(style="success",
+            text=f"⚡ Import all ({with_tg} with TG)",
+            callback_data=ImportCB(action="all", server_id=server_id, page=page).pack())
+        footer_sizes.append(1)
+    kb.button(text="🔙 Picker", callback_data=AdminCB(action="import_main").pack(), style="danger")
+    footer_sizes.append(1)
+    sizes = [1] * len(page_items) + footer_sizes
+    kb.adjust(*sizes)
+    return kb.as_markup()
+
+
+def kb_import_client_view(server_id: int, email: str, has_tg_id: bool,
+                          already_imported: bool, page: int) -> InlineKeyboardMarkup:
+    """Per-client action view in the import flow."""
+    kb = InlineKeyboardBuilder()
+    if has_tg_id:
+        if already_imported:
+            kb.button(style="primary", text="🔄 Re-sync",
+                      callback_data=ImportCB(action="do", server_id=server_id,
+                                             email=email, page=page).pack())
+        else:
+            kb.button(style="success", text="✅ Import this client",
+                      callback_data=ImportCB(action="do", server_id=server_id,
+                                             email=email, page=page).pack())
+        kb.button(style="primary", text="✏️ Change Telegram ID",
+                  callback_data=ImportCB(action="set_tgid", server_id=server_id,
+                                         email=email, page=page).pack())
+    else:
+        kb.button(style="success", text="🔗 Set Telegram ID",
+                  callback_data=ImportCB(action="set_tgid", server_id=server_id,
+                                         email=email, page=page).pack())
+    kb.button(text="🔙 List", callback_data=ImportCB(action="server",
+              server_id=server_id, page=page).pack(), style="danger")
+    kb.adjust(1, 1)
     return kb.as_markup()
 
 
@@ -2417,14 +3792,51 @@ def kb_tickets(tickets: List[dict], back_cb: str = "admin") -> InlineKeyboardMar
     return kb.as_markup()
 
 
-def kb_ticket_view(ticket_id: int, is_admin: bool, lang: str = "en") -> InlineKeyboardMarkup:
+def kb_ticket_view(ticket_id: int, is_admin: bool, lang: str = "en", status: str = "open",
+                   user_tg_id: int = 0, messages: Optional[List[dict]] = None) -> InlineKeyboardMarkup:
+    """Inline keyboard for the ticket-detail view.
+
+    When ``is_admin`` is True and ``user_tg_id`` is provided, an extra
+    "👤 Manage User" button is appended (jumps straight to the admin
+    user-detail screen for the ticket owner). When ``messages`` is provided,
+    one "📎 View Media" button is appended per ticket-message that carries a
+    media attachment (photo / document / video / voice). (TICKET-1)
+    """
     kb = InlineKeyboardBuilder()
-    kb.button(text=t("reply", lang), callback_data=TicketCB(action="reply", ticket_id=ticket_id).pack(), style="primary")
+    if status != "closed":
+        kb.button(text=t("reply", lang), callback_data=TicketCB(action="reply", ticket_id=ticket_id).pack(), style="primary")
     if is_admin:
-        kb.button(text=t("close", lang), callback_data=TicketCB(action="close", ticket_id=ticket_id).pack(), style="danger")
+        if status != "closed":
+            kb.button(text=t("close", lang), callback_data=TicketCB(action="close", ticket_id=ticket_id).pack(), style="danger")
+        # Manage-User shortcut: only when we know the ticket owner's tg_id.
+        if user_tg_id:
+            kb.button(text=t("manage_user", lang), callback_data=AdminCB(action="user_view", data=str(user_tg_id)).pack(), style="primary")
         kb.button(text="🔙 Tickets", callback_data=AdminCB(action="tickets").pack(), style="danger")
     else:
+        if status == "closed":
+            kb.button(text=t("reopen", lang), callback_data=TicketCB(action="reopen", ticket_id=ticket_id).pack(), style="success")
         kb.button(text=t("back", lang), callback_data=MenuCB(action="my_tickets").pack(), style="danger")
+    # Per-message "View Media" buttons (one per media-bearing message).
+    media_buttons = 0
+    if messages:
+        media_label_map = {
+            "photo": t("media_photo", lang),
+            "document": t("media_document", lang),
+            "video": t("media_video", lang),
+            "voice": t("media_voice", lang),
+        }
+        for m in messages:
+            mt = m.get("media_type") or ""
+            if mt and m.get("media_file_id"):
+                label = media_label_map.get(mt, "Media")
+                kb.button(text=f"📎 {label}",
+                          callback_data=TicketMediaCB(ticket_id=ticket_id,
+                                                      message_id=m.get("id", 0)).pack(),
+                          style="primary")
+                media_buttons += 1
+    # Layout: 2 primary action buttons per row, then 1 per row for the rest.
+    # adjust() applies a repeating pattern; the count of leading "2" groups is
+    # enough to fit Reply+Close, then each subsequent button on its own row.
     kb.adjust(2, 1)
     return kb.as_markup()
 
@@ -2488,6 +3900,7 @@ class UserStates(StatesGroup):
     waiting_for_promo_code = State()
     waiting_for_gift_code = State()
     waiting_for_account_name = State()
+    waiting_for_ticket_category = State()
     waiting_for_ticket_subject = State()
     waiting_for_ticket_message = State()
     waiting_for_ticket_reply = State()
@@ -2522,6 +3935,8 @@ class AdminStates(StatesGroup):
     waiting_for_add_balance = State()  # data=tg_id
     waiting_for_deduct_balance = State()
     waiting_for_admin_account_create = State()
+    # import from panel (MIGRATE-1)
+    waiting_for_import_tg_id = State()
     # ticket
     waiting_for_admin_ticket_reply = State()
     # promo
@@ -2537,6 +3952,8 @@ class AdminStates(StatesGroup):
     waiting_for_reject_reason = State()
     # force join
     waiting_for_force_join_channel = State()
+    # payment admins management
+    waiting_for_payment_admin_id = State()
 
 
 # ============================================================================
@@ -2569,8 +3986,12 @@ class AuthMiddleware:
                     await event.answer(t("banned", db_user.get("language", "en")))
                 elif isinstance(event, CallbackQuery):
                     await event.answer(t("banned", db_user.get("language", "en")), show_alert=True)
-            except Exception:
-                pass
+            except TelegramForbiddenError:
+                pass  # user blocked the bot — expected
+            except TelegramBadRequest as e:
+                logger.warning("banned-notify failed: %s", e)
+            except Exception as e:
+                logger.warning("banned-notify failed: %s", e, exc_info=True)
             return
 
         # Force-join check (skip for admins and language-selection state)
@@ -2588,7 +4009,11 @@ class AuthMiddleware:
                                 member = await self.bot.get_chat_member(int(chat_id), user.id)
                                 if member.status not in ("member", "administrator", "creator"):
                                     not_joined.append(ch)
-                            except Exception:
+                            except (TelegramBadRequest, TelegramForbiddenError):
+                                # Bot not in channel / chat not found — treat as not joined.
+                                not_joined.append(ch)
+                            except Exception as e:
+                                logger.warning("get_chat_member failed for %s: %s", ch, e, exc_info=True)
                                 not_joined.append(ch)
                     if not_joined:
                         # Allow language selection callbacks to pass through
@@ -2623,25 +4048,79 @@ class AuthMiddleware:
                                 await event.message.edit_text(t("force_join", lang, channels=channels_text),
                                                               reply_markup=kb.as_markup())
                                 await event.answer(t("force_join_failed", lang), show_alert=True)
-                        except Exception:
-                            pass
+                        except TelegramForbiddenError:
+                            pass  # user blocked the bot — expected
+                        except TelegramBadRequest as e:
+                            logger.warning("force-join prompt failed: %s", e)
+                        except Exception as e:
+                            logger.warning("force-join prompt failed: %s", e, exc_info=True)
                         return
 
         data["db_user"] = db_user
         return await handler(event, data)
 
 
+async def get_payment_admin_ids(db: "Database") -> set:
+    """Return the set of Telegram user IDs configured as payment-only admins.
+
+    Stored as a JSON array in the settings table under key
+    ``payment_admin_ids``. Payment admins can ONLY approve/reject pending
+    payments — they cannot access servers, plans, users, settings, etc.
+    """
+    raw = await db.get_setting_json("payment_admin_ids", [])
+    if not isinstance(raw, list):
+        return set()
+    return {int(x) for x in raw if x}
+
+
 class AdminGuard:
-    """Reject non-admins from admin-only routers."""
+    """Enforce admin / payment-admin access on the admin router.
+
+    * Full admins (``ADMIN_IDS`` env) — unrestricted access to every admin
+      callback and the ``/admin`` command.
+    * Payment admins (``payment_admin_ids`` DB setting) — restricted to
+      payment-related callbacks only: ``admin:main``, ``admin:pending_payments``,
+      ``pay:*`` (view/approve/reject), and ``menu:main`` (back to user menu).
+      Every other admin callback is rejected with an inline toast.
+    """
+
+    # Callback-data prefixes (raw event.data strings) that payment admins may
+    # invoke. AdminCB packs as "admin:<action>:...", PaymentCB as "pay:...",
+    # MenuCB as "menu:<action>".
+    _PAYMENT_ALLOWED_PREFIXES = (
+        "admin:main",
+        "admin:pending_payments",
+        "pay:",
+        "menu:main",
+    )
+
+    def __init__(self, db: "Database"):
+        self._db = db
 
     async def __call__(self, handler, event, data):
         user = data.get("event_from_user")
-        if not user or user.id not in ADMIN_IDS:
+        if not user:
+            return
+        # Full admin — unrestricted.
+        if user.id in ADMIN_IDS:
+            return await handler(event, data)
+        # Payment admin?
+        pa_ids = await get_payment_admin_ids(self._db)
+        if user.id not in pa_ids:
             if isinstance(event, CallbackQuery):
                 await event.answer(t("admin_only", "en"), show_alert=True)
             elif isinstance(event, Message):
                 await event.answer(t("admin_only", "en"))
             return
+        # Payment admin — restrict to payment-related callbacks.
+        if isinstance(event, CallbackQuery):
+            raw = event.data or ""
+            if not any(raw.startswith(p) for p in self._PAYMENT_ALLOWED_PREFIXES):
+                await event.answer(
+                    "⛔ Access denied — payment admins can only manage payments.",
+                    show_alert=True,
+                )
+                return
         return await handler(event, data)
 
 
@@ -2660,6 +4139,13 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
     async def _currency() -> str:
         return await db.get_setting("currency", DEFAULT_CURRENCY) or DEFAULT_CURRENCY
 
+    async def _can_access_admin(tg_id: int) -> bool:
+        """True if user is a full admin OR a payment-only admin (so the
+        'Admin Panel' button shows in their main menu)."""
+        if tg_id in ADMIN_IDS:
+            return True
+        return tg_id in await get_payment_admin_ids(db)
+
     # ---------------------------------------------------------------- /start
     @router.message(CommandStart())
     async def cmd_start(message: Message, state: FSMContext, db_user: dict):
@@ -2676,7 +4162,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         me = await bot.get_me()
         await message.answer(
             t("welcome", lang, bot_name=f"@{me.username}"),
-            reply_markup=kb_main_menu(message.from_user.id in ADMIN_IDS, lang),
+            reply_markup=kb_main_menu(await _can_access_admin(message.from_user.id), lang),
         )
 
     # ---------------------------------------------------------------- /help
@@ -2685,7 +4171,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         lang = _lang(db_user)
         help_text = await db.get_setting(f"help_text_{lang}") or t("help_text", lang)
         await message.answer(help_text,
-                             reply_markup=kb_main_menu(message.from_user.id in ADMIN_IDS, lang))
+                             reply_markup=kb_main_menu(await _can_access_admin(message.from_user.id), lang))
 
     # ------------------------------------------------------------ /language
     @router.message(Command("language"))
@@ -2699,23 +4185,23 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         await state.clear()
         lang = _lang(db_user)
         await message.answer(t("cancelled_action", lang),
-                             reply_markup=kb_main_menu(message.from_user.id in ADMIN_IDS, lang))
+                             reply_markup=kb_main_menu(await _can_access_admin(message.from_user.id), lang))
 
     # ---------------------------------------------------- main menu buttons
     @router.callback_query(MenuCB.filter(F.action == "main"))
     async def cb_main_menu(callback: CallbackQuery, state: FSMContext, db_user: dict):
         await state.clear()
         lang = _lang(db_user)
-        await callback.message.edit_text(t("menu_main", lang),
-                                         reply_markup=kb_main_menu(callback.from_user.id in ADMIN_IDS, lang))
+        await show_view(callback.message, text=t("menu_main", lang),
+                         reply_markup=kb_main_menu(await _can_access_admin(callback.from_user.id), lang))
         await callback.answer()
 
     @router.callback_query(MenuCB.filter(F.action == "cancel"))
     async def cb_cancel(callback: CallbackQuery, state: FSMContext, db_user: dict):
         await state.clear()
         lang = _lang(db_user)
-        await callback.message.edit_text(t("action_cancelled", lang),
-                                         reply_markup=kb_main_menu(callback.from_user.id in ADMIN_IDS, lang))
+        await show_view(callback.message, text=t("action_cancelled", lang),
+                         reply_markup=kb_main_menu(await _can_access_admin(callback.from_user.id), lang))
         await callback.answer()
 
     # ------------------------------------------------------- language picker
@@ -2734,7 +4220,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         me = await bot.get_me()
         await callback.message.edit_text(
             t("lang_set", lang) + "\n\n" + t("welcome", lang, bot_name=f"@{me.username}"),
-            reply_markup=kb_main_menu(callback.from_user.id in ADMIN_IDS, lang),
+            reply_markup=kb_main_menu(await _can_access_admin(callback.from_user.id), lang),
         )
         await callback.answer()
 
@@ -2747,7 +4233,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             # Force join disabled, let user proceed
             await callback.message.edit_text(
                 t("welcome", lang, bot_name=f"@{(await bot.get_me()).username}"),
-                reply_markup=kb_main_menu(callback.from_user.id in ADMIN_IDS, lang),
+                reply_markup=kb_main_menu(await _can_access_admin(callback.from_user.id), lang),
             )
             await callback.answer()
             return
@@ -2760,15 +4246,63 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
                     member = await bot.get_chat_member(int(chat_id), callback.from_user.id)
                     if member.status not in ("member", "administrator", "creator"):
                         not_joined.append(ch)
-                except Exception:
-                    not_joined.append(ch)
+                except TelegramBadRequest as e:
+                    # L11 — Bot likely lost admin in this channel (or chat was
+                    # deleted / never existed). Previously this branch was
+                    # fail-CLOSED: the user was treated as "not joined" and
+                    # blocked. That is hostile to legitimate users when the
+                    # admin forgets to re-promote the bot after a channel
+                    # migration. Fail OPEN instead: log + alert admins so
+                    # they can re-add the bot, but let the user through.
+                    logger.warning(
+                        "force_join check failed for channel %s: %s — failing open",
+                        ch, e,
+                    )
+                    for admin_id in ADMIN_IDS:
+                        await safe_notify(
+                            bot.send_message(
+                                admin_id,
+                                f"⚠️ <b>Force-join check failed</b>\n"
+                                f"Channel: <code>{escape_html(str(ch))}</code>\n"
+                                f"Error: {escape_html(str(e))[:200]}\n"
+                                f"User was allowed through (fail-open). "
+                                f"Please re-add the bot as admin.",
+                            ),
+                            context="force_join fail-open alert",
+                        )
+                except TelegramForbiddenError as e:
+                    # Same rationale — fail OPEN and alert admins.
+                    logger.warning(
+                        "force_join check forbidden for channel %s: %s — failing open",
+                        ch, e,
+                    )
+                    for admin_id in ADMIN_IDS:
+                        await safe_notify(
+                            bot.send_message(
+                                admin_id,
+                                f"⚠️ <b>Force-join check failed</b>\n"
+                                f"Channel: <code>{escape_html(str(ch))}</code>\n"
+                                f"Error: {escape_html(str(e))[:200]}\n"
+                                f"User was allowed through (fail-open). "
+                                f"Please re-add the bot as admin.",
+                            ),
+                            context="force_join fail-open alert",
+                        )
+                except Exception as e:
+                    # Unexpected error (network blip, Telegram 5xx, …). Same
+                    # fail-open policy — better to let a real user in than to
+                    # lock out 100% of new users during a Telegram outage.
+                    logger.error(
+                        "force_join check error for %s: %s — failing open",
+                        ch, e, exc_info=True,
+                    )
         if not_joined:
             await callback.answer(t("force_join_failed", lang), show_alert=True)
             return
         # All channels joined
         await callback.message.edit_text(
             t("force_join_success", lang) + "\n\n" + t("welcome", lang, bot_name=f"@{(await bot.get_me()).username}"),
-            reply_markup=kb_main_menu(callback.from_user.id in ADMIN_IDS, lang),
+            reply_markup=kb_main_menu(await _can_access_admin(callback.from_user.id), lang),
         )
         await callback.answer()
 
@@ -2901,6 +4435,9 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         promo_code = data.get("promo_code")
         account_name = data.get("account_name", "")
 
+        # Friendly pre-check for instant feedback (the authoritative check is
+        # the atomic try_deduct_balance below — C8 — so this race-free even if
+        # we lie here briefly).
         balance = db_user.get("balance", 0)
         if balance < final_price:
             await callback.answer(
@@ -2925,8 +4462,19 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             return
 
         email = gen_email(callback.from_user.id, account_name)
-        expiry_time = (int((datetime.now() + timedelta(days=plan["duration_days"])).timestamp() * 1000)
+        expiry_time = (int((datetime.now(timezone.utc) + timedelta(days=plan["duration_days"])).timestamp() * 1000)
                        if plan["duration_days"] > 0 else 0)
+
+        # C8 — atomic check-and-deduct balance. This replaces the
+        # read-then-write pattern (`if balance < price: return; await
+        # update_user_balance(..., add=False)`) which had a TOCTOU race
+        # window allowing two parallel purchases to both succeed.
+        if not await db.try_deduct_balance(callback.from_user.id, final_price):
+            await callback.message.edit_text(
+                t("insufficient", lang, diff=fmt_price(final_price, lang, currency)),
+                reply_markup=kb_back_to_menu(lang),
+            )
+            return
 
         sub_id = gen_sub_id()
         result = await api.create_client(
@@ -2937,6 +4485,10 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             sub_id=sub_id,
         )
         if not result.get("success"):
+            # C7 — COMPENSATION: the panel call failed AFTER we deducted the
+            # balance. We must credit it back so the user isn't charged for
+            # an account they never received.
+            await db.update_user_balance(callback.from_user.id, final_price, add=True)
             await callback.message.edit_text(
                 t("purchase_failed", lang, msg=result.get("msg", "error")),
                 reply_markup=kb_back_to_menu(lang),
@@ -2945,28 +4497,54 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
 
         links = await api.get_client_links(server["panel_url"], server["api_token"], email)
 
-        await db.add_account(
-            user_tg_id=callback.from_user.id, server_id=server["id"], email=email,
-            sub_id=sub_id, plan_id=plan["id"], traffic_gb=plan["traffic_gb"],
-            expiry_time=expiry_time, limit_ip=plan.get("limit_ip", 0),
-            inbound_ids=json.dumps(inbound_ids), is_trial=False, label=account_name,
-        )
-        await db.update_user_balance(callback.from_user.id, final_price, add=False)
-        if promo_code:
-            await db.use_promo_code(promo_code)
-        await db.add_transaction(
-            user_tg_id=callback.from_user.id, amount=final_price, type_="purchase",
-            description=f"Plan: {plan['name']}", account_email=email, plan_id=plan["id"],
-        )
-        await db.clear_traffic_alerts(email)
-        await db.clear_expiry_reminders(email)
+        # C7 — wrap the multi-step DB writes in a single transaction. If any
+        # step fails, all of them roll back (no partial state: e.g. an account
+        # row without a transaction record, or vice versa).
+        try:
+            async with db.transaction():
+                await db.add_account(
+                    user_tg_id=callback.from_user.id, server_id=server["id"], email=email,
+                    sub_id=sub_id, plan_id=plan["id"], traffic_gb=plan["traffic_gb"],
+                    expiry_time=expiry_time, limit_ip=plan.get("limit_ip", 0),
+                    inbound_ids=json.dumps(inbound_ids), is_trial=False, label=account_name,
+                )
+                if promo_code:
+                    await db.use_promo_code(promo_code)
+                await db.add_transaction(
+                    user_tg_id=callback.from_user.id, amount=final_price, type_="purchase",
+                    description=f"Plan: {plan['name']}", account_email=email, plan_id=plan["id"],
+                )
+                await db.clear_traffic_alerts(email)
+                await db.clear_expiry_reminders(email)
+        except Exception as e:
+            # C7 — COMPENSATION: DB write failed AFTER the panel client was
+            # already created. Delete the orphaned panel client and refund
+            # the balance so the user isn't left with a charge for nothing.
+            logger.error("purchase DB write failed (%s) — compensating", e)
+            try:
+                await api.delete_client(server["panel_url"], server["api_token"], email)
+            except Exception as del_err:
+                logger.error("compensation delete_client failed: %s", del_err)
+            await db.update_user_balance(callback.from_user.id, final_price, add=True)
+            await callback.message.edit_text(
+                t("purchase_failed", lang, msg="Internal error, please try again."),
+                reply_markup=kb_back_to_menu(lang),
+            )
+            return
 
-        # Referral bonus — fires only ONCE per user (on first paid purchase)
+        # C2 — Atomic referral bonus claim. mark_referral_rewarded returns
+        # True only if THIS call performed the transition; if a parallel
+        # purchase already claimed the bonus, we skip the panel-side reward
+        # entirely (no double-grant). The user is still marked as referred,
+        # so disabling the referral program doesn't retroactively grant
+        # bonuses on later purchases.
         if db_user.get("referred_by") and not db_user.get("referral_rewarded"):
+            won_claim = await db.mark_referral_rewarded(callback.from_user.id)
             referrer_id = db_user["referred_by"]
+            ref_enabled = await db.get_setting_int("referral_enabled", 1)
             bonus_days = await db.get_setting_int("referral_bonus_days", 0)
             bonus_gb = await db.get_setting_int("referral_bonus_gb", 0)
-            if bonus_days > 0 or bonus_gb > 0:
+            if won_claim and ref_enabled and (bonus_days > 0 or bonus_gb > 0):
                 ref_accounts = await db.get_user_accounts(referrer_id)
                 active_refs = [a for a in ref_accounts if a["is_active"] and not a["is_trial"]]
                 if active_refs:
@@ -2989,9 +4567,10 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
                                 f"A friend just bought a plan thanks to you!\n"
                                 f"🎁 +{bonus_days}d +{bonus_gb} GB applied to <code>{escape_html(ref_acc['email'])}</code>",
                             )
-                        except Exception:
+                        except TelegramBadRequest:
                             pass
-            await db.mark_referral_rewarded(callback.from_user.id)
+                        except Exception as e:
+                            logger.warning("referral notify failed: %s", e)
 
         # Delivery message
         delivery = f"{t('purchase_success', lang)}\n\n"
@@ -3046,7 +4625,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             plan_name=plan["name"] if plan else ("Trial" if account.get("is_trial") else "-"),
             currency=await _currency(),
         )
-        await callback.message.edit_text(text, reply_markup=kb_account_details(account["email"], account["is_active"], lang))
+        await callback.message.edit_text(text, reply_markup=kb_account_details(account["email"], account["is_active"], lang, account.get("is_trial", False)))
         await callback.answer()
 
     @router.callback_query(AccountCB.filter(F.action == "links"))
@@ -3060,15 +4639,21 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         if not server:
             await callback.answer(t("not_found", lang), show_alert=True)
             return
-        links = await api.get_client_links(server["panel_url"], server["api_token"], account["email"])
-        text = f"{t('conn_links', lang)}\n<code>{escape_html(account['email'])}</code>\n\n"
-        for i, link in enumerate(links, 1):
-            text += f"<code>{escape_html(link)}</code>\n\n"
+        # Per user request: the Links section shows ONLY the subscription URL
+        # (a single self-updating link), not the raw per-inbound V2Ray configs.
+        # A QR-code button is provided here AND on the main account page.
         sub_url = build_sub_url(server, account.get("sub_id", ""))
+        text = f"{t('links_sub_only', lang)}\n\n📱 <code>{escape_html(account['email'])}</code>\n"
         if sub_url:
-            text += f"{t('sub_url', lang)}\n<code>{escape_html(sub_url)}</code>"
+            text += f"\n{t('sub_url', lang)}\n<code>{escape_html(sub_url)}</code>"
+        else:
+            text += f"\n❌ {t('not_found', lang)}"
         kb = InlineKeyboardBuilder()
+        if sub_url:
+            kb.button(style="primary", text=t("qr_sub", lang),
+                      callback_data=AccountCB(action="qr", email=account["email"]).pack())
         kb.button(text=t("back", lang), callback_data=AccountCB(action="view", email=account["email"]).pack(), style="primary")
+        kb.adjust(1)
         await callback.message.edit_text(text, reply_markup=kb.as_markup(), disable_web_page_preview=True)
         await callback.answer()
 
@@ -3134,8 +4719,10 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         try:
             ips = await api.get_client_ips(server["panel_url"], server["api_token"], account["email"])
             text += f"\n🌐 {t('active_ips', lang)}: {fmt_num(len(ips), lang)}"
-        except Exception:
-            pass
+        except Exception as e:
+            # Panel-API call path — never swallow silently (M2). A failed
+            # get_client_ips just means the IP line is omitted from the card.
+            logger.warning("get_client_ips failed for %s: %s", account['email'], e, exc_info=True)
         kb = InlineKeyboardBuilder()
         kb.button(text=t("back", lang), callback_data=AccountCB(action="view", email=account["email"]).pack(), style="primary")
         await callback.message.edit_text(text, reply_markup=kb.as_markup())
@@ -3171,8 +4758,10 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             )
             try:
                 await callback.message.delete()
-            except Exception:
-                pass
+            except TelegramBadRequest:
+                pass  # message already deleted / not found — expected
+            except Exception as e:
+                logger.warning("qr message delete failed: %s", e, exc_info=True)
         else:
             await callback.message.answer(
                 f"📱 <code>{escape_html(payload)}</code>",
@@ -3181,8 +4770,10 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             )
             try:
                 await callback.message.delete()
-            except Exception:
-                pass
+            except TelegramBadRequest:
+                pass  # message already deleted / not found — expected
+            except Exception as e:
+                logger.warning("qr message delete failed: %s", e, exc_info=True)
         await callback.answer()
 
     # ---- set label -----------------------------------------------------
@@ -3204,14 +4795,17 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         if not email:
             await message.answer(t("not_found", lang), reply_markup=kb_back_to_menu(lang))
             return
+        acc = await db.get_account(email)
+        is_active = acc["is_active"] if acc else True
+        is_trial = bool(acc.get("is_trial", False)) if acc else False
         if text == "-":
             await db.update_account(email, label=None)
             await message.answer(t("label_cleared", lang),
-                                 reply_markup=kb_account_details(email, True, lang))
+                                 reply_markup=kb_account_details(email, is_active, lang, is_trial))
         else:
             await db.update_account(email, label=text)
             await message.answer(t("label_set", lang, label=escape_html(text)),
-                                 reply_markup=kb_account_details(email, True, lang))
+                                 reply_markup=kb_account_details(email, is_active, lang, is_trial))
 
     # ---- renew ---------------------------------------------------------
     @router.callback_query(AccountCB.filter(F.action == "renew"))
@@ -3220,6 +4814,9 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         account = await db.get_account(callback_data.email)
         if not account or account["user_tg_id"] != callback.from_user.id:
             await callback.answer(t("not_found", lang), show_alert=True)
+            return
+        if account.get("is_trial"):
+            await callback.answer(t("trial_no_renew", lang), show_alert=True)
             return
         plan = await db.get_plan(account["plan_id"]) if account.get("plan_id") else None
         if not plan:
@@ -3253,12 +4850,19 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         if not plan:
             await callback.answer("Plan not found.", show_alert=True)
             return
-        if db_user.get("balance", 0) < plan["price"]:
-            await callback.answer(t("insufficient", lang, diff=""), show_alert=True)
+        if account.get("is_trial"):
+            await callback.answer(t("trial_no_renew", lang), show_alert=True)
             return
         server = await db.get_server(account["server_id"])
         if not server:
             await callback.answer(t("not_found", lang), show_alert=True)
+            return
+        # C8 — atomic balance deduction (replaces the read-then-write race).
+        if not await db.try_deduct_balance(callback.from_user.id, plan["price"]):
+            await callback.answer(
+                t("insufficient", lang, diff=fmt_price(plan["price"], lang, await _currency())),
+                show_alert=True,
+            )
             return
         add_bytes = plan["traffic_gb"] * GB if plan["traffic_gb"] > 0 else 0
         result = await api.bulk_adjust(
@@ -3266,21 +4870,34 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             add_days=plan["duration_days"], add_bytes=add_bytes,
         )
         if not result.get("success"):
+            # C7 — compensation: refund the deducted balance.
+            await db.update_user_balance(callback.from_user.id, plan["price"], add=True)
             await callback.answer(t("renew_failed", lang, msg=result.get("msg", "")), show_alert=True)
             return
-        now_ms = int(datetime.now().timestamp() * 1000)
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         base = account["expiry_time"] if account["expiry_time"] and account["expiry_time"] > now_ms else now_ms
         new_expiry = base + plan["duration_days"] * MS_PER_DAY if plan["duration_days"] > 0 else 0
         new_traffic = (account["traffic_gb"] + plan["traffic_gb"]) if account["traffic_gb"] and plan["traffic_gb"] else (account["traffic_gb"] or plan["traffic_gb"])
-        await db.update_account(account["email"], expiry_time=new_expiry, traffic_gb=new_traffic,
-                                is_active=True, renewed_at=datetime.now().isoformat())
-        await db.clear_traffic_alerts(account["email"])
-        await db.clear_expiry_reminders(account["email"])
-        await db.update_user_balance(callback.from_user.id, plan["price"], add=False)
-        await db.add_transaction(
-            user_tg_id=callback.from_user.id, amount=plan["price"], type_="renewal",
-            description=f"Renewed: {plan['name']}", account_email=account["email"], plan_id=plan["id"],
-        )
+        # C7 — transaction for the multi-step DB writes.
+        try:
+            async with db.transaction():
+                await db.update_account(account["email"], expiry_time=new_expiry, traffic_gb=new_traffic,
+                                        is_active=True, renewed_at=datetime.now(timezone.utc).isoformat())
+                await db.clear_traffic_alerts(account["email"])
+                await db.clear_expiry_reminders(account["email"])
+                await db.add_transaction(
+                    user_tg_id=callback.from_user.id, amount=plan["price"], type_="renewal",
+                    description=f"Renewed: {plan['name']}", account_email=account["email"], plan_id=plan["id"],
+                )
+        except Exception as e:
+            # C7 — compensation: panel succeeded but DB failed. Best-effort
+            # log; the panel client is already extended. Don't refund because
+            # the user DID get the renewal on the panel side.
+            logger.error("renew DB write failed (%s) — panel already extended for %s",
+                         e, account["email"])
+            await callback.answer("⚠️ Renewal applied but DB sync failed. Contact support.",
+                                  show_alert=True)
+            return
         currency = await _currency()
         text = f"{t('renew_success', lang)}\n\n<code>{escape_html(account['email'])}</code>\n"
         text += f"📅 {fmt_ts(new_expiry, lang)}\n💾 {fmt_gb(new_traffic, lang)}\n"
@@ -3298,6 +4915,9 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         if not account or account["user_tg_id"] != callback.from_user.id:
             await callback.answer(t("not_found", lang), show_alert=True)
             return
+        if account.get("is_trial"):
+            await callback.answer(t("trial_no_renew", lang), show_alert=True)
+            return
         packages = await db.get_setting_json("topup_packages", [5, 10, 20, 50])
         await callback.message.edit_text(
             t("topup_title", lang),
@@ -3312,31 +4932,48 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         if not account or account["user_tg_id"] != callback.from_user.id:
             await callback.answer(t("not_found", lang), show_alert=True)
             return
-        gb = callback_data.gb
-        price_per_gb = await db.get_setting_int("topup_price_per_gb", 2000)
-        price = gb * price_per_gb
-        if db_user.get("balance", 0) < price:
-            await callback.answer(t("insufficient", lang, diff=fmt_price(price - db_user.get("balance", 0), lang, await _currency())), show_alert=True)
+        if account.get("is_trial"):
+            await callback.answer(t("trial_no_renew", lang), show_alert=True)
             return
+        gb = callback_data.gb
+        price_per_gb = await db.get_setting_int("topup_price_per_gb", TOPUP_DEFAULT_PRICE_PER_GB)
+        price = gb * price_per_gb
         server = await db.get_server(account["server_id"])
         if not server:
             await callback.answer(t("not_found", lang), show_alert=True)
+            return
+        # C8 — atomic balance deduction.
+        if not await db.try_deduct_balance(callback.from_user.id, price):
+            await callback.answer(
+                t("insufficient", lang, diff=fmt_price(price, lang, await _currency())),
+                show_alert=True,
+            )
             return
         result = await api.bulk_adjust(
             server["panel_url"], server["api_token"], [account["email"]],
             add_bytes=gb * GB,
         )
         if not result.get("success"):
+            # C7 — compensation: refund the deducted balance.
+            await db.update_user_balance(callback.from_user.id, price, add=True)
             await callback.answer(f"Failed: {result.get('msg')}", show_alert=True)
             return
         new_traffic = (account["traffic_gb"] or 0) + gb
-        await db.update_account(account["email"], traffic_gb=new_traffic, is_active=True)
-        await db.clear_traffic_alerts(account["email"])
-        await db.update_user_balance(callback.from_user.id, price, add=False)
-        await db.add_transaction(
-            user_tg_id=callback.from_user.id, amount=price, type_="topup",
-            description=f"Top-up +{gb}GB", account_email=account["email"],
-        )
+        # C7 — transaction.
+        try:
+            async with db.transaction():
+                await db.update_account(account["email"], traffic_gb=new_traffic, is_active=True)
+                await db.clear_traffic_alerts(account["email"])
+                await db.add_transaction(
+                    user_tg_id=callback.from_user.id, amount=price, type_="topup",
+                    description=f"Top-up +{gb}GB", account_email=account["email"],
+                )
+        except Exception as e:
+            logger.error("topup DB write failed (%s) — panel already extended for %s",
+                         e, account["email"])
+            await callback.answer("⚠️ Top-up applied but DB sync failed. Contact support.",
+                                  show_alert=True)
+            return
         currency = await _currency()
         await callback.answer("✅")
         text = t("topup_success", lang, gb=gb, email=account["email"]) + "\n"
@@ -3445,8 +5082,8 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             await callback.message.edit_text(t("trial_used", lang), reply_markup=kb_back_to_menu(lang))
             await callback.answer()
             return
-        days = await db.get_setting_int("trial_days", 3)
-        gb = await db.get_setting_int("trial_gb", 5)
+        days = await db.get_setting_int("trial_days", TRIAL_DEFAULT_DAYS)
+        gb = await db.get_setting_int("trial_gb", TRIAL_DEFAULT_GB)
         text = (
             f"{t('trial_offer', lang)}\n\n"
             f"📅 {fmt_days(days, lang)}\n💾 {fmt_gb(gb, lang)}\n💵 {fmt_price(0, lang, await _currency())}\n\n"
@@ -3465,23 +5102,34 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         if await db.has_used_trial(callback.from_user.id):
             await callback.answer(t("trial_used", lang), show_alert=True)
             return
+        # C4 — atomic claim. Try to mark trial_used_at BEFORE creating the
+        # panel client. If two parallel requests both reach this handler, only
+        # one wins the row and proceeds; the other aborts with no side effects
+        # (no orphaned panel client, no wasted API call).
+        if not await db.mark_trial_used(callback.from_user.id):
+            await callback.answer(t("trial_used", lang), show_alert=True)
+            return
         await callback.message.edit_text(t("creating_account", lang))
-        days = await db.get_setting_int("trial_days", 3)
-        gb = await db.get_setting_int("trial_gb", 5)
+        days = await db.get_setting_int("trial_days", TRIAL_DEFAULT_DAYS)
+        gb = await db.get_setting_int("trial_gb", TRIAL_DEFAULT_GB)
         limit_ip = await db.get_setting_int("trial_limit_ip", 1)
         trial_inbounds = await db.get_setting_json("trial_inbounds", [])
         # Restrict to servers referenced by trial_inbounds (if any)
         allowed = list({int(x.split("_", 1)[0]) for x in trial_inbounds if "_" in x})
         server = await lb.select_best_server(allowed or None)
         if not server:
+            # C4 — undo the trial claim so the user can retry when a server
+            # comes back online. (Otherwise they'd be permanently blocked.)
+            await db._unmark_trial_used(callback.from_user.id)
             await callback.message.edit_text(t("no_servers", lang), reply_markup=kb_back_to_menu(lang))
             return
         inbound_ids = await lb.select_trial_inbounds(server, trial_inbounds)
         if not inbound_ids:
+            await db._unmark_trial_used(callback.from_user.id)
             await callback.message.edit_text(t("no_inbounds", lang), reply_markup=kb_back_to_menu(lang))
             return
         email = gen_email(callback.from_user.id, "trial")
-        expiry_time = int((datetime.now() + timedelta(days=days)).timestamp() * 1000)
+        expiry_time = int((datetime.now(timezone.utc) + timedelta(days=days)).timestamp() * 1000)
         sub_id = gen_sub_id()
         result = await api.create_client(
             panel_url=server["panel_url"], token=server["api_token"],
@@ -3490,19 +5138,37 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             sub_id=sub_id,
         )
         if not result.get("success"):
+            # C4/C7 — undo the trial claim so the user can retry later.
+            await db._unmark_trial_used(callback.from_user.id)
             await callback.message.edit_text(t("trial_failed", lang, msg=result.get("msg", "")),
                                              reply_markup=kb_back_to_menu(lang))
             return
         links = await api.get_client_links(server["panel_url"], server["api_token"], email)
-        await db.add_account(
-            user_tg_id=callback.from_user.id, server_id=server["id"], email=email, sub_id=sub_id,
-            plan_id=None, traffic_gb=gb, expiry_time=expiry_time, limit_ip=limit_ip,
-            inbound_ids=json.dumps(inbound_ids), is_trial=True, label="Trial",
-        )
-        await db.add_transaction(
-            user_tg_id=callback.from_user.id, amount=0, type_="trial",
-            description=f"Free Trial {days}d/{gb}GB", account_email=email,
-        )
+        # C7 — wrap the DB writes in a single transaction.
+        try:
+            async with db.transaction():
+                await db.add_account(
+                    user_tg_id=callback.from_user.id, server_id=server["id"], email=email, sub_id=sub_id,
+                    plan_id=None, traffic_gb=gb, expiry_time=expiry_time, limit_ip=limit_ip,
+                    inbound_ids=json.dumps(inbound_ids), is_trial=True, label="Trial",
+                )
+                await db.add_transaction(
+                    user_tg_id=callback.from_user.id, amount=0, type_="trial",
+                    description=f"Free Trial {days}d/{gb}GB", account_email=email,
+                )
+        except Exception as e:
+            # C7 — compensation: panel client was created but DB failed.
+            logger.error("trial DB write failed (%s) — compensating", e)
+            try:
+                await api.delete_client(server["panel_url"], server["api_token"], email)
+            except Exception as del_err:
+                logger.error("compensation delete_client failed: %s", del_err)
+            await db._unmark_trial_used(callback.from_user.id)
+            await callback.message.edit_text(
+                t("trial_failed", lang, msg="Internal error, please try again."),
+                reply_markup=kb_back_to_menu(lang),
+            )
+            return
         text = f"{t('trial_created', lang)}\n\n"
         text += fmt_account_card(
             {"email": email, "traffic_gb": gb, "expiry_time": expiry_time, "is_active": True, "is_trial": True, "label": "Trial"},
@@ -3537,7 +5203,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
                 icon = {"purchase": "🛒", "renewal": "🔄", "topup": "➕", "deposit": "💰",
                         "gift_balance": "🎁", "gift_plan": "🎁", "trial": "🆓",
                         "admin_adjust": "⚙️"}.get(tx["type"], "•")
-                text += f"{icon} {tx['created_at'][:16]} · {fmt_price(tx['amount'], lang, currency)} · {escape_html((tx.get('description') or '')[:24])}\n"
+                text += f"{icon} {fmt_iso(tx['created_at'])} · {fmt_price(tx['amount'], lang, currency)} · {escape_html((tx.get('description') or '')[:24])}\n"
         text += f"\n{t('topup_hint', lang)}"
         kb = InlineKeyboardBuilder()
         kb.button(text=t("charge_wallet_btn", lang), callback_data=MenuCB(action="charge_wallet").pack(), style="primary")
@@ -3580,13 +5246,19 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
     async def cb_payment_select_amount(callback: CallbackQuery, callback_data: PaymentCB, state: FSMContext, db_user: dict):
         lang = _lang(db_user)
         original_amount = callback_data.amount
-        suffix = random.randint(100, 999)
+        # Cryptographic 4-digit suffix (9000 values instead of 900) reduces
+        # payment-amount collisions when multiple users pay the same base.
+        suffix = secrets.randbelow(PAYMENT_UNIQUE_SUFFIX_RANGE) + PAYMENT_UNIQUE_SUFFIX_MIN
         unique_amount = original_amount + suffix
         await state.update_data(original_amount=original_amount, unique_amount=unique_amount)
         card_number = await db.get_setting("payment_card_number", "-")
         card_holder = await db.get_setting("payment_card_holder", "-")
+        currency = await _currency()
+        # L8 — pass amount (no unit, via fmt_num) + explicit {unit} word so the
+        # template renders cleanly for toman AND usd without double-printing.
         await callback.message.edit_text(
-            t("payment_info", lang, card_number=card_number, card_holder=card_holder, unique_amount=fmt_price(unique_amount, lang, await _currency())),
+            t("payment_info", lang, card_number=card_number, card_holder=card_holder,
+              unique_amount=fmt_num(unique_amount, lang), unit=payment_unit_str(currency, lang)),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(style="success", text=t("send_receipt", lang), callback_data=PaymentCB(action="send_receipt", amount=0).pack())],
                 [InlineKeyboardButton(style="danger", text=t("back_menu", lang), callback_data=MenuCB(action="main").pack())],
@@ -3598,7 +5270,8 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
     async def cb_payment_custom_amount(callback: CallbackQuery, state: FSMContext, db_user: dict):
         lang = _lang(db_user)
         await state.set_state(UserStates.waiting_for_custom_amount)
-        min_amount = 10000
+        # M12 — use admin-configurable min amount instead of hardcoded 10000.
+        min_amount = await db.get_setting_int("payment_min_amount", DEFAULT_PAYMENT_MIN_AMOUNT)
         await callback.message.edit_text(
             t("enter_custom_amount", lang, min=fmt_price(min_amount, lang, await _currency())),
             reply_markup=kb_cancel(lang),
@@ -3613,16 +5286,25 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         except ValueError:
             await message.answer(t("invalid_number", lang), reply_markup=kb_cancel(lang))
             return
-        if amount < 10000:
-            await message.answer(t("invalid_number", lang), reply_markup=kb_cancel(lang))
+        # Use the admin-configurable minimum amount (M12 — was hardcoded 10000).
+        min_amount = await db.get_setting_int("payment_min_amount", DEFAULT_PAYMENT_MIN_AMOUNT)
+        if amount < min_amount:
+            await message.answer(
+                t("invalid_number", lang),
+                reply_markup=kb_cancel(lang),
+            )
             return
-        suffix = random.randint(100, 999)
+        # Cryptographic 4-digit suffix (9000 values instead of 900) — C6.
+        suffix = secrets.randbelow(PAYMENT_UNIQUE_SUFFIX_RANGE) + PAYMENT_UNIQUE_SUFFIX_MIN
         unique_amount = amount + suffix
         await state.update_data(original_amount=amount, unique_amount=unique_amount)
         card_number = await db.get_setting("payment_card_number", "-")
         card_holder = await db.get_setting("payment_card_holder", "-")
+        currency = await _currency()
+        # L8 — amount + {unit} word (see cb_payment_select_amount for rationale).
         await message.answer(
-            t("payment_info", lang, card_number=card_number, card_holder=card_holder, unique_amount=fmt_price(unique_amount, lang, await _currency())),
+            t("payment_info", lang, card_number=card_number, card_holder=card_holder,
+              unique_amount=fmt_num(unique_amount, lang), unit=payment_unit_str(currency, lang)),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(style="success", text=t("send_receipt", lang), callback_data=PaymentCB(action="send_receipt", amount=0).pack())],
                 [InlineKeyboardButton(style="danger", text=t("back_menu", lang), callback_data=MenuCB(action="main").pack())],
@@ -3673,7 +5355,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             return
 
         await state.clear()
-        await db.add_payment(
+        payment_id = await db.add_payment(
             user_tg_id=message.from_user.id,
             amount=original_amount,
             unique_amount=unique_amount,
@@ -3685,24 +5367,95 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             t("receipt_received", lang, amount=fmt_price(unique_amount, lang, await _currency())),
             reply_markup=kb_back_to_menu(lang),
         )
+        # Notify every admin that a new payment needs their review.
+        # Includes payment-only admins (who can approve/reject) in addition
+        # to full ADMIN_IDS.
+        currency = await _currency()
+        notify_targets = set(ADMIN_IDS) | await get_payment_admin_ids(db)
+        for admin_id in notify_targets:
+            try:
+                notify_kb = InlineKeyboardBuilder()
+                notify_kb.button(style="success", text="👁 Review",
+                                 callback_data=PaymentCB(action="view", payment_id=payment_id).pack())
+                notify_kb.button(style="primary", text="💰 Pending Pay",
+                                 callback_data=AdminCB(action="pending_payments").pack())
+                notify_kb.adjust(1)
+                admin_text = (
+                    f"💰 <b>New payment needs approval</b>\n\n"
+                    f"👤 {escape_html(message.from_user.full_name)} (<code>{message.from_user.id}</code>)\n"
+                    f"💵 {fmt_price(unique_amount, 'en', currency)} ({currency})\n"
+                    f"🧾 Receipt: {receipt_type}\n"
+                    f"⏳ Status: <b>awaiting your review</b>"
+                )
+                # Forward the receipt media to the admin if there is one, so
+                # they can see it without even clicking through.
+                if receipt_file_id and receipt_type == "photo":
+                    await bot.send_photo(admin_id, receipt_file_id, caption=admin_text,
+                                         reply_markup=notify_kb.as_markup())
+                elif receipt_file_id and receipt_type == "document":
+                    await bot.send_document(admin_id, receipt_file_id, caption=admin_text,
+                                            reply_markup=notify_kb.as_markup())
+                else:
+                    if receipt_text:
+                        admin_text += f"\n📝 {escape_html(receipt_text[:300])}"
+                    await bot.send_message(admin_id, admin_text, reply_markup=notify_kb.as_markup())
+            except TelegramForbiddenError:
+                pass  # admin blocked the bot — expected
+            except TelegramBadRequest as e:
+                msg = str(e).lower()
+                if "chat not found" not in msg and "blocked" not in msg:
+                    logger.warning("payment-receipt admin notify failed: %s", e)
+            except Exception as e:
+                logger.warning("payment-receipt admin notify failed: %s", e, exc_info=True)
 
     # ====================================================== REFERRAL
     @router.callback_query(MenuCB.filter(F.action == "referral"))
     async def cb_referral(callback: CallbackQuery, db_user: dict):
         lang = _lang(db_user)
+        # Respect the admin on/off toggle for the whole referral program.
+        if not (await db.get_setting_int("referral_enabled", 1)):
+            await callback.message.edit_text(
+                f"{t('referral_title', lang)}\n\n{t('referral_disabled', lang)}",
+                reply_markup=kb_back_to_menu(lang),
+            )
+            await callback.answer()
+            return
         stats = await db.get_referral_stats(callback.from_user.id)
         bonus_days = await db.get_setting_int("referral_bonus_days", 0)
         bonus_gb = await db.get_setting_int("referral_bonus_gb", 0)
         me = await bot.get_me()
         ref_link = f"https://t.me/{me.username}?start={db_user.get('referral_code','')}"
+        # Transparent "how it works" explanation.
         text = (
-            f"{t('referral_title', lang)}\n\n{t('referral_desc', lang)}\n\n"
-            f"👥 {fmt_num(stats['total_referrals'], lang)}\n"
-            f"✅ {fmt_num(stats['completed_referrals'], lang)}\n"
-            f"🎁 +{bonus_days}d +{bonus_gb} GB\n\n"
+            f"{t('referral_title', lang)}\n\n"
+            f"{t('referral_how', lang, days=bonus_days, gb=bonus_gb)}\n\n"
+            f"{t('referral_stats', lang)}\n"
+            f"• {fmt_num(stats['total_referrals'], lang)} — {'Total invited' if lang == 'en' else 'کل دعوت‌شدگان'}\n"
+            f"• {fmt_num(stats['completed_referrals'], lang)} — {'Bought (rewarded)' if lang == 'en' else 'خرید کرده (پاداش‌دار)'}\n"
+            f"• {fmt_num(stats['pending_referrals'], lang)} — {'Pending (not bought yet)' if lang == 'en' else 'در انتظار (هنوز خرید نکرده)'}\n"
+            f"• +{fmt_num(stats['bonus_days_total'], lang)}d / +{fmt_num(stats['bonus_gb_total'], lang)} GB — {'Total bonus earned' if lang == 'en' else 'کل پاداش کسب‌شده'}\n\n"
             f"{t('your_link', lang)}\n<code>{ref_link}</code>"
         )
-        await callback.message.edit_text(text, reply_markup=kb_back_to_menu(lang))
+        # Recent referrals history (last 5)
+        history = await db.get_referral_history(callback.from_user.id, limit=5)
+        if history:
+            text += f"\n\n{t('referral_history', lang)}\n"
+            for h in history:
+                name = escape_html(h.get("first_name") or h.get("username") or str(h["tg_id"]))
+                if h.get("referral_rewarded"):
+                    status = t("ref_status_bought", lang)
+                else:
+                    status = t("ref_status_pending", lang)
+                text += f"• {name} — {status}\n"
+        else:
+            text += f"\n\n{t('referral_no_history', lang)}"
+        kb = InlineKeyboardBuilder()
+        # t.me/share/url lets the user pick a chat to forward the link to.
+        share_url = f"https://t.me/share/url?url={ref_link}"
+        kb.button(style="success", text=t("share_link", lang), url=share_url)
+        kb.button(text=t("back", lang), callback_data=MenuCB(action="main").pack(), style="danger")
+        kb.adjust(1)
+        await callback.message.edit_text(text, reply_markup=kb.as_markup(), disable_web_page_preview=True)
         await callback.answer()
 
     # ====================================================== GIFT CODE
@@ -3725,6 +5478,13 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             await state.clear()
             await message.answer(t("gift_used_code", lang), reply_markup=kb_back_to_menu(lang))
             return
+        # C3 — atomic claim. Try to mark the code as used BEFORE granting the
+        # reward. If two parallel redemptions both pass the is_used check
+        # above, only one wins the UPDATE row and proceeds; the other aborts.
+        if not await db.use_gift_code(code, message.from_user.id):
+            await state.clear()
+            await message.answer(t("gift_used_code", lang), reply_markup=kb_back_to_menu(lang))
+            return
         await state.clear()
         currency = await _currency()
 
@@ -3732,7 +5492,6 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             amount = float(gift["value"])
             await db.update_user_balance(message.from_user.id, amount, add=True)
             await db.add_transaction(message.from_user.id, amount, "gift_balance", f"Gift: {code}")
-            await db.use_gift_code(code, message.from_user.id)
             await message.answer(
                 t("gift_balance_ok", lang, amount=fmt_price(amount, lang, currency)),
                 reply_markup=kb_back_to_menu(lang),
@@ -3751,7 +5510,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
                 await message.answer(t("no_inbounds", lang), reply_markup=kb_back_to_menu(lang))
                 return
             email = gen_email(message.from_user.id, "gift")
-            expiry_time = (int((datetime.now() + timedelta(days=plan["duration_days"])).timestamp() * 1000)
+            expiry_time = (int((datetime.now(timezone.utc) + timedelta(days=plan["duration_days"])).timestamp() * 1000)
                            if plan["duration_days"] > 0 else 0)
             sub_id = gen_sub_id()
             res = await api.create_client(
@@ -3760,16 +5519,42 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
                 tg_id=message.from_user.id, sub_id=sub_id,
             )
             if not res.get("success"):
-                await message.answer(f"❌ {res.get('msg')}", reply_markup=kb_back_to_menu(lang))
+                # C7 — COMPENSATION: gift was claimed but panel failed. We've
+                # already marked the code as used, so we can't un-claim it
+                # without risking a double-grant. Instead, log the failure and
+                # ask the user to contact support (admin can grant manually).
+                logger.error("gift plan panel create failed for code %s user %s: %s",
+                             code, message.from_user.id, res.get("msg"))
+                await message.answer(
+                    f"❌ {res.get('msg')}\n\n⚠️ Your gift code was claimed but the account "
+                    f"could not be created. Please contact support with code <code>{code}</code>.",
+                    reply_markup=kb_back_to_menu(lang),
+                )
                 return
             links = await api.get_client_links(server["panel_url"], server["api_token"], email)
-            await db.add_account(
-                user_tg_id=message.from_user.id, server_id=server["id"], email=email, sub_id=sub_id,
-                plan_id=plan["id"], traffic_gb=plan["traffic_gb"], expiry_time=expiry_time,
-                limit_ip=plan.get("limit_ip", 0), inbound_ids=json.dumps(inbound_ids), label="Gift",
-            )
-            await db.add_transaction(message.from_user.id, 0, "gift_plan", f"Gift: {code}", account_email=email, plan_id=plan["id"])
-            await db.use_gift_code(code, message.from_user.id)
+            # C7 — wrap multi-step DB writes in a transaction.
+            try:
+                async with db.transaction():
+                    await db.add_account(
+                        user_tg_id=message.from_user.id, server_id=server["id"], email=email, sub_id=sub_id,
+                        plan_id=plan["id"], traffic_gb=plan["traffic_gb"], expiry_time=expiry_time,
+                        limit_ip=plan.get("limit_ip", 0), inbound_ids=json.dumps(inbound_ids), label="Gift",
+                    )
+                    await db.add_transaction(message.from_user.id, 0, "gift_plan", f"Gift: {code}",
+                                             account_email=email, plan_id=plan["id"])
+            except Exception as e:
+                # C7 — compensation: panel client was created but DB failed.
+                logger.error("gift plan DB write failed (%s) — compensating", e)
+                try:
+                    await api.delete_client(server["panel_url"], server["api_token"], email)
+                except Exception as del_err:
+                    logger.error("compensation delete_client failed: %s", del_err)
+                await message.answer(
+                    "❌ Internal error. Please contact support with code "
+                    f"<code>{code}</code>.",
+                    reply_markup=kb_back_to_menu(lang),
+                )
+                return
             text = f"{t('gift_plan_ok', lang, plan=plan['name'])}\n\n"
             text += fmt_account_card(
                 {"email": email, "traffic_gb": plan["traffic_gb"], "expiry_time": expiry_time,
@@ -3791,11 +5576,15 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
     @router.callback_query(MenuCB.filter(F.action == "support"))
     async def cb_support(callback: CallbackQuery, db_user: dict):
         lang = _lang(db_user)
+        open_count = await db.count_open_tickets() if callback.from_user.id in ADMIN_IDS else 0
         kb = InlineKeyboardBuilder()
         kb.button(text=t("new_ticket", lang), callback_data=MenuCB(action="new_ticket").pack(), style="success")
         kb.button(style="primary", text=t("my_tickets", lang), callback_data=MenuCB(action="my_tickets").pack())
+        if callback.from_user.id in ADMIN_IDS:
+            badge = f" ({open_count})" if open_count else ""
+            kb.button(style="primary", text=f"🛡 Tickets{badge}", callback_data=AdminCB(action="tickets").pack())
         kb.button(text=t("back", lang), callback_data=MenuCB(action="main").pack(), style="danger")
-        kb.adjust(2, 1)
+        kb.adjust(2, 2 if callback.from_user.id in ADMIN_IDS else 1)
         await callback.message.edit_text(f"{t('support_title', lang)}\n\n{t('support_desc', lang)}",
                                          reply_markup=kb.as_markup())
         await callback.answer()
@@ -3803,14 +5592,38 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
     @router.callback_query(MenuCB.filter(F.action == "new_ticket"))
     async def cb_new_ticket(callback: CallbackQuery, state: FSMContext, db_user: dict):
         lang = _lang(db_user)
+        await state.set_state(UserStates.waiting_for_ticket_category)
+        kb = InlineKeyboardBuilder()
+        kb.button(style="primary", text=t("cat_technical", lang),
+                  callback_data=MenuCB(action="pick_cat", data="technical").pack())
+        kb.button(style="primary", text=t("cat_payment", lang),
+                  callback_data=MenuCB(action="pick_cat", data="payment").pack())
+        kb.button(style="primary", text=t("cat_account", lang),
+                  callback_data=MenuCB(action="pick_cat", data="account").pack())
+        kb.button(style="primary", text=t("cat_other", lang),
+                  callback_data=MenuCB(action="pick_cat", data="other").pack())
+        kb.button(text=t("back", lang), callback_data=MenuCB(action="support").pack(), style="danger")
+        kb.adjust(2, 2, 1)
+        await callback.message.edit_text(t("choose_category", lang), reply_markup=kb.as_markup())
+        await callback.answer()
+
+    @router.callback_query(MenuCB.filter(F.action == "pick_cat"))
+    async def cb_pick_category(callback: CallbackQuery, callback_data: MenuCB, state: FSMContext, db_user: dict):
+        lang = _lang(db_user)
+        category = callback_data.data or "other"
         await state.set_state(UserStates.waiting_for_ticket_subject)
-        await callback.message.edit_text(t("ask_subject", lang), reply_markup=kb_cancel(lang))
+        await state.update_data(category=category)
+        cat_label = t(f"cat_{category}", lang) if category in ("technical", "payment", "account", "other") else category
+        await callback.message.edit_text(t("ask_subject", lang, category=cat_label), reply_markup=kb_cancel(lang))
         await callback.answer()
 
     @router.message(UserStates.waiting_for_ticket_subject)
     async def ms_ticket_subject(message: Message, state: FSMContext, db_user: dict):
         lang = _lang(db_user)
         subject = (message.text or "").strip()[:100]
+        if not subject:
+            await message.answer(t("ask_subject", lang, category=""), reply_markup=kb_cancel(lang))
+            return
         await state.update_data(subject=subject)
         await state.set_state(UserStates.waiting_for_ticket_message)
         await message.answer(t("ask_message", lang, subject=escape_html(subject)), reply_markup=kb_cancel(lang))
@@ -3819,23 +5632,30 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
     async def ms_ticket_message(message: Message, state: FSMContext, db_user: dict):
         lang = _lang(db_user)
         msg_text = (message.text or "").strip()[:2000]
+        if not msg_text:
+            await message.answer(t("ask_message", lang, subject=""), reply_markup=kb_cancel(lang))
+            return
         data = await state.get_data()
         subject = data.get("subject", "No subject")
+        category = data.get("category", "other")
         await state.clear()
-        ticket_id = await db.create_ticket(message.from_user.id, subject)
+        ticket_id = await db.create_ticket(message.from_user.id, subject, category)
         await db.add_ticket_message(ticket_id, "user", msg_text)
+        cat_label = t(f"cat_{category}", lang) if category in ("technical", "payment", "account", "other") else category
         for admin_id in ADMIN_IDS:
-            try:
-                await bot.send_message(
+            await safe_notify(
+                bot.send_message(
                     admin_id,
                     f"🎫 <b>New Ticket #{ticket_id}</b>\n"
-                    f"👤 {message.from_user.full_name} (<code>{message.from_user.id}</code>)\n"
+                    f"👤 {escape_html(message.from_user.full_name)} (<code>{message.from_user.id}</code>)\n"
+                    f"🏷 {cat_label}\n"
                     f"📝 {escape_html(subject)}\n💬 {escape_html(msg_text[:500])}",
-                    reply_markup=kb_ticket_view(ticket_id, True),
-                )
-            except Exception:
-                pass
-        await message.answer(t("ticket_created", lang, id=ticket_id, subject=escape_html(subject)),
+                    reply_markup=kb_ticket_view(ticket_id, True, "en", "open",
+                                                user_tg_id=message.from_user.id),
+                ),
+                context="new-ticket admin notify",
+            )
+        await message.answer(t("ticket_created", lang, id=ticket_id, subject=escape_html(subject), category=cat_label),
                              reply_markup=kb_back_to_menu(lang))
 
     @router.callback_query(MenuCB.filter(F.action == "my_tickets"))
@@ -3848,12 +5668,14 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             return
         kb = InlineKeyboardBuilder()
         for tk in tickets:
-            status = "🟢" if tk["status"] == "open" else "🔴"
-            kb.button(style="primary", text=f"{status} #{tk['id']} - {tk['subject'][:25]}",
+            badge = _ticket_status_badge(tk, lang)
+            cat_emoji = _category_emoji(tk.get("category", "other"))
+            kb.button(style="primary",
+                      text=f"{badge} #{tk['id']} — {cat_emoji} {tk['subject'][:22]}",
                       callback_data=TicketCB(action="view", ticket_id=tk["id"]).pack())
         kb.button(text=t("back", lang), callback_data=MenuCB(action="support").pack(), style="danger")
         kb.adjust(1)
-        await callback.message.edit_text(t("no_tickets", lang).split('\n')[0], reply_markup=kb.as_markup())
+        await callback.message.edit_text(t("my_tickets", lang), reply_markup=kb.as_markup())
         await callback.answer()
 
     @router.callback_query(TicketCB.filter(F.action == "view"))
@@ -3868,29 +5690,172 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             await callback.answer(t("access_denied", lang), show_alert=True)
             return
         messages = await db.get_ticket_messages(callback_data.ticket_id)
-        text = (f"🎫 <b>Ticket #{ticket['id']}</b>\n"
-                f"📝 {escape_html(ticket['subject'])}\n"
-                f"📊 {'🟢 Open' if ticket['status']=='open' else '🔴 Closed'}\n"
-                f"📅 {ticket['created_at'][:16]}\n\n")
+        cat_label = t(f"cat_{ticket.get('category', 'other')}", lang) if ticket.get("category") in ("technical", "payment", "account", "other") else ticket.get("category", "other")
+        status_label = _ticket_status_label(ticket, lang)
+        text = (
+            f"🎫 <b>Ticket #{ticket['id']}</b>\n"
+            f"🏷 {cat_label}\n"
+            f"📝 {escape_html(ticket['subject'])}\n"
+            f"📊 {status_label}\n"
+            f"📅 {fmt_iso(ticket.get('created_at'))}\n\n"
+        )
+        # Feature 1 — admins see the ticket owner's numeric ID + @username + first_name
+        owner_user = None
+        if is_admin:
+            owner_user = await db.get_user(ticket["user_tg_id"])
+        if is_admin and owner_user:
+            uname = (owner_user.get("username") or "").strip()
+            first = (owner_user.get("first_name") or "").strip()
+            if uname:
+                uname_html = f'@<a href="https://t.me/{uname}">{uname}</a>'
+            else:
+                uname_html = "—"
+            text += (
+                f"👤 <b>User:</b> {escape_html(first)}\n"
+                f"🆔 <b>ID:</b> <code>{owner_user.get('tg_id', '')}</code>\n"
+                f"💬 <b>Username:</b> {uname_html}\n\n"
+            )
+        # Feature 3 — render each ticket message; if it has a media attachment,
+        # show a "[📎 Photo]" line above the caption (or in place of it).
+        media_label_map = {
+            "photo": t("media_photo", lang),
+            "document": t("media_document", lang),
+            "video": t("media_video", lang),
+            "voice": t("media_voice", lang),
+        }
         for m in messages:
             who = "👤" if m["sender"] == "user" else "🛡"
-            text += f"\n<b>{who} {m['created_at'][:16]}</b>\n{escape_html(m['message'][:600])}\n"
-        await callback.message.edit_text(text, reply_markup=kb_ticket_view(ticket["id"], is_admin, lang))
+            mtext = (m.get("message") or "")
+            mt = m.get("media_type") or ""
+            if mt:
+                label = media_label_map.get(mt, "Media")
+                text += f"<b>{who} {fmt_iso(m.get('created_at'))}</b>\n[📎 {label}]"
+                if mtext:
+                    text += f"\n{escape_html(mtext[:TICKET_MESSAGE_MAX_CHARS])}"
+                text += "\n\n"
+            else:
+                text += f"<b>{who} {fmt_iso(m.get('created_at'))}</b>\n{escape_html(mtext[:TICKET_MESSAGE_MAX_CHARS])}\n\n"
+        await callback.message.edit_text(
+            text,
+            reply_markup=kb_ticket_view(ticket["id"], is_admin, lang, ticket["status"],
+                                        user_tg_id=ticket["user_tg_id"], messages=messages),
+        )
         await callback.answer()
+
+    @router.callback_query(TicketMediaCB.filter())
+    async def cb_ticket_view_media(callback: CallbackQuery, callback_data: TicketMediaCB, db_user: dict):
+        """Re-send a ticket message's media attachment to the requesting user.
+
+        Looks up the ticket-message by (ticket_id, message_id) and forwards the
+        stored file_id via the appropriate bot.send_* method. Only the ticket
+        owner or an admin may fetch a ticket's media. (TICKET-1 Feature 3)
+        """
+        lang = _lang(db_user)
+        ticket = await db.get_ticket(callback_data.ticket_id)
+        if not ticket:
+            await callback.answer(t("not_found", lang), show_alert=True)
+            return
+        is_admin = callback.from_user.id in ADMIN_IDS
+        if ticket["user_tg_id"] != callback.from_user.id and not is_admin:
+            await callback.answer(t("access_denied", lang), show_alert=True)
+            return
+        messages = await db.get_ticket_messages(callback_data.ticket_id)
+        msg = next((m for m in messages if m.get("id") == callback_data.message_id), None)
+        if not msg:
+            await callback.answer(t("not_found", lang), show_alert=True)
+            return
+        media_type = msg.get("media_type") or ""
+        media_file_id = msg.get("media_file_id") or ""
+        if not media_type or not media_file_id:
+            await callback.answer(t("not_found", lang), show_alert=True)
+            return
+        sender_label = "Admin" if msg.get("sender") == "admin" else "User"
+        ts = fmt_iso(msg.get("created_at"))
+        caption_text = msg.get("media_caption") or ""
+        cap = f"📎 {sender_label} — {ts}"
+        if caption_text:
+            cap += f"\n{escape_html(caption_text[:900])}"
+        try:
+            if media_type == "photo":
+                await callback.message.answer_photo(photo=media_file_id, caption=cap)
+            elif media_type == "document":
+                await callback.message.answer_document(document=media_file_id, caption=cap)
+            elif media_type == "video":
+                await callback.message.answer_video(video=media_file_id, caption=cap)
+            elif media_type == "voice":
+                await callback.message.answer_voice(voice=media_file_id, caption=cap)
+            else:
+                await callback.answer(t("not_found", lang), show_alert=True)
+                return
+        except TelegramBadRequest as e:
+            logger.warning("ticket-view-media send failed: %s", e, exc_info=True)
+            await callback.answer(f"⚠️ {e}", show_alert=True)
+            return
+        except Exception as e:
+            logger.warning("ticket-view-media unexpected: %s", e, exc_info=True)
+            await callback.answer(t("not_found", lang), show_alert=True)
+            return
+        await callback.answer(t("media_sent", lang))
 
     @router.callback_query(TicketCB.filter(F.action == "reply"))
     async def cb_ticket_reply(callback: CallbackQuery, callback_data: TicketCB,
                               state: FSMContext, db_user: dict):
         lang = _lang(db_user)
+        ticket = await db.get_ticket(callback_data.ticket_id)
+        if not ticket:
+            await callback.answer(t("not_found", lang), show_alert=True)
+            return
         await state.set_state(UserStates.waiting_for_ticket_reply)
         await state.update_data(ticket_id=callback_data.ticket_id)
-        await callback.message.edit_text(t("ask_reply", lang), reply_markup=kb_cancel(lang))
+        # TICKET-1 Feature 3 — prompt now mentions that media attachments
+        # (photo / screenshot) are accepted as evidence.
+        header = (f"💬 <b>Reply to ticket #{callback_data.ticket_id}</b>\n"
+                  f"📝 {escape_html(ticket['subject'])}\n\n")
+        await callback.message.edit_text(
+            header + t("ask_reply_with_media", lang),
+            reply_markup=kb_cancel(lang),
+        )
         await callback.answer()
 
     @router.message(UserStates.waiting_for_ticket_reply)
     async def ms_ticket_reply(message: Message, state: FSMContext, db_user: dict):
+        """Accept text OR photo / document / video / voice (with optional caption)
+        as a ticket reply. Persist the message + media metadata, then notify the
+        other party — sending the media too if any. (TICKET-1 Feature 3)"""
         lang = _lang(db_user)
-        msg_text = (message.text or "").strip()[:2000]
+        # ---- Extract media + text from the incoming message ------------------
+        media_type = ""
+        media_file_id = ""
+        caption = ""
+        if message.photo:
+            media_type = "photo"
+            media_file_id = message.photo[-1].file_id  # largest size
+            caption = (message.caption or "").strip()
+        elif message.document:
+            media_type = "document"
+            media_file_id = message.document.file_id
+            caption = (message.caption or "").strip()
+        elif message.video:
+            media_type = "video"
+            media_file_id = message.video.file_id
+            caption = (message.caption or "").strip()
+        elif message.voice:
+            media_type = "voice"
+            media_file_id = message.voice.file_id
+            caption = ""  # voice messages can't have a caption
+        else:
+            msg_text = (message.text or "").strip()
+            if not msg_text:
+                header = (f"💬 <b>Reply to ticket</b>\n\n")
+                await message.answer(header + t("ask_reply_with_media", lang),
+                                     reply_markup=kb_cancel(lang))
+                return
+            msg_text = msg_text[:TICKET_REPLY_MAX_CHARS]
+        # For media replies, the stored `message` column is the caption (or an
+        # empty string). The media-type marker is rendered at view time.
+        if media_type:
+            msg_text = caption[:TICKET_REPLY_MAX_CHARS]
+        # ---- Persist ----------------------------------------------------------
         data = await state.get_data()
         ticket_id = data.get("ticket_id")
         await state.clear()
@@ -3899,29 +5864,93 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             await message.answer(t("not_found", lang), reply_markup=kb_back_to_menu(lang))
             return
         is_admin = message.from_user.id in ADMIN_IDS
+        # Users cannot reply to a closed ticket (they must reopen it first).
+        if not is_admin and ticket["status"] == "closed":
+            await message.answer(t("ticket_closed", lang, id=ticket_id),
+                                 reply_markup=kb_back_to_menu(lang))
+            return
         sender = "admin" if is_admin else "user"
-        await db.add_ticket_message(ticket_id, sender, msg_text)
+        await db.add_ticket_message(
+            ticket_id, sender, msg_text,
+            media_type=media_type,
+            media_file_id=media_file_id,
+            media_caption=caption,
+        )
+        # ---- Build the notification body + send (with media if attached) ----
+        # Body shown after the header — for text replies it's the message text;
+        # for media replies it's the caption (or a placeholder marker).
+        if media_type:
+            body_for_notify = caption if caption else f"[{media_type}]"
+        else:
+            body_for_notify = msg_text
         if is_admin:
-            try:
-                await bot.send_message(
-                    ticket["user_tg_id"],
-                    f"💬 <b>Admin replied — Ticket #{ticket_id}</b>\n📝 {escape_html(ticket['subject'])}\n💬 {escape_html(msg_text[:500])}",
-                    reply_markup=kb_ticket_view(ticket_id, False, lang),
-                )
-            except Exception:
-                pass
+            owner = await db.get_user(ticket["user_tg_id"]) or {}
+            ulang = L(owner.get("language", DEFAULT_LANGUAGE))
+            notify_text = (
+                f"💬 <b>Admin replied — Ticket #{ticket_id}</b>\n"
+                f"📝 {escape_html(ticket['subject'])}\n"
+                f"💬 {escape_html(body_for_notify[:500])}"
+            )
+            reply_kb = kb_ticket_view(ticket_id, False, ulang, "open",
+                                      user_tg_id=ticket["user_tg_id"])
+            await _send_ticket_reply_notify(
+                bot, ticket["user_tg_id"], notify_text,
+                media_type, media_file_id, reply_kb,
+                context="ticket-reply user notify",
+            )
             await message.answer(t("reply_sent_admin", lang), reply_markup=kb_back_to_menu(lang))
         else:
             for admin_id in ADMIN_IDS:
-                try:
-                    await bot.send_message(
-                        admin_id,
-                        f"💬 <b>User replied — Ticket #{ticket_id}</b>\n👤 {message.from_user.full_name}\n💬 {escape_html(msg_text[:500])}",
-                        reply_markup=kb_ticket_view(ticket_id, True),
-                    )
-                except Exception:
-                    pass
+                notify_text = (
+                    f"💬 <b>User replied — Ticket #{ticket_id}</b>\n"
+                    f"👤 {escape_html(message.from_user.full_name)} (<code>{message.from_user.id}</code>)\n"
+                    f"💬 {escape_html(body_for_notify[:500])}"
+                )
+                reply_kb = kb_ticket_view(ticket_id, True, "en", "open",
+                                          user_tg_id=ticket["user_tg_id"])
+                await _send_ticket_reply_notify(
+                    bot, admin_id, notify_text,
+                    media_type, media_file_id, reply_kb,
+                    context="ticket-reply admin notify",
+                )
             await message.answer(t("reply_sent_user", lang), reply_markup=kb_back_to_menu(lang))
+
+    @router.callback_query(TicketCB.filter(F.action == "reopen"))
+    async def cb_ticket_reopen(callback: CallbackQuery, callback_data: TicketCB, db_user: dict):
+        lang = _lang(db_user)
+        ticket = await db.get_ticket(callback_data.ticket_id)
+        if not ticket:
+            await callback.answer(t("not_found", lang), show_alert=True)
+            return
+        if ticket["user_tg_id"] != callback.from_user.id and callback.from_user.id not in ADMIN_IDS:
+            await callback.answer(t("access_denied", lang), show_alert=True)
+            return
+        await db.reopen_ticket(callback_data.ticket_id)
+        # Notify admins
+        for admin_id in ADMIN_IDS:
+            await safe_notify(
+                bot.send_message(
+                    admin_id,
+                    f"🔓 <b>Ticket #{callback_data.ticket_id} reopened</b>\n"
+                    f"👤 {escape_html(callback.from_user.full_name)}\n📝 {escape_html(ticket['subject'])}",
+                    reply_markup=kb_ticket_view(callback_data.ticket_id, True, "en", "open",
+                                                user_tg_id=ticket["user_tg_id"]),
+                ),
+                context="ticket-reopen admin notify",
+            )
+        await callback.answer(t("ticket_reopened", lang, id=callback_data.ticket_id), show_alert=True)
+        # Re-render the ticket view
+        messages = await db.get_ticket_messages(callback_data.ticket_id)
+        cat_label = t(f"cat_{ticket.get('category', 'other')}", lang) if ticket.get("category") in ("technical", "payment", "account", "other") else ticket.get("category", "other")
+        text = (
+            f"🎫 <b>Ticket #{ticket['id']}</b>\n"
+            f"🏷 {cat_label}\n📝 {escape_html(ticket['subject'])}\n"
+            f"📊 {t('ticket_status_open', lang)}\n📅 {fmt_iso(ticket.get('created_at'))}\n\n"
+        )
+        for m in messages:
+            who = "👤" if m["sender"] == "user" else "🛡"
+            text += f"<b>{who} {fmt_iso(m.get('created_at'))}</b>\n{escape_html(m['message'][:TICKET_MESSAGE_MAX_CHARS])}\n\n"
+        await callback.message.edit_text(text, reply_markup=kb_ticket_view(ticket["id"], False, lang, "open"))
 
     # ====================================================== GUIDE
     @router.callback_query(MenuCB.filter(F.action == "guide"))
@@ -3954,7 +5983,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     + account management), finance, promos, gift codes, tickets, broadcast,
     editable settings, depleted cleanup, groups."""
     router = Router()
-    guard = AdminGuard()
+    guard = AdminGuard(db)
 
     @router.message.middleware()
     async def _msg_mw(handler, event, data):
@@ -3967,14 +5996,40 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def _currency() -> str:
         return await db.get_setting("currency", DEFAULT_CURRENCY) or DEFAULT_CURRENCY
 
+    async def admin_lang(tg_id: int) -> str:
+        """Return the admin user's preferred language (from users.language).
+
+        Used by admin handlers so callback alerts / future admin screens can be
+        localised instead of hard-coded English. Falls back to DEFAULT_LANGUAGE
+        if the admin row is missing or has no language set. (M11)
+        """
+        user = await db.get_user(tg_id)
+        return L((user or {}).get("language", DEFAULT_LANGUAGE)) if user else DEFAULT_LANGUAGE
+
+    async def _is_full_admin(tg_id: int) -> bool:
+        return tg_id in ADMIN_IDS
+
     # ------------------------------------------------------------- /admin
     @router.message(Command("admin"))
     async def cmd_admin(message: Message):
-        await message.answer("⚙️ <b>Admin Panel</b>", reply_markup=kb_admin_menu())
+        if await _is_full_admin(message.from_user.id):
+            await message.answer("⚙️ <b>Admin Panel</b>", reply_markup=kb_admin_menu())
+        else:
+            # Payment-only admin — limited menu.
+            await message.answer(
+                "💰 <b>Payment Admin Panel</b>\n\n"
+                "You can approve or reject pending payments.",
+                reply_markup=kb_payment_admin_menu(),
+            )
 
     @router.callback_query(AdminCB.filter(F.action == "main"))
     async def cb_admin_main(callback: CallbackQuery):
-        await callback.message.edit_text("⚙️ <b>Admin Panel</b>", reply_markup=kb_admin_menu())
+        if await _is_full_admin(callback.from_user.id):
+            await show_view(callback.message, text="⚙️ <b>Admin Panel</b>", reply_markup=kb_admin_menu())
+        else:
+            await show_view(callback.message,
+                text="💰 <b>Payment Admin Panel</b>\n\nYou can approve or reject pending payments.",
+                reply_markup=kb_payment_admin_menu())
         await callback.answer()
 
     # ------------------------------------------------------- dashboard
@@ -4000,29 +6055,22 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             "revenue_today": rev["today_revenue"],
             "revenue_all": rev["all_time_revenue"],
         }
-        text = fmt_dashboard(stats, currency=await _currency())
-        if rev["top_plans"]:
-            text += "\n<b>🏆 Top Plans (30d)</b>\n<pre>"
-            text += f"{'Plan':<15} | {'#':>3} | {'Revenue':>10}\n"
-            text += "─" * 35 + "\n"
-            for p in rev["top_plans"]:
-                name = (p.get("name") or "—")[:15]
-                text += f"{name:<15} | {p['cnt']:>3} | {fmt_price(p.get('revenue') or 0, 'en', await _currency()):>10}\n"
-            text += "</pre>"
-        await callback.message.edit_text(text, reply_markup=kb_admin_menu())
+        cur = await _currency()
+        rich = rich_tables.dashboard_rich(stats, cur, rev.get("top_plans"), fmt_price)
+        await show_view(callback.message, rich=rich, reply_markup=kb_admin_menu())
         await callback.answer()
 
     # ====================================================== SERVERS
     @router.callback_query(AdminCB.filter(F.action == "servers"))
     async def cb_servers(callback: CallbackQuery):
         servers = await db.get_servers()
-        await callback.message.edit_text("🖥 <b>Servers</b>", reply_markup=kb_servers(servers))
+        await show_view(callback.message, text="🖥 <b>Servers</b>", reply_markup=kb_servers(servers))
         await callback.answer()
 
     @router.callback_query(ServerCB.filter(F.action == "add"))
     async def cb_server_add(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.waiting_for_server_alias)
-        await callback.message.edit_text(
+        await show_view(callback.message, text=
             "➕ <b>Add Server</b>\n\nEnter alias (e.g. <code>DE-Frankfurt</code>):",
             reply_markup=kb_cancel("en"),
         )
@@ -4114,18 +6162,18 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_srv_view(callback: CallbackQuery, callback_data: ServerCB):
         srv = await db.get_server(callback_data.server_id)
         if not srv:
-            await callback.answer("Not found", show_alert=True)
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
         online = await api.get_online_clients(srv["panel_url"], srv["api_token"])
-        await callback.message.edit_text(fmt_server_health(srv, len(online) if isinstance(online, list) else 0),
-                                         reply_markup=kb_server_view(srv["id"]))
+        rich = rich_tables.server_health_rich(srv, len(online) if isinstance(online, list) else 0, fmt_bytes)
+        await show_view(callback.message, rich=rich, reply_markup=kb_server_view(srv["id"]))
         await callback.answer()
 
     @router.callback_query(ServerCB.filter(F.action == "sync"))
     async def cb_srv_sync(callback: CallbackQuery, callback_data: ServerCB):
         srv = await db.get_server(callback_data.server_id)
         if not srv:
-            await callback.answer("Not found", show_alert=True)
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
         inbounds = await api.get_inbounds(srv["panel_url"], srv["api_token"])
         await db.sync_inbounds(srv["id"], inbounds)
@@ -4151,7 +6199,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_srv_test(callback: CallbackQuery, callback_data: ServerCB):
         srv = await db.get_server(callback_data.server_id)
         if not srv:
-            await callback.answer("Not found", show_alert=True)
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
         ok, msg = await api.test_panel_connection(srv["panel_url"], srv["api_token"])
         await db.update_server_health(srv["id"], ok, "" if ok else msg)
@@ -4161,7 +6209,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_srv_restart(callback: CallbackQuery, callback_data: ServerCB):
         srv = await db.get_server(callback_data.server_id)
         if not srv:
-            await callback.answer("Not found", show_alert=True)
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
         r = await api.restart_panel(srv["panel_url"], srv["api_token"])
         await callback.answer("✅ Restart initiated" if r.get("success") else f"❌ {r.get('msg')}", show_alert=True)
@@ -4170,7 +6218,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_srv_backup(callback: CallbackQuery, callback_data: ServerCB):
         srv = await db.get_server(callback_data.server_id)
         if not srv:
-            await callback.answer("Not found", show_alert=True)
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
         r = await api.backup_to_telegram(srv["panel_url"], srv["api_token"])
         await callback.answer("✅ Backup sent" if r.get("success") else f"❌ {r.get('msg')}", show_alert=True)
@@ -4179,7 +6227,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_srv_stats(callback: CallbackQuery, callback_data: ServerCB):
         srv = await db.get_server(callback_data.server_id)
         if not srv:
-            await callback.answer("Not found", show_alert=True)
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
         data = await api.get_clients_paged(srv["panel_url"], srv["api_token"], page=1, page_size=25)
         summary = data.get("summary", {})
@@ -4187,49 +6235,41 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         total = data.get("total", 0)
         online = await api.get_online_clients(srv["panel_url"], srv["api_token"])
         on_count = len(online) if isinstance(online, list) else 0
-        text = f"📊 <b>{escape_html(srv['alias'])}</b>\n<pre>"
-        text += f"┌──────────────────────────────┐\n"
-        text += f"│ Total:    {total:>19} │\n"
-        text += f"│ Active:   {summary.get('active',0):>19} │\n"
-        text += f"│ Online:   {on_count:>19} │\n"
-        text += f"│ Depleted: {len(summary.get('depleted',[])):>19} │\n"
-        text += f"│ Expiring: {len(summary.get('expiring',[])):>19} │\n"
-        text += f"│ Deactive: {len(summary.get('deactive',[])):>19} │\n"
-        text += f"└──────────────────────────────┘</pre>"
+        blocks = [rich_tables.heading(f"📊 {srv['alias']}"),
+                  rich_tables.kv_table([
+                      ("Total", total), ("Active", summary.get("active", 0)),
+                      ("Online", on_count),
+                      ("Depleted", len(summary.get("depleted", []))),
+                      ("Expiring", len(summary.get("expiring", []))),
+                      ("Deactive", len(summary.get("deactive", []))),
+                  ])]
         if items:
-            text += "\n<pre>"
-            text += f"{'Email':<26} | {'Status':<8} | {'Expiry':<12}\n"
-            text += "─" * 52 + "\n"
-            for it in items[:10]:
-                em = (it.get("email") or "—")[:26]
-                st = "Active" if it.get("enable") else "Off"
-                ex = fmt_ts(it.get("expiryTime", 0))[:12]
-                text += f"{em:<26} | {st:<8} | {ex:<12}\n"
-            text += "</pre>"
-        await callback.message.edit_text(text, reply_markup=kb_server_view(srv["id"]))
+            rows = [((it.get("email") or "—"), "Active" if it.get("enable") else "Off",
+                     fmt_ts(it.get("expiryTime", 0))[:10]) for it in items[:10]]
+            blocks.append(rich_tables.divider())
+            blocks.append(rich_tables.heading("📋 Clients", size=4))
+            blocks.append(rich_tables.grid_table(["Email", "Status", "Expiry"], rows,
+                                                 aligns=["left", "center", "center"]))
+        rich = rich_tables.rich_message(*blocks)
+        await show_view(callback.message, rich=rich, reply_markup=kb_server_view(srv["id"]))
         await callback.answer()
 
     @router.callback_query(ServerCB.filter(F.action == "inbounds"))
     async def cb_srv_inbounds(callback: CallbackQuery, callback_data: ServerCB):
         srv = await db.get_server(callback_data.server_id)
         if not srv:
-            await callback.answer("Not found", show_alert=True)
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
         inbounds = await db.get_inbounds(srv["id"])
-        text = f"📡 <b>Inbounds — {escape_html(srv['alias'])}</b>\n<pre>"
-        text += f"{'ID':>4} | {'Proto':<7} | {'Port':<6} | {'Remark':<20}\n"
-        text += "─" * 45 + "\n"
-        for ib in inbounds:
-            text += f"{ib['inbound_id']:>4} | {ib.get('protocol','?'):<7} | {str(ib.get('port','')):<6} | {(ib.get('remark') or '')[:20]:<20}\n"
-        text += "</pre>"
-        await callback.message.edit_text(text, reply_markup=kb_server_view(srv["id"]))
+        rich = rich_tables.inbounds_rich(srv["alias"], inbounds)
+        await show_view(callback.message, rich=rich, reply_markup=kb_server_view(srv["id"]))
         await callback.answer()
 
     @router.callback_query(ServerCB.filter(F.action == "edit"))
     async def cb_srv_edit(callback: CallbackQuery, callback_data: ServerCB):
         srv = await db.get_server(callback_data.server_id)
         if not srv:
-            await callback.answer("Not found", show_alert=True)
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
         kb = InlineKeyboardBuilder()
         kb.button(style="primary", text="✏️ Alias", callback_data=AdminCB(action="srv_edit_field", data=f"{srv['id']}_alias").pack())
@@ -4242,19 +6282,19 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         kb.button(text=toggle, callback_data=ServerCB(action="toggle", server_id=srv["id"]).pack(), style="primary")
         kb.button(text="🔙 Back", callback_data=ServerCB(action="view", server_id=srv["id"]).pack(), style="danger")
         kb.adjust(2, 2, 2, 1, 1)
-        await callback.message.edit_text("✏️ <b>Edit server — pick a field</b>", reply_markup=kb.as_markup())
+        await show_view(callback.message, text="✏️ <b>Edit server — pick a field</b>", reply_markup=kb.as_markup())
         await callback.answer()
 
     @router.callback_query(ServerCB.filter(F.action == "toggle"))
     async def cb_srv_toggle(callback: CallbackQuery, callback_data: ServerCB):
         srv = await db.get_server(callback_data.server_id)
         if not srv:
-            await callback.answer("Not found", show_alert=True)
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
         await db.toggle_server(srv["id"], not srv["is_active"])
-        await callback.answer("✅ Toggled", show_alert=True)
+        await callback.answer(t("toggled", await admin_lang(callback.from_user.id)), show_alert=True)
         servers = await db.get_servers()
-        await callback.message.edit_text("🖥 <b>Servers</b>", reply_markup=kb_servers(servers))
+        await show_view(callback.message, text="🖥 <b>Servers</b>", reply_markup=kb_servers(servers))
 
     @router.callback_query(AdminCB.filter(F.action == "srv_edit_field"))
     async def cb_srv_edit_field(callback: CallbackQuery, callback_data: AdminCB, state: FSMContext):
@@ -4263,7 +6303,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         await state.update_data(edit_type="server", server_id=int(server_id), field=field)
         labels = {"alias": "alias", "priority": "priority (number)", "capacity": "capacity (number)",
                   "location": "location", "sub_uri": "subscription base URI", "api_token": "API token"}
-        await callback.message.edit_text(
+        await show_view(callback.message, text=
             f"✏️ Enter new <b>{labels.get(field, field)}</b>:",
             reply_markup=kb_cancel("en"),
         )
@@ -4273,12 +6313,12 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_srv_delete_ask(callback: CallbackQuery, callback_data: ServerCB):
         srv = await db.get_server(callback_data.server_id)
         if not srv:
-            await callback.answer("Not found", show_alert=True)
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
         kb = InlineKeyboardBuilder()
         kb.button(text="🗑 Confirm Delete", callback_data=ServerCB(action="delete", server_id=srv["id"]).pack(), style="danger")
         kb.button(text="🔙 Back", callback_data=ServerCB(action="view", server_id=srv["id"]).pack(), style="primary")
-        await callback.message.edit_text(
+        await show_view(callback.message, text=
             f"🗑 <b>Delete server {escape_html(srv['alias'])}?</b>\n\nAccounts on this server will remain in DB but become unmanageable.",
             reply_markup=kb.as_markup(),
         )
@@ -4288,20 +6328,20 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_srv_delete(callback: CallbackQuery, callback_data: ServerCB):
         await db.delete_server(callback_data.server_id)
         servers = await db.get_servers()
-        await callback.message.edit_text("✅ Server deleted.", reply_markup=kb_servers(servers))
+        await show_view(callback.message, text="✅ Server deleted.", reply_markup=kb_servers(servers))
         await callback.answer("Deleted")
 
     # ====================================================== PLANS
     @router.callback_query(AdminCB.filter(F.action == "plans"))
     async def cb_plans(callback: CallbackQuery):
         plans = await db.get_plans(active_only=False)
-        await callback.message.edit_text("📦 <b>Plans</b>", reply_markup=kb_admin_plans(plans))
+        await show_view(callback.message, text="📦 <b>Plans</b>", reply_markup=kb_admin_plans(plans))
         await callback.answer()
 
     @router.callback_query(PlanCB.filter(F.action == "add"))
     async def cb_plan_add(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.waiting_for_plan_name)
-        await callback.message.edit_text("➕ <b>Add Plan</b>\n\nEnter name:", reply_markup=kb_cancel("en"))
+        await show_view(callback.message, text="➕ <b>Add Plan</b>\n\nEnter name:", reply_markup=kb_cancel("en"))
         await callback.answer()
 
     @router.message(AdminStates.waiting_for_plan_name)
@@ -4388,7 +6428,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         kb = InlineKeyboardBuilder()
         servers = await db.get_servers(active_only=True)
         for srv in servers:
-            kb.button(style="primary", text=f"— {escape_html(srv['alias'])} —", callback_data="noop_0")
+            kb.button(style="primary", text=f"— {escape_html(srv['alias'])} —", callback_data=NoopCB().pack())
             inbounds = await db.get_inbounds(srv["id"], enabled_only=True)
             for ib in inbounds:
                 key = f"{srv['id']}_{ib['inbound_id']}"
@@ -4409,7 +6449,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_ib_toggle(callback: CallbackQuery, callback_data: InboundCB):
         plan = await db.get_plan(callback_data.plan_id)
         if not plan:
-            await callback.answer("Plan not found", show_alert=True)
+            # L12 — admin-facing i18n (was English-only "Plan not found").
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
         try:
             selected = set(json.loads(plan.get("inbound_ids") or "[]"))
@@ -4420,7 +6461,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         else:
             selected.add(callback_data.key)
         await db.update_plan(plan["id"], inbound_ids=json.dumps(list(selected)))
-        await callback.message.edit_text(
+        await show_view(callback.message, text=
             f"🔗 <b>Inbounds for {escape_html(plan['name'])}</b>\nSelected: {len(selected)}",
             reply_markup=await _inbound_kb(plan["id"]),
         )
@@ -4429,13 +6470,13 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     @router.callback_query(InboundCB.filter(F.action == "clear"))
     async def cb_ib_clear(callback: CallbackQuery, callback_data: InboundCB):
         await db.update_plan(callback_data.plan_id, inbound_ids="[]")
-        await callback.message.edit_text("Cleared.", reply_markup=await _inbound_kb(callback_data.plan_id))
+        await show_view(callback.message, text="Cleared.", reply_markup=await _inbound_kb(callback_data.plan_id))
         await callback.answer()
 
     @router.callback_query(InboundCB.filter(F.action == "save"))
     async def cb_ib_save(callback: CallbackQuery, callback_data: InboundCB):
         plan = await db.get_plan(callback_data.plan_id)
-        await callback.message.edit_text(
+        await show_view(callback.message, text=
             f"✅ Saved.\n\n{fmt_plan_card(plan, 'en', await _currency())}",
             reply_markup=kb_admin_plan_view(plan["id"], plan["is_active"]),
         )
@@ -4445,7 +6486,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_plan_admin_view(callback: CallbackQuery, callback_data: PlanCB):
         plan = await db.get_plan(callback_data.plan_id)
         if not plan:
-            await callback.answer("Not found", show_alert=True)
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
         text = fmt_plan_card(plan, "en", await _currency())
         inb = plan.get("inbound_ids") or "[]"
@@ -4454,16 +6495,16 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         except Exception:
             n = 0
         text += f"\n\n🔗 Inbounds: {n}\n📊 Status: {'✅' if plan['is_active'] else '❌'}"
-        await callback.message.edit_text(text, reply_markup=kb_admin_plan_view(plan["id"], plan["is_active"]))
+        await show_view(callback.message, text=text, reply_markup=kb_admin_plan_view(plan["id"], plan["is_active"]))
         await callback.answer()
 
     @router.callback_query(PlanCB.filter(F.action == "inbounds"))
     async def cb_plan_inbounds(callback: CallbackQuery, callback_data: PlanCB):
         plan = await db.get_plan(callback_data.plan_id)
         if not plan:
-            await callback.answer("Not found", show_alert=True)
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
-        await callback.message.edit_text(
+        await show_view(callback.message, text=
             f"🔗 <b>Inbounds — {escape_html(plan['name'])}</b>\nToggle the inbounds this plan can use:",
             reply_markup=await _inbound_kb(plan["id"]),
         )
@@ -4473,25 +6514,25 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_plan_toggle(callback: CallbackQuery, callback_data: PlanCB):
         plan = await db.get_plan(callback_data.plan_id)
         if not plan:
-            await callback.answer("Not found", show_alert=True)
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
         await db.toggle_plan(plan["id"], not plan["is_active"])
         plans = await db.get_plans(active_only=False)
-        await callback.message.edit_text("📦 <b>Plans</b>", reply_markup=kb_admin_plans(plans))
+        await show_view(callback.message, text="📦 <b>Plans</b>", reply_markup=kb_admin_plans(plans))
         await callback.answer()
 
     @router.callback_query(PlanCB.filter(F.action == "delete"))
     async def cb_plan_delete(callback: CallbackQuery, callback_data: PlanCB):
         await db.delete_plan(callback_data.plan_id)
         plans = await db.get_plans(active_only=False)
-        await callback.message.edit_text("✅ Deleted.", reply_markup=kb_admin_plans(plans))
+        await show_view(callback.message, text="✅ Deleted.", reply_markup=kb_admin_plans(plans))
         await callback.answer()
 
     @router.callback_query(PlanCB.filter(F.action == "edit"))
     async def cb_plan_edit(callback: CallbackQuery, callback_data: PlanCB):
         plan = await db.get_plan(callback_data.plan_id)
         if not plan:
-            await callback.answer("Not found", show_alert=True)
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
         kb = InlineKeyboardBuilder()
         for field, label in [("name", "📛 Name"), ("description", "📝 Description"),
@@ -4500,7 +6541,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             kb.button(style="primary", text=label, callback_data=AdminCB(action="plan_edit_field", data=f"{plan['id']}_{field}").pack())
         kb.button(text="🔙 Back", callback_data=PlanCB(action="admin_view", plan_id=plan["id"]).pack(), style="danger")
         kb.adjust(2, 2, 2, 1)
-        await callback.message.edit_text("✏️ <b>Edit plan — pick a field</b>", reply_markup=kb.as_markup())
+        await show_view(callback.message, text="✏️ <b>Edit plan — pick a field</b>", reply_markup=kb.as_markup())
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "plan_edit_field"))
@@ -4508,7 +6549,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         plan_id, field = callback_data.data.split("_", 1)
         await state.set_state(AdminStates.setting_edit_value)
         await state.update_data(edit_type="plan", plan_id=int(plan_id), field=field)
-        await callback.message.edit_text(f"✏️ Enter new <b>{field}</b>:", reply_markup=kb_cancel("en"))
+        await show_view(callback.message, text=f"✏️ Enter new <b>{field}</b>:", reply_markup=kb_cancel("en"))
         await callback.answer()
 
     # Generic value handler for ALL admin FSM edits (server / plan / setting_int / acc_extend)
@@ -4535,8 +6576,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             await state.clear()
             srv = await db.get_server(server_id)
             online = await api.get_online_clients(srv["panel_url"], srv["api_token"])
-            await message.answer(fmt_server_health(srv, len(online) if isinstance(online, list) else 0),
-                                 reply_markup=kb_server_view(server_id))
+            rich = rich_tables.server_health_rich(srv, len(online) if isinstance(online, list) else 0, fmt_bytes)
+            await message.answer_rich(rich_message=rich, reply_markup=kb_server_view(server_id))
 
         # ---- plan field edit ----
         elif edit_type == "plan":
@@ -4628,7 +6669,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             if not r.get("success"):
                 await message.answer(f"❌ {r.get('msg')}", reply_markup=kb_admin_menu())
                 return
-            now_ms = int(datetime.now().timestamp() * 1000)
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
             base = account["expiry_time"] if account["expiry_time"] and account["expiry_time"] > now_ms else now_ms
             new_exp = base + days * MS_PER_DAY if days > 0 else account["expiry_time"]
             new_traffic = (account["traffic_gb"] + gb) if account["traffic_gb"] and gb else (account["traffic_gb"] or gb)
@@ -4647,7 +6688,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     @router.callback_query(AdminCB.filter(F.action == "users"))
     async def cb_users(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.waiting_for_user_search)
-        await callback.message.edit_text(
+        await show_view(callback.message, text=
             "👥 <b>Users</b>\n\nSearch by Telegram ID, username or email.\n"
             "Send <code>all</code> to list recent users.",
             reply_markup=kb_cancel("en"),
@@ -4666,46 +6707,43 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             await message.answer("❌ No users found.", reply_markup=kb_admin_menu())
             return
         cur = await _currency()
-        text = f"👥 <b>Results ({len(users)})</b>\n<pre>"
-        text += f"{'TG ID':<12} | {'Username':<18} | {'Balance':>10} | {'Orders':>6}\n"
-        text += "─" * 54 + "\n"
-        for u in users[:20]:
-            text += f"{u['tg_id']:<12} | {(u.get('username') or '-')[:18]:<18} | {fmt_price(u.get('balance',0),'en',cur):>10} | {u.get('total_orders',0):>6}\n"
-        text += "</pre>"
+        rich = rich_tables.user_search_rich(users, cur, fmt_price)
         kb = InlineKeyboardBuilder()
         for u in users[:10]:
             kb.button(style="primary", text=f"👤 {u['tg_id']} · {(u.get('username') or '-')[:15]}",
                       callback_data=AdminCB(action="user_view", data=str(u["tg_id"])).pack())
         kb.button(text="🔙 Admin", callback_data=AdminCB(action="main").pack(), style="danger")
         kb.adjust(1)
-        await message.answer(text, reply_markup=kb.as_markup())
+        await message.answer_rich(rich_message=rich, reply_markup=kb.as_markup())
 
     @router.callback_query(AdminCB.filter(F.action == "user_view"))
     async def cb_user_view(callback: CallbackQuery, callback_data: AdminCB):
         tg_id = int(callback_data.data)
         user = await db.get_user(tg_id)
         if not user:
-            await callback.answer("Not found", show_alert=True)
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
         accounts = await db.get_user_accounts(tg_id)
         cur = await _currency()
-        text = "👤 <b>User</b>\n<pre>"
-        text += f"┌──────────────────────────────┐\n"
-        text += f"│ TG ID:    {user['tg_id']:<18} │\n"
-        text += f"│ Username: {(user.get('username') or '-')[:18]:<18} │\n"
-        text += f"│ Balance:  {fmt_price(user.get('balance',0),'en',cur):>18} │\n"
-        text += f"│ Orders:   {user.get('total_orders',0):<18} │\n"
-        text += f"│ Spent:    {fmt_price(user.get('total_spent',0),'en',cur):>18} │\n"
-        text += f"│ Banned:   {'Yes' if user.get('is_banned') else 'No':<18} │\n"
-        text += f"│ Joined:   {user['created_at'][:18]:<18} │\n"
-        text += f"└──────────────────────────────┘</pre>"
+        blocks = [rich_tables.heading("👤 User"),
+                  rich_tables.kv_table([
+                      ("TG ID", user["tg_id"]),
+                      ("Username", (user.get("username") or "-")),
+                      ("Balance", fmt_price(user.get("balance", 0), "en", cur)),
+                      ("Orders", user.get("total_orders", 0)),
+                      ("Spent", fmt_price(user.get("total_spent", 0), "en", cur)),
+                      ("Banned", "Yes" if user.get("is_banned") else "No"),
+                      ("Joined", fmt_iso(user.get("created_at"), "%Y-%m-%d %H:%M:%S")),
+                  ])]
         if accounts:
-            text += f"\n📱 <b>Accounts ({len(accounts)})</b>\n"
-            for a in accounts:
-                st = "🟢" if a["is_active"] else "🔴"
-                tr = " 🎁" if a["is_trial"] else ""
-                lbl = a.get("label") or ""
-                text += f"{st}<code>{escape_html(a['email'])}</code>{tr} {escape_html(lbl)}\n"
+            rows = [("🟢" if a["is_active"] else "🔴",
+                     ("🎁 " if a.get("is_trial") else "") + a["email"],
+                     a.get("label") or "") for a in accounts]
+            blocks.append(rich_tables.divider())
+            blocks.append(rich_tables.heading(f"📱 Accounts ({len(accounts)})", size=4))
+            blocks.append(rich_tables.grid_table(["Status", "Email", "Label"], rows,
+                                                 aligns=["center", "left", "left"]))
+        rich = rich_tables.rich_message(*blocks)
         kb = InlineKeyboardBuilder()
         if user.get("is_banned"):
             kb.button(text="✅ Unban", callback_data=AdminCB(action="unban", data=str(tg_id)).pack(), style="success")
@@ -4721,7 +6759,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
                       callback_data=AdminCB(action="user_account", data=f"{tg_id}_{a['email']}").pack())
         kb.button(text="🔙 Search", callback_data=AdminCB(action="users").pack(), style="danger")
         kb.adjust(2, 2, 1, 1, 1)
-        await callback.message.edit_text(text, reply_markup=kb.as_markup())
+        await show_view(callback.message, rich=rich, reply_markup=kb.as_markup())
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "ban"))
@@ -4739,7 +6777,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         tg_id = int(callback_data.data)
         await state.set_state(AdminStates.waiting_for_add_balance)
         await state.update_data(tg_id=tg_id)
-        await callback.message.edit_text(
+        await show_view(callback.message, text=
             f"💰 <b>Add balance</b> to user <code>{tg_id}</code>\n\nEnter amount in {await _currency()}:",
             reply_markup=kb_cancel("en"),
         )
@@ -4766,14 +6804,14 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         )
         cur = await _currency()
         user = await db.get_user(tg_id)
-        try:
-            await bot.send_message(
+        await safe_notify(
+            bot.send_message(
                 tg_id,
                 f"💰 <b>Balance updated</b>\n\n➕ {fmt_price(abs(amount), 'en' if (user or {}).get('language','en')=='en' else 'fa', cur)} added.\n"
                 f"💳 New balance: {fmt_price((user or {}).get('balance',0), 'en' if (user or {}).get('language','en')=='en' else 'fa', cur)}",
-            )
-        except Exception:
-            pass
+            ),
+            context="balance-update user notify",
+        )
         await message.answer(
             f"✅ Added {fmt_price(abs(amount), 'en', cur)} to <code>{tg_id}</code>",
             reply_markup=kb_admin_menu(),
@@ -4784,7 +6822,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         tg_id = int(callback_data.data)
         await state.set_state(AdminStates.waiting_for_deduct_balance)
         await state.update_data(tg_id=tg_id)
-        await callback.message.edit_text(
+        await show_view(callback.message, text=
             f"➖ <b>Deduct balance</b> from <code>{tg_id}</code>\n\nEnter amount:",
             reply_markup=kb_cancel("en"),
         )
@@ -4822,7 +6860,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         tg_id = int(callback_data.data)
         plans = await db.get_plans(active_only=True)
         if not plans:
-            await callback.answer("No plans available.", show_alert=True)
+            # L12 — admin-facing i18n (was English-only "No plans available.").
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
         await state.set_state(AdminStates.waiting_for_admin_account_create)
         await state.update_data(tg_id=tg_id)
@@ -4832,7 +6871,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
                       callback_data=AdminCB(action="create_account_pick", data=f"{tg_id}_{p['id']}").pack())
         kb.button(text="❌ Cancel", callback_data=AdminCB(action="user_view", data=str(tg_id)).pack(), style="danger")
         kb.adjust(1)
-        await callback.message.edit_text("➕ <b>Create account for user</b> — pick a plan:", reply_markup=kb.as_markup())
+        await show_view(callback.message, text="➕ <b>Create account for user</b> — pick a plan:", reply_markup=kb.as_markup())
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "create_account_pick"))
@@ -4841,19 +6880,20 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         tg_id, plan_id = int(tg_id_str), int(plan_id_str)
         plan = await db.get_plan(plan_id)
         if not plan:
-            await callback.answer("Plan not found", show_alert=True)
+            # L12 — admin-facing i18n.
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
-        await callback.message.edit_text("⏳ Creating account...")
+        await show_view(callback.message, text="⏳ Creating account...")
         server = await lb.select_best_server(lb.plan_server_ids(plan) or None)
         if not server:
-            await callback.message.edit_text("❌ No servers available.", reply_markup=kb_admin_menu())
+            await show_view(callback.message, text="❌ No servers available.", reply_markup=kb_admin_menu())
             return
         inbound_ids = await lb.select_inbounds_for_plan(server, plan)
         if not inbound_ids:
-            await callback.message.edit_text("❌ No inbounds available.", reply_markup=kb_admin_menu())
+            await show_view(callback.message, text="❌ No inbounds available.", reply_markup=kb_admin_menu())
             return
         email = gen_email(tg_id, "admin")
-        expiry = int((datetime.now() + timedelta(days=plan["duration_days"])).timestamp() * 1000) if plan["duration_days"] > 0 else 0
+        expiry = int((datetime.now(timezone.utc) + timedelta(days=plan["duration_days"])).timestamp() * 1000) if plan["duration_days"] > 0 else 0
         sub_id = gen_sub_id()
         res = await api.create_client(
             panel_url=server["panel_url"], token=server["api_token"], email=email,
@@ -4861,7 +6901,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             limit_ip=plan.get("limit_ip", 0), tg_id=tg_id, sub_id=sub_id,
         )
         if not res.get("success"):
-            await callback.message.edit_text(f"❌ {res.get('msg')}", reply_markup=kb_admin_menu())
+            await show_view(callback.message, text=f"❌ {res.get('msg')}", reply_markup=kb_admin_menu())
             return
         await db.add_account(
             user_tg_id=tg_id, server_id=server["id"], email=email, sub_id=sub_id,
@@ -4870,14 +6910,14 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         )
         await db.add_transaction(tg_id, 0, "admin_adjust", f"Admin created account ({plan['name']})",
                                  account_email=email, plan_id=plan["id"], admin_id=callback.from_user.id)
-        try:
-            await bot.send_message(
+        await safe_notify(
+            bot.send_message(
                 tg_id,
                 f"🎁 <b>Admin created a VPN account for you!</b>\n\n📦 {escape_html(plan['name'])}\n📧 <code>{escape_html(email)}</code>",
-            )
-        except Exception:
-            pass
-        await callback.message.edit_text(
+            ),
+            context="manual-account-create user notify",
+        )
+        await show_view(callback.message, text=
             f"✅ Account created for <code>{tg_id}</code>\n📧 <code>{escape_html(email)}</code>",
             reply_markup=kb_admin_menu(),
         )
@@ -4890,7 +6930,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         tg_id = int(tg_id_str)
         account = await db.get_account(email)
         if not account or account["user_tg_id"] != tg_id:
-            await callback.answer("Not found", show_alert=True)
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
         server = await db.get_server(account["server_id"])
         plan = await db.get_plan(account["plan_id"]) if account.get("plan_id") else None
@@ -4909,7 +6949,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         kb.button(text="🗑 Delete", callback_data=AdminCB(action="acc_delete", data=f"{tg_id}_{email}").pack(), style="danger")
         kb.button(text="🔙 User", callback_data=AdminCB(action="user_view", data=str(tg_id)).pack(), style="danger")
         kb.adjust(2, 2, 1)
-        await callback.message.edit_text(text, reply_markup=kb.as_markup())
+        await show_view(callback.message, text=text, reply_markup=kb.as_markup())
         await callback.answer()
 
     async def _parse_email(callback_data: AdminCB) -> Tuple[int, str]:
@@ -4921,7 +6961,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         tg_id, email = await _parse_email(callback_data)
         await state.set_state(AdminStates.setting_edit_value)
         await state.update_data(edit_type="acc_extend", tg_id=tg_id, email=email)
-        await callback.message.edit_text(
+        await show_view(callback.message, text=
             "➕ Extend account.\nSend days and GB, e.g. <code>30 10</code> (30 days, 10 GB). Use 0 to skip either.",
             reply_markup=kb_cancel("en"),
         )
@@ -4932,7 +6972,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         tg_id, email = await _parse_email(callback_data)
         account = await db.get_account(email)
         if not account:
-            await callback.answer("Not found", show_alert=True)
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
         server = await db.get_server(account["server_id"])
         r = await api.reset_client_traffic(server["panel_url"], server["api_token"], email)
@@ -4968,7 +7008,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         await db.delete_account(email)
         await callback.answer("✅ Deleted", show_alert=True)
         # refresh user view
-        await callback.message.edit_text("✅ Account deleted.",
+        await show_view(callback.message, text="✅ Account deleted.",
                                          reply_markup=InlineKeyboardBuilder()
                                          .button(text="🔙 User", callback_data=AdminCB(action="user_view", data=str(tg_id)).pack(), style="primary")
                                          .as_markup())
@@ -4978,22 +7018,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_finance(callback: CallbackQuery):
         rev = await db.get_revenue_stats(days=30)
         cur = await _currency()
-        text = "💰 <b>Finance (30d)</b>\n<pre>"
-        text += f"┌──────────────────────────────┐\n"
-        text += f"│ Revenue 30d:  {fmt_price(rev['total_revenue'],'en',cur):>16} │\n"
-        text += f"│ Today:        {fmt_price(rev['today_revenue'],'en',cur):>16} │\n"
-        text += f"│ All-time:     {fmt_price(rev['all_time_revenue'],'en',cur):>16} │\n"
-        text += f"│ Transactions: {rev['transaction_count']:>16} │\n"
-        avg = rev["total_revenue"] / max(rev["transaction_count"], 1)
-        text += f"│ Avg order:    {fmt_price(avg,'en',cur):>16} │\n"
-        text += f"└──────────────────────────────┘</pre>"
-        if rev["top_plans"]:
-            text += "\n<b>🏆 Top Plans</b>\n<pre>"
-            text += f"{'Plan':<15} | {'#':>4} | {'Revenue':>12}\n" + "─" * 36 + "\n"
-            for p in rev["top_plans"]:
-                text += f"{(p.get('name') or '—')[:15]:<15} | {p['cnt']:>4} | {fmt_price(p.get('revenue') or 0,'en',cur):>12}\n"
-            text += "</pre>"
-        await callback.message.edit_text(text, reply_markup=kb_admin_menu())
+        rich = rich_tables.finance_rich(rev, cur, fmt_price)
+        await show_view(callback.message, rich=rich, reply_markup=kb_admin_menu())
         await callback.answer()
 
     # ====================================================== PROMOS
@@ -5001,27 +7027,22 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_promos(callback: CallbackQuery):
         promos = await db.get_promo_codes()
         cur = await _currency()
-        text = "🎫 <b>Promo Codes</b>\n\n"
-        if promos:
-            text += "<pre>"
-            text += f"{'Code':<14} | {'Disc':>6} | {'Used':>5} | {'Max':>5}\n" + "─" * 38 + "\n"
-            for p in promos:
-                disc = f"{p['discount_percent']}%" if p["discount_percent"] > 0 else fmt_price(p["discount_amount"], "en", cur)
-                text += f"{p['code']:<14} | {disc:>6} | {p['used_count']:>5} | {p['max_uses'] or '∞':>5}\n"
-            text += "</pre>"
-        else:
-            text += "No promo codes yet."
         kb = InlineKeyboardBuilder()
         kb.button(text="➕ Create", callback_data=AdminCB(action="create_promo").pack(), style="success")
         kb.button(text="🔙 Admin", callback_data=AdminCB(action="main").pack(), style="danger")
         kb.adjust(1)
-        await callback.message.edit_text(text, reply_markup=kb.as_markup())
+        if promos:
+            rich = rich_tables.promos_rich(promos, cur, fmt_price)
+        else:
+            rich = rich_tables.rich_message(rich_tables.heading("🎫 Promo Codes"),
+                                            rich_tables.paragraph("No promo codes yet."))
+        await show_view(callback.message, rich=rich, reply_markup=kb.as_markup())
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "create_promo"))
     async def cb_create_promo(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.waiting_for_promo_code_str)
-        await callback.message.edit_text("🎫 <b>Create promo</b>\n\nCode (or <code>-</code> for random):",
+        await show_view(callback.message, text="🎫 <b>Create promo</b>\n\nCode (or <code>-</code> for random):",
                                          reply_markup=kb_cancel("en"))
         await callback.answer()
 
@@ -5064,29 +7085,23 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     @router.callback_query(AdminCB.filter(F.action == "gift_codes"))
     async def cb_gift_codes(callback: CallbackQuery):
         gifts = await db.get_gift_codes(unused_only=False)
-        cur = await _currency()
-        text = "🎁 <b>Gift Codes</b>\n\n"
-        if gifts:
-            text += "<pre>"
-            text += f"{'Code':<20} | {'Type':<8} | {'Value':<10} | {'Used':<4}\n" + "─" * 50 + "\n"
-            for g in gifts[:25]:
-                val = g["value"][:10]
-                text += f"{g['code']:<20} | {g['type']:<8} | {val:<10} | {'Yes' if g['is_used'] else 'No':<4}\n"
-            text += "</pre>"
-        else:
-            text += "No gift codes yet."
         kb = InlineKeyboardBuilder()
         kb.button(text="➕ Gift (Balance)", callback_data=AdminCB(action="create_gift_balance").pack(), style="success")
         kb.button(text="➕ Gift (Plan)", callback_data=AdminCB(action="create_gift_plan").pack(), style="primary")
         kb.button(text="🔙 Admin", callback_data=AdminCB(action="main").pack(), style="danger")
         kb.adjust(1, 1, 1)
-        await callback.message.edit_text(text, reply_markup=kb.as_markup())
+        if gifts:
+            rich = rich_tables.gift_codes_rich(gifts)
+        else:
+            rich = rich_tables.rich_message(rich_tables.heading("🎁 Gift Codes"),
+                                            rich_tables.paragraph("No gift codes yet."))
+        await show_view(callback.message, rich=rich, reply_markup=kb.as_markup())
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "create_gift_balance"))
     async def cb_gift_balance(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.waiting_for_gift_amount)
-        await callback.message.edit_text(
+        await show_view(callback.message, text=
             f"💰 <b>Balance gift</b>\n\nEnter amount in {await _currency()}:",
             reply_markup=kb_cancel("en"),
         )
@@ -5109,7 +7124,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_gift_plan(callback: CallbackQuery, state: FSMContext):
         plans = await db.get_plans(active_only=True)
         if not plans:
-            await callback.answer("No plans", show_alert=True)
+            # L12 — admin-facing i18n.
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
         await state.set_state(AdminStates.waiting_for_gift_plan)
         kb = InlineKeyboardBuilder()
@@ -5118,7 +7134,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
                       callback_data=AdminCB(action="gift_plan_pick", data=str(p["id"])).pack())
         kb.button(text="❌ Cancel", callback_data=AdminCB(action="gift_codes").pack(), style="danger")
         kb.adjust(1)
-        await callback.message.edit_text("🎁 Pick a plan for the gift code:", reply_markup=kb.as_markup())
+        await show_view(callback.message, text="🎁 Pick a plan for the gift code:", reply_markup=kb.as_markup())
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "gift_plan_pick"))
@@ -5127,11 +7143,12 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         plan_id = int(callback_data.data)
         plan = await db.get_plan(plan_id)
         if not plan:
-            await callback.answer("Plan not found", show_alert=True)
+            # L12 — admin-facing i18n.
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
         code = gen_gift_code()
         await db.create_gift_code(code, "plan", str(plan_id), plan_id=plan_id, created_by=callback.from_user.id)
-        await callback.message.edit_text(
+        await show_view(callback.message, text=
             f"✅ <b>Gift code</b>\n🎫 <code>{code}</code>\n📦 {escape_html(plan['name'])}",
             reply_markup=kb_admin_menu(),
         )
@@ -5139,40 +7156,94 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     # ====================================================== TICKETS
     @router.callback_query(AdminCB.filter(F.action == "tickets"))
-    async def cb_tickets(callback: CallbackQuery):
-        tickets = await db.get_open_tickets()
+    async def cb_tickets(callback: CallbackQuery, callback_data: AdminCB):
+        # L4 — callback_data is required because the @router decorator above
+        # uses ``AdminCB.filter(F.action == "tickets")``: aiogram will only
+        # route to this handler when the filter matches, and in that case
+        # ``callback_data`` is always injected. The previous ``= None``
+        # default was dead code (it would only have been used by an
+        # unfiltered decorator, which we do not register) and silently
+        # masked the case where filter-mismatch somehow routed here.
+        #
+        # callback_data.data carries the filter: "open" (default) or "all".
+        # When the user taps the "📋 Show all" toggle button, the action is
+        # still "tickets" but data="all"; otherwise data is empty / "open".
+        filter_mode = "all" if callback_data.data == "all" else "open"
+        if filter_mode == "all":
+            tickets = await db.get_all_tickets(limit=50)
+            title = f"💬 <b>All Tickets ({len(tickets)})</b>"
+        else:
+            tickets = await db.get_open_tickets()
+            title = f"💬 <b>Open Tickets ({len(tickets)})</b>"
         if not tickets:
-            await callback.message.edit_text("💬 <b>Tickets</b>\n\n✅ No open tickets.", reply_markup=kb_admin_menu())
+            await show_view(callback.message, text=f"{title}\n\n✅ No tickets.",
+                            reply_markup=kb_admin_menu())
             await callback.answer()
             return
-        await callback.message.edit_text(f"💬 <b>Open Tickets ({len(tickets)})</b>",
-                                         reply_markup=kb_tickets(tickets))
+        kb = InlineKeyboardBuilder()
+        for tk in tickets:
+            badge = _ticket_status_badge(tk, "en")
+            cat_emoji = _category_emoji(tk.get("category", "other"))
+            user = await db.get_user(tk["user_tg_id"])
+            # TICKET-1 Feature 4 — show first_name + @username (if present)
+            # so admins can recognise the requester at a glance from the list.
+            if user:
+                first = (user.get("first_name") or "").strip()
+                uname = (user.get("username") or "").strip()
+                if first and uname:
+                    display = f"{first} @{uname}"
+                elif first:
+                    display = first
+                elif uname:
+                    display = f"@{uname}"
+                else:
+                    display = str(tk["user_tg_id"])
+            else:
+                display = str(tk["user_tg_id"])
+            display = display[:20]
+            kb.button(style="primary",
+                      text=f"{badge} #{tk['id']} {cat_emoji} {display} — {tk['subject'][:18]}",
+                      callback_data=TicketCB(action="view", ticket_id=tk["id"]).pack())
+        # Filter toggle
+        if filter_mode == "open":
+            kb.button(style="primary", text="📋 Show all", callback_data=AdminCB(action="tickets", data="all").pack())
+        else:
+            kb.button(style="primary", text="🟢 Open only", callback_data=AdminCB(action="tickets", data="open").pack())
+        kb.button(text="🔙 Admin", callback_data=AdminCB(action="main").pack(), style="danger")
+        kb.adjust(1, 1)
+        await show_view(callback.message, text=title, reply_markup=kb.as_markup())
         await callback.answer()
 
     @router.callback_query(TicketCB.filter(F.action == "close"))
     async def cb_ticket_close(callback: CallbackQuery, callback_data: TicketCB):
         ticket = await db.get_ticket(callback_data.ticket_id)
         if not ticket:
-            await callback.answer("Not found", show_alert=True)
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
         await db.close_ticket(callback_data.ticket_id)
-        try:
-            await bot.send_message(ticket["user_tg_id"],
-                                   f"🔒 <b>Ticket #{callback_data.ticket_id} closed.</b>")
-        except Exception:
-            pass
+        # Notify the user in their language
+        user = await db.get_user(ticket["user_tg_id"])
+        ulang = L((user or {}).get("language", DEFAULT_LANGUAGE))
+        await safe_notify(
+            bot.send_message(
+                ticket["user_tg_id"],
+                t("ticket_closed", ulang, id=callback_data.ticket_id),
+                reply_markup=kb_ticket_view(callback_data.ticket_id, False, ulang, "closed"),
+            ),
+            context="ticket-close user notify",
+        )
         await callback.answer("✅ Closed", show_alert=True)
         tickets = await db.get_open_tickets()
         if tickets:
-            await callback.message.edit_text(f"💬 <b>Open Tickets ({len(tickets)})</b>",
+            await show_view(callback.message, text=f"💬 <b>Open Tickets ({len(tickets)})</b>",
                                              reply_markup=kb_tickets(tickets))
         else:
-            await callback.message.edit_text("✅ All tickets resolved.", reply_markup=kb_admin_menu())
+            await show_view(callback.message, text="✅ All open tickets resolved.", reply_markup=kb_admin_menu())
 
     # ====================================================== BROADCAST
     @router.callback_query(AdminCB.filter(F.action == "broadcast"))
     async def cb_broadcast(callback: CallbackQuery):
-        await callback.message.edit_text("📣 <b>Broadcast</b> — choose target:",
+        await show_view(callback.message, text="📣 <b>Broadcast</b> — choose target:",
                                          reply_markup=kb_broadcast_targets())
         await callback.answer()
 
@@ -5181,7 +7252,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         target = callback_data.action.replace("broadcast_", "")
         await state.set_state(AdminStates.waiting_for_broadcast_message)
         await state.update_data(target=target)
-        await callback.message.edit_text(
+        await show_view(callback.message, text=
             f"📣 <b>Broadcast → {target}</b>\n\nSend the message (text/HTML):",
             reply_markup=kb_cancel("en"),
         )
@@ -5189,7 +7260,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.message(AdminStates.waiting_for_broadcast_message)
     async def ms_broadcast(message: Message, state: FSMContext):
-        text = (message.text or "").strip()[:4000]
+        text = (message.text or "").strip()[:BROADCAST_MAX_TEXT_CHARS]
         data = await state.get_data()
         target = data.get("target", "all")
         await state.clear()
@@ -5198,23 +7269,45 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             await message.answer("❌ No users in this group.", reply_markup=kb_admin_menu())
             return
         bid = await db.create_broadcast(message.from_user.id, text, target)
-        await message.answer(f"📤 Sending to {len(user_ids)} users...")
+        status_msg = await message.answer(f"📤 Sending to {len(user_ids)} users... 0%")
+        # H2 — batch-fetch all user languages in ONE query instead of N+1.
+        langs = await db.get_user_languages_by_ids(user_ids)
         sent = failed = 0
-        for uid in user_ids:
+        total = len(user_ids)
+        # Stream sends with throttle. Update progress every 50 sends.
+        for i, uid in enumerate(user_ids, 1):
             try:
-                # Get user language and format broadcast with proper header
-                buser = await db.get_user(uid)
-                blang = L((buser or {}).get("language", DEFAULT_LANGUAGE))
+                blang = L(langs.get(uid, DEFAULT_LANGUAGE))
                 header = t("broadcast_header_en", blang) if blang == "en" else t("broadcast_header_fa", blang)
                 formatted = header + text
                 await bot.send_message(uid, formatted)
                 sent += 1
-                await asyncio.sleep(0.05)
-            except Exception:
+                # Throttle to ~20 msgs/sec — Telegram allows 30 but we leave
+                # headroom for the bot's other concurrent sends.
+                await asyncio.sleep(BROADCAST_THROTTLE_SECONDS)
+            except TelegramForbiddenError:
+                # User blocked the bot — expected, count as failed silently.
                 failed += 1
+            except TelegramBadRequest:
+                failed += 1
+            except Exception as e:
+                logger.warning("broadcast send to %s failed: %s", uid, e)
+                failed += 1
+            # Progress update every 50 sends (cheap edit_text).
+            if i % 50 == 0 and i < total:
+                try:
+                    await status_msg.edit_text(
+                        f"📤 Sending to {total} users... {i*100//total}% ({sent} sent, {failed} failed)"
+                    )
+                except Exception:
+                    pass  # Don't let progress-update failure abort the broadcast.
         await db.update_broadcast_stats(bid, sent, failed)
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
         await message.answer(
-            f"✅ <b>Broadcast complete</b>\n📤 Sent: {sent}\n❌ Failed: {failed}\n📊 Total: {len(user_ids)}",
+            f"✅ <b>Broadcast complete</b>\n📤 Sent: {sent}\n❌ Failed: {failed}\n📊 Total: {total}",
             reply_markup=kb_admin_menu(),
         )
 
@@ -5226,7 +7319,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         kb.button(text="🧹 Sync client counts", callback_data=AdminCB(action="cleanup_sync_counts").pack(), style="primary")
         kb.button(text="🔙 Admin", callback_data=AdminCB(action="main").pack(), style="danger")
         kb.adjust(1, 1)
-        await callback.message.edit_text("🧹 <b>Cleanup & maintenance</b>", reply_markup=kb.as_markup())
+        await show_view(callback.message, text="🧹 <b>Cleanup & maintenance</b>", reply_markup=kb.as_markup())
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "cleanup_depleted"))
@@ -5253,17 +7346,19 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_settings(callback: CallbackQuery):
         cur = await _currency()
         trial_en = await db.get_setting_int("trial_enabled", 0)
+        ref_en = await db.get_setting_int("referral_enabled", 1)
         pay_en = await db.get_setting_int("payment_enabled", 0)
         fj_en = await db.get_setting_int("force_join_enabled", 0)
-        text = (
-            "⚙️ <b>Settings</b>\n<pre>"
-            f"┌──────────────────────────────┐\n"
-            f"│ Currency:        {cur:>11} │\n"
-            f"│ Trial:           {'✅' if trial_en else '❌':>11} │\n"
-            f"│ Payment:         {'✅' if pay_en else '❌':>11} │\n"
-            f"│ Force Join:      {'✅' if fj_en else '❌':>11} │\n"
-            f"└──────────────────────────────┘</pre>"
-            "Tap a category to configure:"
+        rich = rich_tables.rich_message(
+            rich_tables.heading("⚙️ Settings"),
+            rich_tables.kv_table([
+                ("Currency", cur),
+                ("Trial", "✅" if trial_en else "❌"),
+                ("Referral", "✅" if ref_en else "❌"),
+                ("Payment", "✅" if pay_en else "❌"),
+                ("Force Join", "✅" if fj_en else "❌"),
+            ]),
+            rich_tables.paragraph("Tap a category to configure:"),
         )
         kb = InlineKeyboardBuilder()
         kb.button(text="🎉 Trial", callback_data=SettingsCatCB(category="trial").pack(), style="primary")
@@ -5273,27 +7368,21 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         kb.button(text="➕ Topup", callback_data=SettingsCatCB(category="topup").pack(), style="primary")
         kb.button(text="📚 Help Text", callback_data=SettingsCatCB(category="help_text").pack(), style="primary")
         kb.button(style="primary", text="💵 Currency", callback_data=AdminCB(action="set_currency").pack())
+        kb.button(style="primary", text="👥 Payment Admins", callback_data=AdminCB(action="payment_admins").pack())
         kb.button(text="🔄 Refresh servers", callback_data=AdminCB(action="refresh_servers").pack(), style="primary")
         kb.button(style="primary", text="💾 DB Backup", callback_data=AdminCB(action="db_backup").pack())
         kb.button(text="🔙 Admin", callback_data=AdminCB(action="main").pack(), style="danger")
         kb.adjust(2, 2, 2, 2, 2, 1)
-        await callback.message.edit_text(text, reply_markup=kb.as_markup())
+        await show_view(callback.message, rich=rich, reply_markup=kb.as_markup())
         await callback.answer()
 
     # ---- Settings Category Pages ----
     @router.callback_query(SettingsCatCB.filter(F.category == "trial"))
     async def cb_settings_trial(callback: CallbackQuery):
         trial_en = await db.get_setting_int("trial_enabled", 0)
-        trial_days = await db.get_setting_int("trial_days", 3)
-        trial_gb = await db.get_setting_int("trial_gb", 5)
-        text = (
-            "🎉 <b>Trial Settings</b>\n<pre>"
-            f"┌──────────────────────────────┐\n"
-            f"│ Enabled:    {'Yes' if trial_en else 'No':>11} │\n"
-            f"│ Days:       {trial_days:>11} │\n"
-            f"│ GB:         {trial_gb:>11} │\n"
-            f"└──────────────────────────────┘</pre>"
-        )
+        trial_days = await db.get_setting_int("trial_days", TRIAL_DEFAULT_DAYS)
+        trial_gb = await db.get_setting_int("trial_gb", TRIAL_DEFAULT_GB)
+        rich = rich_tables.trial_settings_rich(trial_en, trial_days, trial_gb)
         kb = InlineKeyboardBuilder()
         kb.button(style="primary", text=f"{'✅' if trial_en else '❌'} Toggle Trial", callback_data=AdminCB(action="toggle_trial").pack())
         kb.button(style="primary", text="📅 Days", callback_data=AdminCB(action="set_trial_days").pack())
@@ -5301,43 +7390,41 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         kb.button(style="primary", text="🔗 Inbounds", callback_data=AdminCB(action="set_trial_inbounds").pack())
         kb.button(text="🔙 Settings", callback_data=AdminCB(action="settings").pack(), style="danger")
         kb.adjust(2, 2, 1)
-        await callback.message.edit_text(text, reply_markup=kb.as_markup())
+        await show_view(callback.message, rich=rich, reply_markup=kb.as_markup())
         await callback.answer()
 
-    @router.callback_query(SettingsCatCB.filter(F.category == "referral"))
-    async def cb_settings_referral(callback: CallbackQuery):
+    # L3 — _render_settings_referral_view is the rendering logic extracted from
+    # cb_settings_referral so that cb_toggle_referral can refresh the view
+    # without the fragile ``fake_cb = callback`` pattern (calling one callback
+    # handler from another). Both the view handler and the toggle handler now
+    # delegate to this helper, which takes the *message* to render onto.
+    async def _render_settings_referral_view(message: Message):
+        ref_en = await db.get_setting_int("referral_enabled", 1)
         ref_days = await db.get_setting_int("referral_bonus_days", 5)
         ref_gb = await db.get_setting_int("referral_bonus_gb", 2)
-        text = (
-            "🔗 <b>Referral Settings</b>\n<pre>"
-            f"┌──────────────────────────────┐\n"
-            f"│ Bonus days: {ref_days:>11} │\n"
-            f"│ Bonus GB:   {ref_gb:>11} │\n"
-            f"└──────────────────────────────┘</pre>"
-        )
+        rich = rich_tables.referral_settings_rich(ref_en, ref_days, ref_gb)
         kb = InlineKeyboardBuilder()
+        kb.button(style="primary", text=f"{'✅' if ref_en else '❌'} Toggle Referral",
+                  callback_data=AdminCB(action="toggle_referral").pack())
         kb.button(style="success", text="🎁 Bonus Days", callback_data=AdminCB(action="set_ref_days").pack())
         kb.button(style="success", text="🎁 Bonus GB", callback_data=AdminCB(action="set_ref_gb").pack())
         kb.button(text="🔙 Settings", callback_data=AdminCB(action="settings").pack(), style="danger")
-        kb.adjust(2, 1)
-        await callback.message.edit_text(text, reply_markup=kb.as_markup())
+        kb.adjust(1, 2, 1)
+        await show_view(message, rich=rich, reply_markup=kb.as_markup())
+
+    @router.callback_query(SettingsCatCB.filter(F.category == "referral"))
+    async def cb_settings_referral(callback: CallbackQuery):
+        await _render_settings_referral_view(callback.message)
         await callback.answer()
 
-    @router.callback_query(SettingsCatCB.filter(F.category == "payment"))
-    async def cb_settings_payment(callback: CallbackQuery):
+    # L3 — _render_settings_payment_view: same extraction for the payment
+    # settings page; called by both cb_settings_payment and cb_toggle_payment.
+    async def _render_settings_payment_view(message: Message):
         pay_en = await db.get_setting_int("payment_enabled", 0)
         card = await db.get_setting("payment_card_number", "-")
         holder = await db.get_setting("payment_card_holder", "-")
-        min_amt = await db.get_setting_int("payment_min_amount", 50000)
-        text = (
-            "💳 <b>Payment Settings</b>\n<pre>"
-            f"┌──────────────────────────────┐\n"
-            f"│ Enabled:      {'Yes' if pay_en else 'No':>11} │\n"
-            f"│ Card:         {card:>11} │\n"
-            f"│ Holder:       {holder:>11} │\n"
-            f"│ Min amount:   {min_amt:>11} │\n"
-            f"└──────────────────────────────┘</pre>"
-        )
+        min_amt = await db.get_setting_int("payment_min_amount", DEFAULT_PAYMENT_MIN_AMOUNT)
+        rich = rich_tables.payment_settings_rich(pay_en, card, holder, min_amt)
         kb = InlineKeyboardBuilder()
         kb.button(style="primary", text=f"{'✅' if pay_en else '❌'} Toggle", callback_data=AdminCB(action="toggle_payment").pack())
         kb.button(style="primary", text="💳 Card Number", callback_data=AdminCB(action="set_card_number").pack())
@@ -5347,24 +7434,21 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         kb.button(text="💰 Pending Payments", callback_data=AdminCB(action="pending_payments").pack(), style="success")
         kb.button(text="🔙 Settings", callback_data=AdminCB(action="settings").pack(), style="danger")
         kb.adjust(2, 2, 2, 1)
-        await callback.message.edit_text(text, reply_markup=kb.as_markup())
+        await show_view(message, rich=rich, reply_markup=kb.as_markup())
+
+    @router.callback_query(SettingsCatCB.filter(F.category == "payment"))
+    async def cb_settings_payment(callback: CallbackQuery):
+        await _render_settings_payment_view(callback.message)
         await callback.answer()
 
-    @router.callback_query(SettingsCatCB.filter(F.category == "force_join"))
-    async def cb_settings_force_join(callback: CallbackQuery):
+    # L3 — _render_settings_force_join_view: same extraction for the force-join
+    # settings page; called by cb_settings_force_join, cb_toggle_force_join
+    # and cb_remove_force_join_channel (which re-renders the view after
+    # removing a channel).
+    async def _render_settings_force_join_view(message: Message):
         fj_en = await db.get_setting_int("force_join_enabled", 0)
         channels = await db.get_setting_json("force_join_channels", [])
-        text = (
-            "📢 <b>Force Join Settings</b>\n<pre>"
-            f"┌──────────────────────────────┐\n"
-            f"│ Enabled:      {'Yes' if fj_en else 'No':>11} │\n"
-            f"│ Channels:     {len(channels):>11} │\n"
-            f"└──────────────────────────────┘</pre>"
-        )
-        if channels:
-            text += "\n<b>Channels:</b>\n"
-            for ch in channels:
-                text += f"• {ch.get('title', ch.get('username', 'Unknown'))} ({ch.get('chat_id', '')})\n"
+        rich = rich_tables.force_join_settings_rich(fj_en, channels)
         kb = InlineKeyboardBuilder()
         kb.button(style="primary", text=f"{'✅' if fj_en else '❌'} Toggle", callback_data=AdminCB(action="toggle_force_join").pack())
         kb.button(text="➕ Add Channel", callback_data=AdminCB(action="add_force_join_channel").pack(), style="success")
@@ -5372,26 +7456,24 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             kb.button(text="🗑 Remove Channel", callback_data=AdminCB(action="remove_force_join_channel").pack(), style="danger")
         kb.button(text="🔙 Settings", callback_data=AdminCB(action="settings").pack(), style="danger")
         kb.adjust(2, 1, 1)
-        await callback.message.edit_text(text, reply_markup=kb.as_markup())
+        await show_view(message, rich=rich, reply_markup=kb.as_markup())
+
+    @router.callback_query(SettingsCatCB.filter(F.category == "force_join"))
+    async def cb_settings_force_join(callback: CallbackQuery):
+        await _render_settings_force_join_view(callback.message)
         await callback.answer()
 
     @router.callback_query(SettingsCatCB.filter(F.category == "topup"))
     async def cb_settings_topup(callback: CallbackQuery):
-        topup_price = await db.get_setting_int("topup_price_per_gb", 2000)
+        topup_price = await db.get_setting_int("topup_price_per_gb", TOPUP_DEFAULT_PRICE_PER_GB)
         packages = await db.get_setting_json("topup_packages", [5, 10, 20, 50])
-        text = (
-            "➕ <b>Topup Settings</b>\n<pre>"
-            f"┌──────────────────────────────┐\n"
-            f"│ Price/GB:     {topup_price:>11} │\n"
-            f"│ Packages:     {str(packages):>11} │\n"
-            f"└──────────────────────────────┘</pre>"
-        )
+        rich = rich_tables.topup_settings_rich(topup_price, packages)
         kb = InlineKeyboardBuilder()
         kb.button(style="success", text="➕ Price/GB", callback_data=AdminCB(action="set_topup_price").pack())
         kb.button(style="primary", text="📦 Packages", callback_data=AdminCB(action="set_topup_packages").pack())
         kb.button(text="🔙 Settings", callback_data=AdminCB(action="settings").pack(), style="danger")
         kb.adjust(2, 1)
-        await callback.message.edit_text(text, reply_markup=kb.as_markup())
+        await show_view(callback.message, rich=rich, reply_markup=kb.as_markup())
         await callback.answer()
 
     @router.callback_query(SettingsCatCB.filter(F.category == "help_text"))
@@ -5408,7 +7490,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         kb.button(style="primary", text="🇮🇷 Edit فارسی", callback_data=AdminCB(action="edit_help_fa").pack())
         kb.button(text="🔙 Settings", callback_data=AdminCB(action="settings").pack(), style="danger")
         kb.adjust(2, 1)
-        await callback.message.edit_text(text, reply_markup=kb.as_markup())
+        await show_view(callback.message, text=text, reply_markup=kb.as_markup())
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "toggle_trial"))
@@ -5418,6 +7500,15 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         await callback.answer(f"Trial {'enabled' if not cur else 'disabled'}", show_alert=True)
         await cb_settings(callback)
 
+    @router.callback_query(AdminCB.filter(F.action == "toggle_referral"))
+    async def cb_toggle_referral(callback: CallbackQuery):
+        cur = await db.get_setting_int("referral_enabled", 1)
+        await db.set_setting("referral_enabled", "0" if cur else "1")
+        await callback.answer(f"Referral {'enabled' if not cur else 'disabled'}", show_alert=True)
+        # L3 — refresh the view via the extracted render helper instead of
+        # ``fake_cb = callback; await cb_settings_referral(fake_cb)``.
+        await _render_settings_referral_view(callback.message)
+
     @router.callback_query(AdminCB.filter(F.action == "set_currency"))
     async def cb_set_currency(callback: CallbackQuery):
         kb = InlineKeyboardBuilder()
@@ -5425,7 +7516,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         kb.button(style="primary", text="💵 USD", callback_data=AdminCB(action="set_currency_val", data="usd").pack())
         kb.button(text="🔙 Back", callback_data=AdminCB(action="settings").pack(), style="danger")
         kb.adjust(2, 1)
-        await callback.message.edit_text("💵 <b>Currency</b>", reply_markup=kb.as_markup())
+        await show_view(callback.message, text="💵 <b>Currency</b>", reply_markup=kb.as_markup())
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "set_currency_val"))
@@ -5454,35 +7545,35 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_set_trial_days(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.setting_edit_value)
         await state.update_data(edit_type="setting_int", key="trial_days", label="Trial days")
-        await callback.message.edit_text("📅 Enter trial days:", reply_markup=kb_cancel("en"))
+        await show_view(callback.message, text="📅 Enter trial days:", reply_markup=kb_cancel("en"))
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "set_trial_gb"))
     async def cb_set_trial_gb(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.setting_edit_value)
         await state.update_data(edit_type="setting_int", key="trial_gb", label="Trial GB")
-        await callback.message.edit_text("💾 Enter trial GB:", reply_markup=kb_cancel("en"))
+        await show_view(callback.message, text="💾 Enter trial GB:", reply_markup=kb_cancel("en"))
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "set_ref_days"))
     async def cb_set_ref_days(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.setting_edit_value)
         await state.update_data(edit_type="setting_int", key="referral_bonus_days", label="Referral days")
-        await callback.message.edit_text("🎁 Enter referral bonus days:", reply_markup=kb_cancel("en"))
+        await show_view(callback.message, text="🎁 Enter referral bonus days:", reply_markup=kb_cancel("en"))
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "set_ref_gb"))
     async def cb_set_ref_gb(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.setting_edit_value)
         await state.update_data(edit_type="setting_int", key="referral_bonus_gb", label="Referral GB")
-        await callback.message.edit_text("🎁 Enter referral bonus GB:", reply_markup=kb_cancel("en"))
+        await show_view(callback.message, text="🎁 Enter referral bonus GB:", reply_markup=kb_cancel("en"))
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "set_topup_price"))
     async def cb_set_topup_price(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.setting_edit_value)
         await state.update_data(edit_type="setting_int", key="topup_price_per_gb", label="Topup price/GB")
-        await callback.message.edit_text("➕ Enter topup price per GB:", reply_markup=kb_cancel("en"))
+        await show_view(callback.message, text="➕ Enter topup price per GB:", reply_markup=kb_cancel("en"))
         await callback.answer()
 
     # The generic setting_edit_value handler also covers setting_int — handle it:
@@ -5500,7 +7591,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         kb = InlineKeyboardBuilder()
         servers = await db.get_servers(active_only=True)
         for srv in servers:
-            kb.button(style="primary", text=f"— {escape_html(srv['alias'])} —", callback_data="noop_0")
+            kb.button(style="primary", text=f"— {escape_html(srv['alias'])} —", callback_data=NoopCB().pack())
             inbounds = await db.get_inbounds(srv["id"], enabled_only=True)
             for ib in inbounds:
                 key = f"{srv['id']}_{ib['inbound_id']}"
@@ -5510,7 +7601,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         kb.button(text="💾 Save", callback_data=AdminCB(action="settings").pack(), style="success")
         kb.button(text="⬜ Clear (use all)", callback_data=AdminCB(action="trial_ib_clear").pack(), style="danger")
         kb.adjust(1, 1)
-        await callback.message.edit_text("🔗 <b>Trial inbounds</b> (empty = use all)", reply_markup=kb.as_markup())
+        await show_view(callback.message, text="🔗 <b>Trial inbounds</b> (empty = use all)", reply_markup=kb.as_markup())
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "trial_ib_toggle"))
@@ -5557,35 +7648,282 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         except Exception as e:
             await callback.answer(f"❌ {str(e)[:50]}", show_alert=True)
 
+    # ====================================================== IMPORT FROM PANEL (MIGRATE-1)
+    # In-memory cache of the last-fetched panel client list per admin, so
+    # paging through the import list does not re-hit the panel API on every
+    # page click. Holds one (server_id, clients) tuple per admin; trivially
+    # small for a single-admin bot.
+    _import_cache = {}
+
+    async def _import_client_row(srv: dict, client: dict):
+        """Import a single (slim) panel client object into the bot DB.
+
+        Uses only fields present in the paged-list response (email, tgId,
+        subId, enable, totalGB, expiryTime, limitIp, inboundIds), so no extra
+        ``/clients/get`` API call is needed. The client must already have
+        ``tgId`` set. Returns ``(ok, msg)``."""
+        email = client.get("email")
+        tg_id = int(client.get("tgId") or 0)
+        if not email:
+            return False, "no email"
+        if not tg_id:
+            return False, "no Telegram ID set"
+        await db.upsert_user_minimal(tg_id)
+        total_gb_raw = int(client.get("totalGB") or 0)
+        traffic_gb = total_gb_raw // GB if total_gb_raw > 0 else 0
+        inbound_ids = json.dumps(client.get("inboundIds") or [])
+        await db.upsert_account(
+            user_tg_id=tg_id,
+            server_id=srv["id"],
+            email=email,
+            sub_id=client.get("subId") or "",
+            traffic_gb=traffic_gb,
+            expiry_time=int(client.get("expiryTime") or 0),
+            limit_ip=int(client.get("limitIp") or 0),
+            inbound_ids=inbound_ids,
+            is_active=bool(client.get("enable")),
+            is_trial=False,
+        )
+        return True, "ok"
+
+    @router.callback_query(AdminCB.filter(F.action == "import_main"))
+    async def cb_import_main(callback: CallbackQuery):
+        servers = await db.get_servers(active_only=True)
+        if not servers:
+            await show_view(callback.message,
+                text="ℹ️ No active servers. Add a server first.",
+                reply_markup=kb_admin_menu())
+            await callback.answer()
+            return
+        await show_view(callback.message,
+            text=("📥 <b>Import clients from panel</b>\n\n"
+                  "Select a server to list its existing panel clients.\n"
+                  "You can assign a Telegram numeric ID to each client so "
+                  "the user controls their config from this bot."),
+            reply_markup=kb_import_server_picker(servers))
+        await callback.answer()
+
+    @router.callback_query(ImportCB.filter(F.action == "server"))
+    async def cb_import_server(callback: CallbackQuery, callback_data: ImportCB):
+        srv = await db.get_server(callback_data.server_id)
+        if not srv:
+            await callback.answer("Server not found", show_alert=True)
+            return
+        await callback.answer("⏳ Fetching clients…")
+        try:
+            clients = await api.get_all_clients(srv["panel_url"], srv["api_token"])
+        except Exception as e:
+            await show_view(callback.message,
+                text=f"❌ Panel error: {escape_html(str(e)[:120])}",
+                reply_markup=kb_import_server_picker(await db.get_servers(active_only=True)))
+            return
+        _import_cache[callback.from_user.id] = (srv["id"], clients)
+        if not clients:
+            await show_view(callback.message,
+                text=f"📥 <b>{escape_html(srv['alias'])}</b>\n\nNo clients found on panel.",
+                reply_markup=kb_import_server_picker(await db.get_servers(active_only=True)))
+            return
+        with_tg = sum(1 for c in clients if c.get("tgId"))
+        rich = rich_tables.rich_message(
+            rich_tables.heading(f"📥 {srv['alias']}"),
+            rich_tables.kv_table([
+                ("Total clients", len(clients)),
+                ("With Telegram ID", with_tg),
+            ]),
+            rich_tables.paragraph("Tap a client to import or set its Telegram ID."),
+        )
+        await show_view(callback.message, rich=rich,
+            reply_markup=kb_import_client_list(srv["id"], clients, callback_data.page))
+
+    @router.callback_query(ImportCB.filter(F.action == "page"))
+    async def cb_import_page(callback: CallbackQuery, callback_data: ImportCB):
+        cached = _import_cache.get(callback.from_user.id)
+        if not cached or cached[0] != callback_data.server_id:
+            srv = await db.get_server(callback_data.server_id)
+            if not srv:
+                await callback.answer("Server not found", show_alert=True)
+                return
+            await callback.answer("⏳ Fetching clients…")
+            clients = await api.get_all_clients(srv["panel_url"], srv["api_token"])
+            _import_cache[callback.from_user.id] = (srv["id"], clients)
+        else:
+            clients = cached[1]
+            srv = await db.get_server(callback_data.server_id)
+        await show_view(callback.message,
+            text=f"📥 <b>{escape_html(srv['alias'])}</b> — {len(clients)} clients",
+            reply_markup=kb_import_client_list(srv["id"], clients, callback_data.page))
+
+    @router.callback_query(ImportCB.filter(F.action == "client"))
+    async def cb_import_client(callback: CallbackQuery, callback_data: ImportCB):
+        cached = _import_cache.get(callback.from_user.id)
+        clients = cached[1] if cached and cached[0] == callback_data.server_id else []
+        client = next((c for c in clients if c.get("email") == callback_data.email), None)
+        if not client:
+            await callback.answer("Client not in cache. Reopen the server.", show_alert=True)
+            return
+        existing = await db.get_account(callback_data.email)
+        total_gb_raw = int(client.get("totalGB") or 0)
+        gb_disp = f"{total_gb_raw // GB} GB" if total_gb_raw else "∞"
+        rows = [
+            ("Email", client.get("email", "—")),
+            ("Telegram ID", client.get("tgId") or "— not set —"),
+            ("Enabled", "✅" if client.get("enable") else "❌"),
+            ("Traffic limit", gb_disp),
+            ("Expiry", fmt_ts(client.get("expiryTime") or 0) or "∞"),
+            ("Limit IP", client.get("limitIp") or "∞"),
+            ("Inbounds", ", ".join(str(i) for i in (client.get("inboundIds") or [])) or "—"),
+            ("In bot DB", "✅ yes" if existing else "❌ no"),
+        ]
+        rich = rich_tables.rich_message(
+            rich_tables.heading("📥 Client detail"),
+            rich_tables.kv_table(rows),
+        )
+        await show_view(callback.message, rich=rich,
+            reply_markup=kb_import_client_view(callback_data.server_id,
+                callback_data.email, bool(client.get("tgId")),
+                bool(existing), callback_data.page))
+
+    @router.callback_query(ImportCB.filter(F.action == "set_tgid"))
+    async def cb_import_set_tgid(callback: CallbackQuery, callback_data: ImportCB, state: FSMContext):
+        await state.set_state(AdminStates.waiting_for_import_tg_id)
+        await state.update_data(server_id=callback_data.server_id,
+                                email=callback_data.email,
+                                page=callback_data.page)
+        await show_view(callback.message,
+            text=(f"🔗 Enter the Telegram numeric ID for:\n"
+                  f"<code>{escape_html(callback_data.email)}</code>\n\n"
+                  f"Send <code>0</code> or <code>-</code> to clear."),
+            reply_markup=kb_cancel("en"))
+        await callback.answer()
+
+    @router.message(AdminStates.waiting_for_import_tg_id)
+    async def ms_import_tg_id(message: Message, state: FSMContext):
+        raw = (message.text or "").strip()
+        data = await state.get_data()
+        await state.clear()
+        server_id = data.get("server_id")
+        email = data.get("email")
+        page = data.get("page", 1)
+        srv = await db.get_server(server_id)
+        if not srv:
+            await message.answer("❌ Server not found.", reply_markup=kb_admin_menu())
+            return
+        tg_id = 0
+        if raw not in ("0", "-", ""):
+            try:
+                tg_id = int(raw)
+                if tg_id < 0:
+                    raise ValueError
+            except ValueError:
+                await message.answer("❌ Invalid Telegram ID. Must be a positive integer.",
+                                     reply_markup=kb_admin_menu())
+                return
+        r = await api.set_client_tg_id(srv["panel_url"], srv["api_token"], email, tg_id)
+        if not r.get("success"):
+            await message.answer(f"❌ Panel error: {escape_html(r.get('msg', 'unknown'))}",
+                                 reply_markup=kb_admin_menu())
+            return
+        cached = _import_cache.get(message.from_user.id)
+        clients = cached[1] if cached and cached[0] == server_id else []
+        client = next((c for c in clients if c.get("email") == email), None)
+        if client:
+            client["tgId"] = tg_id
+        if tg_id and client:
+            ok, _msg = await _import_client_row(srv, client)
+            note = "imported" if ok else "import failed"
+            await message.answer(
+                f"✅ Telegram ID <code>{tg_id}</code> set on panel & client {note}.\n"
+                f"The user will see this config in <b>My Accounts</b>.",
+                reply_markup=kb_import_client_list(server_id, clients, page))
+        elif tg_id:
+            await message.answer(
+                f"✅ Telegram ID <code>{tg_id}</code> set on panel.\n"
+                f"Reopen the server to import.",
+                reply_markup=kb_import_server_picker(await db.get_servers(active_only=True)))
+        else:
+            await message.answer("✅ Telegram ID cleared on panel.",
+                reply_markup=kb_import_client_list(server_id, clients, page))
+
+    @router.callback_query(ImportCB.filter(F.action == "do"))
+    async def cb_import_do(callback: CallbackQuery, callback_data: ImportCB):
+        srv = await db.get_server(callback_data.server_id)
+        if not srv:
+            await callback.answer("Server not found", show_alert=True)
+            return
+        cached = _import_cache.get(callback.from_user.id)
+        clients = cached[1] if cached and cached[0] == srv["id"] else []
+        client = next((c for c in clients if c.get("email") == callback_data.email), None)
+        if not client:
+            await callback.answer("Client not in cache. Reopen the server.", show_alert=True)
+            return
+        await callback.answer("⏳ Importing…")
+        ok, msg = await _import_client_row(srv, client)
+        await show_view(callback.message,
+            text=(f"✅ Imported <code>{escape_html(callback_data.email)}</code>." if ok
+                  else f"❌ Could not import: {escape_html(msg)}"),
+            reply_markup=kb_import_client_list(srv["id"], clients, callback_data.page))
+
+    @router.callback_query(ImportCB.filter(F.action == "all"))
+    async def cb_import_all(callback: CallbackQuery, callback_data: ImportCB):
+        srv = await db.get_server(callback_data.server_id)
+        if not srv:
+            await callback.answer("Server not found", show_alert=True)
+            return
+        await callback.answer("⏳ Bulk import…")
+        cached = _import_cache.get(callback.from_user.id)
+        if cached and cached[0] == srv["id"]:
+            clients = cached[1]
+        else:
+            clients = await api.get_all_clients(srv["panel_url"], srv["api_token"])
+            _import_cache[callback.from_user.id] = (srv["id"], clients)
+        with_tg = [c for c in clients if c.get("tgId")]
+        ok_count = 0
+        fail_count = 0
+        for c in with_tg:
+            try:
+                ok, _ = await _import_client_row(srv, c)
+                if ok:
+                    ok_count += 1
+                else:
+                    fail_count += 1
+            except Exception as e:
+                logger.error("import %s failed: %s", c.get("email"), e)
+                fail_count += 1
+        await show_view(callback.message,
+            text=(f"⚡ <b>Bulk import complete</b>\n\n"
+                  f"✅ Imported: {ok_count}\n"
+                  f"❌ Failed: {fail_count}\n"
+                  f"➖ Skipped (no TG ID): {len(clients) - len(with_tg)}"),
+            reply_markup=kb_import_client_list(srv["id"], clients, callback_data.page))
+
     # ---- Payment settings handlers ----
     @router.callback_query(AdminCB.filter(F.action == "toggle_payment"))
     async def cb_toggle_payment(callback: CallbackQuery):
         cur = await db.get_setting_int("payment_enabled", 0)
         await db.set_setting("payment_enabled", "0" if cur else "1")
         await callback.answer(f"Payment {'enabled' if not cur else 'disabled'}", show_alert=True)
-        # Re-render payment settings
-        fake_cb = callback
-        await cb_settings_payment(fake_cb)
+        # L3 — refresh via the extracted render helper (no more fake_cb).
+        await _render_settings_payment_view(callback.message)
 
     @router.callback_query(AdminCB.filter(F.action == "set_card_number"))
     async def cb_set_card_number(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.setting_edit_value)
         await state.update_data(edit_type="setting_str", key="payment_card_number", label="Card number")
-        await callback.message.edit_text("💳 Enter card number:", reply_markup=kb_cancel("en"))
+        await show_view(callback.message, text="💳 Enter card number:", reply_markup=kb_cancel("en"))
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "set_card_holder"))
     async def cb_set_card_holder(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.setting_edit_value)
         await state.update_data(edit_type="setting_str", key="payment_card_holder", label="Card holder")
-        await callback.message.edit_text("👤 Enter card holder name:", reply_markup=kb_cancel("en"))
+        await show_view(callback.message, text="👤 Enter card holder name:", reply_markup=kb_cancel("en"))
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "set_payment_min"))
     async def cb_set_payment_min(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.setting_edit_value)
         await state.update_data(edit_type="setting_int", key="payment_min_amount", label="Min payment amount")
-        await callback.message.edit_text("🔢 Enter minimum payment amount (Toman):", reply_markup=kb_cancel("en"))
+        await show_view(callback.message, text="🔢 Enter minimum payment amount (Toman):", reply_markup=kb_cancel("en"))
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "set_payment_presets"))
@@ -5593,18 +7931,137 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         await state.set_state(AdminStates.setting_edit_value)
         await state.update_data(edit_type="setting_str", key="payment_presets", label="Payment presets")
         cur = await db.get_setting_json("payment_presets", [50000, 100000, 200000, 500000])
-        await callback.message.edit_text(
+        await show_view(callback.message, text=
             f"📋 Enter preset amounts as comma-separated numbers (Toman):\n\nCurrent: {cur}",
             reply_markup=kb_cancel("en"),
         )
         await callback.answer()
+
+    # ---- Payment admins management ----
+    @router.callback_query(AdminCB.filter(F.action == "payment_admins"))
+    async def cb_payment_admins(callback: CallbackQuery):
+        pa_ids = sorted(await get_payment_admin_ids(db))
+        lines = ["👥 <b>Payment-Only Admins</b>\n"]
+        lines.append("These users can ONLY approve/reject pending payments.")
+        lines.append("They cannot access servers, plans, users, or settings.\n")
+        if pa_ids:
+            lines.append("<b>Current payment admins:</b>")
+            for pid in pa_ids:
+                u = await db.get_user(pid)
+                if u:
+                    uname = escape_html(u.get("first_name") or u.get("username") or "—")
+                    handle = f" @{u['username']}" if u.get("username") else ""
+                    lines.append(f"• <code>{pid}</code> — {uname}{handle}")
+                else:
+                    lines.append(f"• <code>{pid}</code> — (not yet started bot)")
+        else:
+            lines.append("<i>No payment admins configured.</i>")
+        kb = InlineKeyboardBuilder()
+        kb.button(style="success", text="➕ Add Payment Admin",
+                  callback_data=AdminCB(action="add_payment_admin").pack())
+        # Remove buttons (one per existing admin)
+        for pid in pa_ids:
+            kb.button(style="danger", text=f"🗑 Remove {pid}",
+                      callback_data=AdminCB(action="remove_payment_admin", data=str(pid)).pack())
+        kb.button(text="🔙 Settings", callback_data=AdminCB(action="settings").pack(), style="danger")
+        kb.adjust(1, *[1 for _ in pa_ids], 1)
+        await show_view(callback.message, text="\n".join(lines), reply_markup=kb.as_markup())
+        await callback.answer()
+
+    @router.callback_query(AdminCB.filter(F.action == "add_payment_admin"))
+    async def cb_add_payment_admin(callback: CallbackQuery, state: FSMContext):
+        await state.set_state(AdminStates.waiting_for_payment_admin_id)
+        await show_view(callback.message,
+            text=("➕ <b>Add Payment Admin</b>\n\n"
+                  "Send the Telegram <b>numeric ID</b> of the user you want to "
+                  "make a payment-only admin.\n\n"
+                  "The user must have started the bot at least once (so we can "
+                  "look them up). Payment admins can only approve/reject "
+                  "pending payments — nothing else."),
+            reply_markup=kb_cancel("en"))
+        await callback.answer()
+
+    @router.message(AdminStates.waiting_for_payment_admin_id)
+    async def ms_payment_admin_id(message: Message, state: FSMContext):
+        raw = (message.text or "").strip()
+        await state.clear()
+        try:
+            tg_id = int(raw)
+            if tg_id <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            await message.answer("❌ Invalid ID. Must be a positive integer.",
+                                 reply_markup=kb_admin_menu())
+            return
+        if tg_id in ADMIN_IDS:
+            await message.answer("⚠️ This user is already a FULL admin — no need to add as payment admin.",
+                                 reply_markup=kb_admin_menu())
+            return
+        pa_ids = await get_payment_admin_ids(db)
+        if tg_id in pa_ids:
+            await message.answer("⚠️ This user is already a payment admin.",
+                                 reply_markup=kb_admin_menu())
+            return
+        pa_ids.add(tg_id)
+        await db.set_setting("payment_admin_ids", json.dumps(sorted(pa_ids)))
+        # Try to notify the new payment admin.
+        try:
+            await bot.send_message(tg_id,
+                "💰 <b>You are now a Payment Admin</b>\n\n"
+                "You can approve or reject pending payments.\n"
+                "Send /admin to open the payment panel.",
+                reply_markup=kb_payment_admin_menu())
+        except Exception:
+            pass  # user hasn't started the bot yet — that's OK
+        await message.answer(
+            f"✅ Added <code>{tg_id}</code> as payment admin.\n"
+            f"They can now use /admin to manage payments.",
+            reply_markup=kb_admin_menu())
+
+    @router.callback_query(AdminCB.filter(F.action == "remove_payment_admin"))
+    async def cb_remove_payment_admin(callback: CallbackQuery, callback_data: AdminCB):
+        try:
+            tg_id = int(callback_data.data)
+        except (TypeError, ValueError):
+            await callback.answer("Invalid ID.", show_alert=True)
+            return
+        pa_ids = await get_payment_admin_ids(db)
+        pa_ids.discard(tg_id)
+        await db.set_setting("payment_admin_ids", json.dumps(sorted(pa_ids)))
+        await callback.answer(f"✅ Removed {tg_id}", show_alert=False)
+        # Re-render the list.
+        remaining = sorted(pa_ids)
+        lines = ["👥 <b>Payment-Only Admins</b>\n",
+                 "These users can ONLY approve/reject pending payments.\n"]
+        if remaining:
+            lines.append("<b>Current payment admins:</b>")
+            for pid in remaining:
+                u = await db.get_user(pid)
+                if u:
+                    uname = escape_html(u.get("first_name") or u.get("username") or "—")
+                    handle = f" @{u['username']}" if u.get("username") else ""
+                    lines.append(f"• <code>{pid}</code> — {uname}{handle}")
+                else:
+                    lines.append(f"• <code>{pid}</code> — (not yet started bot)")
+        else:
+            lines.append("<i>No payment admins configured.</i>")
+        kb = InlineKeyboardBuilder()
+        kb.button(style="success", text="➕ Add Payment Admin",
+                  callback_data=AdminCB(action="add_payment_admin").pack())
+        for pid in remaining:
+            kb.button(style="danger", text=f"🗑 Remove {pid}",
+                      callback_data=AdminCB(action="remove_payment_admin", data=str(pid)).pack())
+        kb.button(text="🔙 Settings", callback_data=AdminCB(action="settings").pack(), style="danger")
+        kb.adjust(1, *[1 for _ in remaining], 1)
+        await show_view(callback.message, text="\n".join(lines), reply_markup=kb.as_markup())
 
     # ---- Pending payments ----
     @router.callback_query(AdminCB.filter(F.action == "pending_payments"))
     async def cb_pending_payments(callback: CallbackQuery):
         payments = await db.get_pending_payments()
         if not payments:
-            await callback.message.edit_text("💰 <b>No pending payments</b>", reply_markup=kb_admin_menu())
+            menu = kb_admin_menu() if await _is_full_admin(callback.from_user.id) else kb_payment_admin_menu()
+            await show_view(callback.message, text="💰 <b>No pending payments</b>", reply_markup=menu)
             await callback.answer()
             return
         text = "💰 <b>Pending Payments</b>\n\n"
@@ -5619,14 +8076,14 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             )
         kb.button(text="🔙 Admin", callback_data=AdminCB(action="main").pack(), style="danger")
         kb.adjust(1, 1)
-        await callback.message.edit_text(text, reply_markup=kb.as_markup())
+        await show_view(callback.message, text=text, reply_markup=kb.as_markup())
         await callback.answer()
 
     @router.callback_query(PaymentCB.filter(F.action == "view"))
     async def cb_payment_view(callback: CallbackQuery, callback_data: PaymentCB):
         payment = await db.get_payment(callback_data.payment_id)
         if not payment:
-            await callback.answer("Not found", show_alert=True)
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
         user = await db.get_user(payment["user_tg_id"])
         uname = escape_html(user.get("first_name") or user.get("username") or str(payment["user_tg_id"]))
@@ -5635,7 +8092,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         text += f"💵 Base amount: {int(payment['amount'])} Toman\n"
         text += f"💵 Unique amount: {int(payment['unique_amount'])} Toman\n"
         text += f"💳 Card: {escape_html(payment.get('card_number') or '-')}\n"
-        text += f"📅 Created: {payment.get('created_at', '-')}\n"
+        text += f"📅 Created: {fmt_iso(payment.get('created_at'), '%Y-%m-%d %H:%M:%S') or '-'}\n"
         if payment.get("receipt_text"):
             text += f"📝 Receipt: {escape_html(payment['receipt_text'][:200])}\n"
         text += f"\nStatus: {payment.get('status', 'pending')}"
@@ -5646,36 +8103,48 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         kb.button(style="danger", text="🔙 Pending", callback_data=AdminCB(action="pending_payments").pack())
         kb.adjust(2, 1)
 
-        # If receipt is a photo/document, send the media with the details as caption
+        # L9 — preserve admin context. Previously this handler DELETED the
+        # pending-payments list message and sent the receipt photo with the
+        # payment details as the caption. The admin then lost the list and had
+        # no easy way back to the next payment. Now we:
+        #   1. EDIT the existing list message in place to show the payment
+        #      details + approve/reject buttons inline (the list itself is
+        #      just one tap away via the 🔙 Pending button).
+        #   2. Send the receipt photo as a SEPARATE follow-up message so the
+        #      admin sees both the detail card and the receipt image side by
+        #      side without losing context.
         file_id = payment.get("receipt_file_id")
         rtype = (payment.get("receipt_type") or "").lower()
+        await show_view(callback.message, text=text, reply_markup=kb.as_markup())
         if file_id:
             try:
                 if rtype == "document":
                     await bot.send_document(
-                        callback.from_user.id, file_id, caption=text, reply_markup=kb.as_markup()
+                        callback.from_user.id, file_id,
+                        caption=f"📎 Receipt for payment #{payment['id']}",
                     )
                 else:
                     await bot.send_photo(
-                        callback.from_user.id, file_id, caption=text, reply_markup=kb.as_markup()
+                        callback.from_user.id, file_id,
+                        caption=f"📎 Receipt for payment #{payment['id']}",
                     )
-                try:
-                    await callback.message.delete()
-                except Exception:
-                    pass
-            except Exception:
-                await callback.message.edit_text(text, reply_markup=kb.as_markup())
-        else:
-            await callback.message.edit_text(text, reply_markup=kb.as_markup())
+            except Exception as e:
+                logger.warning("payment-view receipt media send failed: %s", e, exc_info=True)
         await callback.answer()
 
     @router.callback_query(PaymentCB.filter(F.action == "approve"))
     async def cb_payment_approve(callback: CallbackQuery, callback_data: PaymentCB):
         payment = await db.get_payment(callback_data.payment_id)
         if not payment or payment["status"] != "pending":
-            await callback.answer("Not pending", show_alert=True)
+            await callback.answer(t("not_pending", await admin_lang(callback.from_user.id)), show_alert=True)
             return
-        await db.approve_payment(payment["id"], callback.from_user.id)
+        # C1 — atomic approve: only one admin can perform the pending→approved
+        # transition. If two admins click simultaneously, the second call to
+        # approve_payment returns False and we abort before double-crediting.
+        ok = await db.approve_payment(payment["id"], callback.from_user.id)
+        if not ok:
+            await callback.answer(t("already_processed", await admin_lang(callback.from_user.id)), show_alert=True)
+            return
         await db.update_user_balance(payment["user_tg_id"], payment["amount"], add=True)
         await db.add_transaction(
             user_tg_id=payment["user_tg_id"], amount=payment["amount"], type_="deposit",
@@ -5691,9 +8160,11 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
                 payment["user_tg_id"],
                 t("payment_approved", lang, amount=fmt_price(payment["amount"], lang, currency), balance=fmt_price(balance, lang, currency)),
             )
-        except Exception:
+        except TelegramBadRequest:
             pass
-        await callback.message.edit_text(
+        except Exception as e:
+            logger.warning("approve notify failed: %s", e)
+        await show_view(callback.message, text=
             f"✅ <b>Payment #{payment['id']} approved</b>\n"
             f"💰 {int(payment['amount'])} Toman added to user {payment['user_tg_id']}",
             reply_markup=kb_admin_menu(),
@@ -5704,7 +8175,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_payment_reject_ask(callback: CallbackQuery, callback_data: PaymentCB, state: FSMContext):
         await state.set_state(AdminStates.waiting_for_reject_reason)
         await state.update_data(payment_id=callback_data.payment_id)
-        await callback.message.edit_text(t("enter_reject_reason", "en"), reply_markup=kb_cancel("en"))
+        await show_view(callback.message, text=t("enter_reject_reason", "en"), reply_markup=kb_cancel("en"))
         await callback.answer()
 
     @router.message(AdminStates.waiting_for_reject_reason)
@@ -5718,7 +8189,12 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         if not payment or payment["status"] != "pending":
             await message.answer("Payment not found or already processed.", reply_markup=kb_admin_menu())
             return
-        await db.reject_payment(payment["id"], message.from_user.id, reason)
+        # C1 — atomic reject: only one admin can transition pending→rejected.
+        ok = await db.reject_payment(payment["id"], message.from_user.id, reason)
+        if not ok:
+            await message.answer("⚠️ Payment was already processed by another admin.",
+                                 reply_markup=kb_admin_menu())
+            return
         # Notify user
         user = await db.get_user(payment["user_tg_id"])
         lang = L((user or {}).get("language", DEFAULT_LANGUAGE))
@@ -5727,8 +8203,10 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
                 payment["user_tg_id"],
                 t("payment_rejected", lang, reason=escape_html(reason) or "No reason given"),
             )
-        except Exception:
+        except TelegramBadRequest:
             pass
+        except Exception as e:
+            logger.warning("reject notify failed: %s", e)
         await message.answer(
             f"❌ <b>Payment #{payment['id']} rejected</b>",
             reply_markup=kb_admin_menu(),
@@ -5740,13 +8218,13 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         cur = await db.get_setting_int("force_join_enabled", 0)
         await db.set_setting("force_join_enabled", "0" if cur else "1")
         await callback.answer(f"Force join {'enabled' if not cur else 'disabled'}", show_alert=True)
-        fake_cb = callback
-        await cb_settings_force_join(fake_cb)
+        # L3 — refresh via the extracted render helper (no more fake_cb).
+        await _render_settings_force_join_view(callback.message)
 
     @router.callback_query(AdminCB.filter(F.action == "add_force_join_channel"))
     async def cb_add_force_join_channel(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.waiting_for_force_join_channel)
-        await callback.message.edit_text(
+        await show_view(callback.message, text=
             "📢 <b>Add Force Join Channel</b>\n\n"
             "Enter channel username (e.g. <code>@mychannel</code>) or chat ID:\n"
             "The bot must be an admin in the channel!",
@@ -5805,7 +8283,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_remove_force_join_channel(callback: CallbackQuery):
         channels = await db.get_setting_json("force_join_channels", [])
         if not channels:
-            await callback.answer("No channels to remove", show_alert=True)
+            # L12 — admin-facing i18n (was English-only "No channels to remove").
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
         kb = InlineKeyboardBuilder()
         for i, ch in enumerate(channels):
@@ -5816,7 +8295,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             )
         kb.button(text="🔙 Force Join", callback_data=SettingsCatCB(category="force_join").pack(), style="primary")
         kb.adjust(1, 1)
-        await callback.message.edit_text("🗑 <b>Select channel to remove:</b>", reply_markup=kb.as_markup())
+        await show_view(callback.message, text="🗑 <b>Select channel to remove:</b>", reply_markup=kb.as_markup())
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "remove_fj_channel"))
@@ -5827,7 +8306,11 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             removed = channels.pop(idx)
             await db.set_setting("force_join_channels", json.dumps(channels))
             await callback.answer(f"✅ Removed {removed.get('title', '?')}", show_alert=True)
-        await cb_settings_force_join(callback)
+        # L3 — refresh via the extracted render helper. (This callsite used
+        # ``await cb_settings_force_join(callback)`` directly, which worked but
+        # also fired a second ``callback.answer()`` from inside the view
+        # handler. Switching to the helper avoids the double-answer.)
+        await _render_settings_force_join_view(callback.message)
 
     # ---- Help text settings handlers ----
     @router.callback_query(AdminCB.filter(F.action == "edit_help_en"))
@@ -5835,7 +8318,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         await state.set_state(AdminStates.setting_edit_value)
         await state.update_data(edit_type="setting_str", key="help_text_en", label="Help text (English)")
         current = await db.get_setting("help_text_en") or t("help_text", "en")
-        await callback.message.edit_text(
+        await show_view(callback.message, text=
             f"📚 <b>Edit English help text</b>\n\nCurrent:\n<i>{escape_html(current[:200])}...</i>\n\nSend new help text:",
             reply_markup=kb_cancel("en"),
         )
@@ -5846,7 +8329,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         await state.set_state(AdminStates.setting_edit_value)
         await state.update_data(edit_type="setting_str", key="help_text_fa", label="Help text (Farsi)")
         current = await db.get_setting("help_text_fa") or t("help_text", "fa")
-        await callback.message.edit_text(
+        await show_view(callback.message, text=
             f"📚 <b>Edit Persian help text</b>\n\nCurrent:\n<i>{escape_html(current[:200])}...</i>\n\nSend new help text:",
             reply_markup=kb_cancel("fa"),
         )
@@ -5858,13 +8341,19 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         await state.set_state(AdminStates.setting_edit_value)
         await state.update_data(edit_type="setting_str", key="topup_packages", label="Topup packages")
         cur = await db.get_setting_json("topup_packages", [5, 10, 20, 50])
-        await callback.message.edit_text(
+        await show_view(callback.message, text=
             f"📦 Enter topup packages as comma-separated GB values:\n\nCurrent: {cur}",
             reply_markup=kb_cancel("en"),
         )
         await callback.answer()
 
     # ---- catch-all for section-header "noop" buttons & stray callbacks ----
+    # L5: NoopCB packs to a string starting with the "noop" prefix, so the
+    # original ``F.data.startswith("noop")`` filter (kept for backward
+    # compatibility with any in-flight legacy callbacks) still matches. The
+    # typed NoopCB.filter() form would also work but the startswith filter is
+    # more permissive — it tolerates both the old literal "noop_0" and the
+    # new packed form ("noop:").
     @router.callback_query(F.data.startswith("noop"))
     async def cb_noop(callback: CallbackQuery):
         await callback.answer()
@@ -5891,15 +8380,18 @@ async def task_expiry_checker(bot: Bot, db: Database, api: PanelAPI):
                     lang = L(user.get("language", DEFAULT_LANGUAGE))
                     try:
                         kb = InlineKeyboardBuilder()
-                        kb.button(text=t("renew", lang),
-                                  callback_data=AccountCB(action="renew", email=acc["email"]).pack(),
-                                  style="success")
+                        # Trial accounts can't be renewed — only offer Buy.
+                        if not acc.get("is_trial"):
+                            kb.button(text=t("renew", lang),
+                                      callback_data=AccountCB(action="renew", email=acc["email"]).pack(),
+                                      style="success")
+                        kb.button(style="success", text=t("buy", lang), callback_data=MenuCB(action="buy").pack())
                         kb.button(style="primary", text=t("my_accounts", lang),
                                   callback_data=MenuCB(action="my_accounts").pack())
-                        kb.adjust(2)
+                        kb.adjust(2 if not acc.get("is_trial") else 1, 1)
                         await bot.send_message(
                             acc["user_tg_id"],
-                            f"⏰ <b>{'Subscription expiring soon!' if lang=='en' else 'اشتراک شما به‌زودی منقضی می‌شود!'}</b>\n\n"
+                            f"⏰ <b>{t('expiry_reminder_subject', lang)}</b>\n\n"
                             f"📱 <code>{escape_html(acc['email'])}</code>\n"
                             f"📅 {fmt_remaining(acc['expiry_time'], lang)}\n"
                             f"🗓 {fmt_ts(acc['expiry_time'], lang)}",
@@ -5910,7 +8402,7 @@ async def task_expiry_checker(bot: Bot, db: Database, api: PanelAPI):
                         logger.error("expiry reminder failed: %s", e)
 
             # Auto-disable fully expired accounts
-            now_ms = int(datetime.now().timestamp() * 1000)
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
             for acc in await db.get_all_active_accounts():
                 if acc["expiry_time"] > 0 and acc["expiry_time"] < now_ms:
                     server = await db.get_server(acc["server_id"])
@@ -5922,138 +8414,380 @@ async def task_expiry_checker(bot: Bot, db: Database, api: PanelAPI):
                     logger.info("Auto-disabled expired: %s", acc["email"])
                     try:
                         kb = InlineKeyboardBuilder()
-                        kb.button(text=t("renew", lang),
-                                  callback_data=AccountCB(action="renew", email=acc["email"]).pack(), style="success")
+                        # Trial accounts can't be renewed — only offer Buy.
+                        if not acc.get("is_trial"):
+                            kb.button(text=t("renew", lang),
+                                      callback_data=AccountCB(action="renew", email=acc["email"]).pack(), style="success")
                         kb.button(style="success", text=t("buy", lang), callback_data=MenuCB(action="buy").pack())
-                        kb.adjust(2)
+                        kb.adjust(2 if not acc.get("is_trial") else 1)
                         await bot.send_message(
                             acc["user_tg_id"],
-                            f"🔴 <b>{'Account expired' if lang=='en' else 'اکانت منقضی شد'}</b>\n\n"
+                            f"🔴 <b>{t('account_expired_subject', lang)}</b>\n\n"
                             f"📱 <code>{escape_html(acc['email'])}</code>\n"
                             f"🗓 {fmt_ts(acc['expiry_time'], lang)}",
                             reply_markup=kb.as_markup(),
                         )
-                    except Exception:
-                        pass
+                    except TelegramForbiddenError:
+                        pass  # user blocked the bot — expected
+                    except TelegramBadRequest as e:
+                        msg = str(e).lower()
+                        if "chat not found" not in msg and "blocked" not in msg:
+                            logger.warning("expiry auto-disable notify failed: %s", e)
+                    except Exception as e:
+                        logger.warning("expiry auto-disable notify failed: %s", e, exc_info=True)
         except Exception as e:
             logger.error("expiry checker error: %s", e)
-        await asyncio.sleep(3600)
+        await asyncio.sleep(EXPIRY_CHECK_INTERVAL_SECONDS)
 
 
 async def task_traffic_alerts(bot: Bot, db: Database, api: PanelAPI):
-    """Every 10 min: traffic-threshold alerts + auto-disable depleted."""
+    """Every 10 min: traffic-threshold alerts + auto-disable depleted.
+
+    Servers and the accounts on them are processed CONCURRENTLY via
+    asyncio.gather; every panel API call is bounded by PANEL_API_SEMAPHORE
+    (M15) so a single 1-core/1GB server cannot be flooded with 100s of
+    simultaneous HTTP requests.
+    """
     logger.info("Background task started: traffic_alerts")
-    while True:
-        try:
-            for acc in await db.get_all_active_accounts():
-                server = await db.get_server(acc["server_id"])
-                if not server:
-                    continue
-                traffic = await api.get_client_traffic(server["panel_url"], server["api_token"], acc["email"])
-                if not traffic:
-                    continue
-                total = traffic.get("total", 0)
-                used = traffic.get("up", 0) + traffic.get("down", 0)
-                if total <= 0:
-                    continue
-                pct = (used / total) * 100
-                user = await db.get_user(acc["user_tg_id"])
-                lang = L((user or {}).get("language", DEFAULT_LANGUAGE))
-                for threshold in (TRAFFIC_ALERT_THRESHOLD_1, TRAFFIC_ALERT_THRESHOLD_2):
-                    if pct >= threshold and not await db.has_traffic_alert(acc["email"], threshold):
-                        try:
-                            emoji = "⚠️" if threshold < 90 else "🚨"
-                            kb = InlineKeyboardBuilder()
+
+    async def _check_account(acc: dict, server: dict):
+        """Per-account traffic check + alert + auto-disable. Bounded by the
+        semaphore so panel API calls (get_client_traffic, disable_client)
+        stay under PANEL_API_SEMAPHORE concurrency."""
+        async with PANEL_API_SEMAPHORE:
+            traffic = await api.get_client_traffic(server["panel_url"], server["api_token"], acc["email"])
+            if not traffic:
+                return
+            total = traffic.get("total", 0)
+            used = traffic.get("up", 0) + traffic.get("down", 0)
+            if total <= 0:
+                return
+            pct = (used / total) * 100
+            user = await db.get_user(acc["user_tg_id"])
+            lang = L((user or {}).get("language", DEFAULT_LANGUAGE))
+            for threshold in (TRAFFIC_ALERT_THRESHOLD_1, TRAFFIC_ALERT_THRESHOLD_2):
+                if pct >= threshold and not await db.has_traffic_alert(acc["email"], threshold):
+                    try:
+                        emoji = "⚠️" if threshold < 90 else "🚨"
+                        kb = InlineKeyboardBuilder()
+                        # Trial accounts can't be topped up or renewed.
+                        if not acc.get("is_trial"):
                             kb.button(text=t("topup_traffic", lang),
                                       callback_data=AccountCB(action="topup", email=acc["email"]).pack(), style="primary")
                             kb.button(text=t("renew", lang),
                                       callback_data=AccountCB(action="renew", email=acc["email"]).pack(), style="success")
-                            kb.adjust(2)
-                            await bot.send_message(
-                                acc["user_tg_id"],
-                                f"{emoji} <b>Traffic {threshold}%</b>\n"
-                                f"📱 <code>{escape_html(acc['email'])}</code>\n"
-                                f"📊 {fmt_bytes(used)} / {fmt_bytes(total)}\n"
-                                f"✅ {fmt_bytes(total-used)}",
-                                reply_markup=kb.as_markup(),
-                            )
-                            await db.add_traffic_alert(acc["email"], threshold)
-                        except Exception as e:
-                            logger.error("traffic alert send failed: %s", e)
-                if pct >= 100 and acc["is_active"]:
-                    await api.disable_client(server["panel_url"], server["api_token"], acc["email"])
-                    await db.update_account(acc["email"], is_active=False)
-                    logger.info("Auto-disabled depleted: %s", acc["email"])
-                    try:
-                        kb = InlineKeyboardBuilder()
-                        kb.button(text=t("renew", lang),
-                                  callback_data=AccountCB(action="renew", email=acc["email"]).pack(), style="success")
-                        kb.adjust(1)
+                        else:
+                            kb.button(style="success", text=t("buy", lang), callback_data=MenuCB(action="buy").pack())
+                        kb.adjust(2 if not acc.get("is_trial") else 1)
                         await bot.send_message(
                             acc["user_tg_id"],
-                            f"🔴 <b>{'Traffic depleted' if lang=='en' else 'حجم تمام شد'}</b>\n"
-                            f"📱 <code>{escape_html(acc['email'])}</code>",
+                            f"{emoji} <b>Traffic {threshold}%</b>\n"
+                            f"📱 <code>{escape_html(acc['email'])}</code>\n"
+                            f"📊 {fmt_bytes(used)} / {fmt_bytes(total)}\n"
+                            f"✅ {fmt_bytes(total-used)}",
                             reply_markup=kb.as_markup(),
                         )
-                    except Exception:
-                        pass
+                        await db.add_traffic_alert(acc["email"], threshold)
+                    except Exception as e:
+                        logger.error("traffic alert send failed: %s", e)
+            if pct >= 100 and acc["is_active"]:
+                await api.disable_client(server["panel_url"], server["api_token"], acc["email"])
+                await db.update_account(acc["email"], is_active=False)
+                logger.info("Auto-disabled depleted: %s", acc["email"])
+                try:
+                    kb = InlineKeyboardBuilder()
+                    kb.button(text=t("renew", lang),
+                              callback_data=AccountCB(action="renew", email=acc["email"]).pack(), style="success")
+                    kb.adjust(1)
+                    await bot.send_message(
+                        acc["user_tg_id"],
+                        f"🔴 <b>{t('traffic_depleted_subject', lang)}</b>\n"
+                        f"📱 <code>{escape_html(acc['email'])}</code>",
+                        reply_markup=kb.as_markup(),
+                    )
+                except TelegramForbiddenError:
+                    pass  # user blocked the bot — expected
+                except TelegramBadRequest as e:
+                    msg = str(e).lower()
+                    if "chat not found" not in msg and "blocked" not in msg:
+                        logger.warning("traffic-depleted notify failed: %s", e)
+                except Exception as e:
+                    logger.warning("traffic-depleted notify failed: %s", e, exc_info=True)
+
+    async def _process_server(srv: dict, accounts: List[dict]):
+        """Fan out per-account checks for one server. Per-account coroutines
+        acquire PANEL_API_SEMAPHORE individually so a busy server with many
+        accounts cannot starve other servers."""
+        if not accounts:
+            return
+        results = await asyncio.gather(
+            *(_check_account(acc, srv) for acc in accounts),
+            return_exceptions=True,
+        )
+        for r in results:
+            if isinstance(r, Exception):
+                logger.error("traffic alerts account error on %s: %s",
+                             srv.get("alias", srv.get("id")), r)
+
+    while True:
+        try:
+            servers = await db.get_servers(active_only=True)
+            accounts = await db.get_all_active_accounts()
+            # Group accounts by server_id so each _process_server coroutine
+            # handles only its own accounts (avoids N redundant get_server calls).
+            by_srv: Dict[int, List[dict]] = {}
+            for acc in accounts:
+                by_srv.setdefault(acc["server_id"], []).append(acc)
+            server_results = await asyncio.gather(
+                *(_process_server(srv, by_srv.get(srv["id"], [])) for srv in servers),
+                return_exceptions=True,
+            )
+            for r in server_results:
+                if isinstance(r, Exception):
+                    logger.error("traffic alerts server error: %s", r)
         except Exception as e:
             logger.error("traffic alerts error: %s", e)
-        await asyncio.sleep(600)
+        await asyncio.sleep(TRAFFIC_CHECK_INTERVAL_SECONDS)
 
 
 async def task_server_health(bot: Bot, db: Database, api: PanelAPI):
-    """Every 5 min: probe all servers, notify admins of state changes."""
+    """Every 5 min: probe all servers, notify admins of state changes.
+
+    All servers are probed CONCURRENTLY via asyncio.gather; each probe is
+    bounded by PANEL_API_SEMAPHORE (M15). One slow/down server cannot block
+    the rest because return_exceptions=True is used and any Exception is
+    logged but does not abort the loop.
+    """
     logger.info("Background task started: server_health")
+
+    async def _check_server(srv: dict):
+        async with PANEL_API_SEMAPHORE:
+            ok, msg = await api.test_panel_connection(srv["panel_url"], srv["api_token"])
+            was_healthy = bool(srv["is_healthy"])
+            await db.update_server_health(srv["id"], ok, "" if ok else msg)
+            if was_healthy and not ok:
+                logger.warning("Server down: %s — %s", srv["alias"], msg)
+                for admin_id in ADMIN_IDS:
+                    await safe_notify(
+                        bot.send_message(
+                            admin_id,
+                            f"🔴 <b>Server Down</b>\n🖥 {escape_html(srv['alias'])}\n"
+                            f"🔗 <code>{escape_html(srv['panel_url'])}</code>\n❌ {escape_html(msg)}",
+                        ),
+                        context="server-down admin notify",
+                    )
+            elif not was_healthy and ok:
+                logger.info("Server recovered: %s", srv["alias"])
+                for admin_id in ADMIN_IDS:
+                    await safe_notify(
+                        bot.send_message(
+                            admin_id,
+                            f"🟢 <b>Server Recovered</b>\n🖥 {escape_html(srv['alias'])}",
+                        ),
+                        context="server-recovered admin notify",
+                    )
+
     while True:
         try:
-            for srv in await db.get_servers(active_only=True):
-                ok, msg = await api.test_panel_connection(srv["panel_url"], srv["api_token"])
-                was_healthy = bool(srv["is_healthy"])
-                await db.update_server_health(srv["id"], ok, "" if ok else msg)
-                if was_healthy and not ok:
-                    logger.warning("Server down: %s — %s", srv["alias"], msg)
-                    for admin_id in ADMIN_IDS:
-                        try:
-                            await bot.send_message(
-                                admin_id,
-                                f"🔴 <b>Server Down</b>\n🖥 {escape_html(srv['alias'])}\n"
-                                f"🔗 <code>{escape_html(srv['panel_url'])}</code>\n❌ {escape_html(msg)}",
-                            )
-                        except Exception:
-                            pass
-                elif not was_healthy and ok:
-                    logger.info("Server recovered: %s", srv["alias"])
-                    for admin_id in ADMIN_IDS:
-                        try:
-                            await bot.send_message(
-                                admin_id,
-                                f"🟢 <b>Server Recovered</b>\n🖥 {escape_html(srv['alias'])}",
-                            )
-                        except Exception:
-                            pass
+            servers = await db.get_servers(active_only=True)
+            results = await asyncio.gather(
+                *(_check_server(srv) for srv in servers),
+                return_exceptions=True,
+            )
+            for srv, r in zip(servers, results):
+                if isinstance(r, Exception):
+                    logger.error("server health check failed for %s: %s",
+                                 srv.get("alias", srv.get("id")), r)
         except Exception as e:
             logger.error("server health error: %s", e)
-        await asyncio.sleep(300)
+        await asyncio.sleep(SERVER_HEALTH_INTERVAL_SECONDS)
 
 
 async def task_sync_client_counts(db: Database, api: PanelAPI):
-    """Every 30 min: refresh cached client counts per server (for load balancing)."""
+    """Every 30 min: refresh cached client counts per server (for load balancing).
+
+    All servers are synced CONCURRENTLY via asyncio.gather; each panel call is
+    bounded by PANEL_API_SEMAPHORE (M15).
+    """
     logger.info("Background task started: sync_client_counts")
+
+    async def _sync_server(srv: dict):
+        async with PANEL_API_SEMAPHORE:
+            data = await api.get_clients_paged(srv["panel_url"], srv["api_token"], page=1, page_size=1)
+            total = data.get("total", 0) if isinstance(data, dict) else 0
+            await db.update_server(srv["id"], total_clients=total)
+
     while True:
         try:
-            for srv in await db.get_servers(active_only=True):
-                data = await api.get_clients_paged(srv["panel_url"], srv["api_token"], page=1, page_size=1)
-                total = data.get("total", 0) if isinstance(data, dict) else 0
-                await db.update_server(srv["id"], total_clients=total)
+            servers = await db.get_servers(active_only=True)
+            results = await asyncio.gather(
+                *(_sync_server(srv) for srv in servers),
+                return_exceptions=True,
+            )
+            for srv, r in zip(servers, results):
+                if isinstance(r, Exception):
+                    logger.error("sync client counts failed for %s: %s",
+                                 srv.get("alias", srv.get("id")), r)
         except Exception as e:
             logger.error("sync client counts error: %s", e)
-        await asyncio.sleep(1800)
+        await asyncio.sleep(SYNC_COUNTS_INTERVAL_SECONDS)
+
+
+async def task_data_retention(bot: Bot, db: Database):
+    """Every 24h: purge old ticket_messages / payments / broadcasts (M9).
+
+    Policy lives in ``Database.purge_old_data`` so it can be unit-tested and
+    re-used by an admin "cleanup" button later.  This task just calls it on a
+    fixed 86400-second cadence and logs the per-table purge counts.
+    """
+    logger.info("Background task started: data_retention")
+    while True:
+        try:
+            counts = await db.purge_old_data()
+            if any(counts.values()):
+                logger.info(
+                    "data_retention purged: ticket_messages=%d payments=%d broadcasts=%d",
+                    counts["ticket_messages"], counts["payments"], counts["broadcasts"],
+                )
+            else:
+                logger.info("data_retention: nothing to purge this cycle")
+        except Exception as e:
+            logger.error("data retention error: %s", e)
+        await asyncio.sleep(DATA_RETENTION_INTERVAL_SECONDS)
+
+
+async def task_db_backup(bot: Bot, db: Database):
+    """Every 24h: take a consistent snapshot of the SQLite DB and ship it to
+    every admin as a Telegram document (L10).
+
+    Why ``VACUUM INTO`` instead of copying the file:
+      SQLite's ``VACUUM INTO`` produces a transactionally-consistent snapshot
+      without taking a write lock on the source DB. The live bot keeps serving
+      requests while the snapshot is taken. File-level ``cp bot.db bot.db.bak``
+      would race with concurrent writes and could yield a corrupt backup.
+
+    Retention:
+      Only the latest ``DB_BACKUP_KEEP`` (default 3) on-disk snapshots are
+      kept; older ones are unlinked. Telegram itself stores the full history
+      of sent documents in the admin PMs, so the on-disk rotation does not
+      lose data — it just keeps the working directory small.
+    """
+    keep = int(os.getenv("DB_BACKUP_KEEP", "3"))
+    logger.info("Background task started: db_backup (keep=%d)", keep)
+    while True:
+        backup_path = None
+        try:
+            ts = datetime.now(TEHRAN_TZ).strftime("%Y%m%dT%H%M%SZ")
+            backup_path = f"{DATABASE_PATH}.bak.{ts}"
+            # VACUUM INTO writes a fresh DB file with all the live data,
+            # transactionally consistent as of the moment the command runs.
+            # We reuse the live connection so the snapshot reflects a single
+            # point-in-time view.
+            #
+            # NOTE: SQLite's VACUUM INTO does not accept a bound parameter for
+            # the filename — it must be a string literal. We inline the path
+            # with single-quotes doubled to neutralise any quote characters
+            # that might appear in DATABASE_PATH (the path is admin-controlled
+            # via env var, so this is a hardening measure rather than a real
+            # injection vector).
+            safe_path = backup_path.replace("'", "''")
+            await db._db.execute(f"VACUUM INTO '{safe_path}'")
+            size = os.path.getsize(backup_path) if os.path.exists(backup_path) else 0
+            logger.info("db_backup: snapshot written to %s (%d bytes)", backup_path, size)
+            # Ship to every admin via Telegram document.
+            for admin_id in ADMIN_IDS:
+                await safe_notify(
+                    bot.send_document(
+                        admin_id,
+                        FSInputFile(backup_path),
+                        caption=(
+                            f"💾 <b>Scheduled DB backup</b>\n"
+                            f"📁 <code>{escape_html(backup_path)}</code>\n"
+                            f"📦 {size:,} bytes\n"
+                            f"🕒 {ts}"
+                        ),
+                    ),
+                    context="db_backup admin document",
+                )
+            # Retention — keep only the latest `keep` on-disk snapshots.
+            try:
+                import glob
+                backups = sorted(
+                    glob.glob(f"{DATABASE_PATH}.bak.*"),
+                    key=lambda p: os.path.getmtime(p),
+                )
+                for old in backups[:-keep]:
+                    try:
+                        os.unlink(old)
+                        logger.info("db_backup: pruned old snapshot %s", old)
+                    except OSError as exc:
+                        logger.warning("db_backup: could not prune %s: %s", old, exc)
+            except Exception as exc:
+                logger.warning("db_backup: retention sweep failed: %s", exc, exc_info=True)
+        except Exception as e:
+            logger.error("db_backup error: %s", e, exc_info=True)
+            # Clean up a half-written snapshot so the next cycle does not see
+            # a stale file lying around.
+            if backup_path:
+                try:
+                    if os.path.exists(backup_path):
+                        os.unlink(backup_path)
+                except OSError:
+                    pass
+        await asyncio.sleep(DB_BACKUP_INTERVAL_SECONDS)
 
 
 # ============================================================================
 # SECTION 13: MAIN APPLICATION
 # ============================================================================
+
+async def _health_server(db: Database, api: PanelAPI, port: int = 9090):
+    """Tiny aiohttp /health endpoint (M7).
+
+    Runs alongside the bot so external monitors (Uptime Kuma, Kubernetes,
+    systemd watchdog) can poll it. Returns 200 OK if the DB is reachable and
+    the polling loop is alive. Returns 503 if anything is wrong.
+
+    Uses a single aiohttp app with one route — minimal RAM footprint for our
+    1-core/1GB host. If aiohttp is not installed, this is a no-op.
+    """
+    try:
+        from aiohttp import web
+    except ImportError:
+        logger.info("aiohttp not installed — /health endpoint disabled (M7)")
+        return None
+
+    last_poll_heartbeat = {"ts": time.time()}
+
+    async def health_handler(request):
+        try:
+            # DB reachability check.
+            async with db._db.execute("SELECT 1") as cur:
+                await cur.fetchone()
+            db_ok = True
+        except Exception:
+            db_ok = False
+        # Panel API client is "alive" if the httpx session isn't closed.
+        api_ok = not api.client.is_closed
+        # Polling heartbeat: should update every few seconds.
+        poll_stale = (time.time() - last_poll_heartbeat["ts"]) > 60
+        status = "ok" if (db_ok and api_ok and not poll_stale) else "degraded"
+        code = 200 if status == "ok" else 503
+        return web.json_response(
+            {"status": status, "db": db_ok, "api_client": api_ok,
+             "poll_stale": poll_stale, "ts": time.time()},
+            status=code,
+        )
+
+    app = web.Application()
+    app.router.add_get("/health", health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info("/health endpoint listening on port %d", port)
+    return runner, last_poll_heartbeat
+
 
 async def main():
     """Initialise DB, API, bot, routers, middleware, background tasks — then poll."""
@@ -6089,28 +8823,80 @@ async def main():
         asyncio.create_task(task_traffic_alerts(bot, db, api)),
         asyncio.create_task(task_server_health(bot, db, api)),
         asyncio.create_task(task_sync_client_counts(db, api)),
+        asyncio.create_task(task_data_retention(bot, db)),
+        asyncio.create_task(task_db_backup(bot, db)),
     ]
-    logger.info("Background tasks: expiry, traffic, health, sync_counts")
+    logger.info("Background tasks: expiry, traffic, health, sync_counts, data_retention, db_backup")
+
+    # /health endpoint (M7)
+    health_runner = None
+    health_heartbeat = None
+    try:
+        result = await _health_server(db, api, port=int(os.getenv("HEALTH_PORT", "9090")))
+        if result:
+            health_runner, health_heartbeat = result
+    except Exception as e:
+        logger.warning("/health endpoint failed to start (non-fatal): %s", e)
+
+    # M6 — graceful shutdown: SIGTERM (systemd) and SIGINT (Ctrl+C) both
+    # trigger dp.stop_polling() so the `finally` block can clean up cleanly.
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def _signal_handler():
+        logger.info("Shutdown signal received — draining...")
+        stop_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _signal_handler)
+        except (NotImplementedError, RuntimeError):
+            # add_signal_handler is not available on Windows / some loops.
+            pass
 
     me = await bot.get_me()
     logger.info("Bot online as @%s", me.username)
     for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(
+        await safe_notify(
+            bot.send_message(
                 admin_id,
                 f"✅ <b>Bot Started</b>\n🤖 @{me.username}\n"
                 f"⚙️ /admin — admin panel\n🔧 Background tasks: active",
-            )
-        except Exception:
-            pass
+            ),
+            context="bot-start admin notify",
+        )
 
+    # Polling task — runs concurrently with the stop-event watcher so we can
+    # react to SIGTERM/SIGINT cleanly (M6).
+    polling_task = asyncio.create_task(
+        dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    )
+    stop_watcher = asyncio.create_task(stop_event.wait())
+    logger.info("Starting polling...")
     try:
-        logger.info("Starting polling...")
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        # Wait for either polling to exit OR a stop signal to arrive.
+        done, pending = await asyncio.wait(
+            {polling_task, stop_watcher}, return_when=asyncio.FIRST_COMPLETED,
+        )
+        if stop_watcher in done:
+            # Signal received — stop polling gracefully.
+            await dp.stop_polling()
+            try:
+                await asyncio.wait_for(polling_task, timeout=10)
+            except asyncio.TimeoutError:
+                polling_task.cancel()
     finally:
+        if not stop_watcher.done():
+            stop_watcher.cancel()
         for task in tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # Give cancelled tasks up to 30s to finish in-flight work (M6).
+        await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=30,
+        )
+        if health_runner is not None:
+            await health_runner.cleanup()
         await api.close()
         await db.disconnect()
         await bot.session.close()
