@@ -68,6 +68,7 @@ import json
 import time
 import io
 import re
+import math
 import string
 import secrets
 import uuid
@@ -77,6 +78,7 @@ import contextlib
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Dict, List, Tuple, Callable, Iterable, Sequence
 
+from urllib.parse import quote
 import httpx
 import aiosqlite
 from aiogram import Bot, Dispatcher, Router, F
@@ -466,6 +468,98 @@ class rich_tables:
         )
 
     # ------------------------------------------------------------------
+    # USER-FACING wallet view (used by cb_balance / Wallet hub)
+    # ------------------------------------------------------------------
+    #
+    # Why a dedicated builder (instead of reusing kv_table directly in the
+    # handler): the wallet page is the one USER-FACING screen that benefits
+    # from a real bordered/striped table (balance + orders + spent summary,
+    # plus a recent-transactions grid).  Building it here keeps the handler
+    # thin and lets us localize the column headers (kv_table hard-codes
+    # "Field"/"Value" which looks wrong in Farsi).
+    #
+    # IMPORTANT: Rich Message heading/paragraph/cell text is PLAIN TEXT —
+    # HTML tags like <b> are NOT rendered and would show up literally.  This
+    # is exactly the bug that previously pushed the wallet page off tables
+    # onto plain HTML text.  The fix is simply to NOT use HTML here: the
+    # heading block is already bold by design, and emphasis comes from
+    # emojis + column layout, not from <b> tags.
+
+    @staticmethod
+    def wallet_rich(balance, total_orders, total_spent, txs,
+                    lang: str, currency: str, fmt: PriceFmt) -> InputRichMessage:
+        """Build the user-facing Wallet rich message (summary + transactions).
+
+        Renders a bordered/striped key/value table for the balance summary and
+        a 3-column grid (Date | Type | Amount) for recent transactions.  Farsi
+        gets ``is_rtl=True`` so the table lays out right-to-left.
+        """
+        is_rtl = (lang == "fa")
+        if lang == "fa":
+            title = "💳 کیف پول"
+            sum_headers = ["بخش", "مقدار"]
+            sum_rows = [
+                ("💰 موجودی", fmt(balance, lang, currency)),
+                ("🛒 سفارش‌ها", fmt_num(total_orders, lang)),
+                ("💸 هزینه‌شده", fmt(total_spent, lang, currency)),
+            ]
+            tx_title = "📋 تراکنش‌های اخیر"
+            tx_headers = ["تاریخ", "نوع", "مبلغ"]
+            empty = "💡 هنوز تراکنشی ثبت نشده. با شارژ کیف پول شروع کن!"
+            type_labels = {
+                "purchase": "🛒 خرید",
+                "renewal": "🔄 تمدید",
+                "topup": "➕ حجم",
+                "deposit": "💰 شارژ",
+                "gift_balance": "🎁 هدیه",
+                "gift_plan": "🎁 هدیه",
+                "trial": "🆓 رایگان",
+                "admin_adjust": "⚙️ ادمین",
+            }
+        else:
+            title = "💳 Wallet"
+            sum_headers = ["Field", "Value"]
+            sum_rows = [
+                ("💰 Balance", fmt(balance, lang, currency)),
+                ("🛒 Total orders", fmt_num(total_orders, lang)),
+                ("💸 Total spent", fmt(total_spent, lang, currency)),
+            ]
+            tx_title = "📋 Recent transactions"
+            tx_headers = ["Date", "Type", "Amount"]
+            empty = "💡 No transactions yet. Charge your wallet to get started!"
+            type_labels = {
+                "purchase": "🛒 Purchase",
+                "renewal": "🔄 Renewal",
+                "topup": "➕ Top-up",
+                "deposit": "💰 Deposit",
+                "gift_balance": "🎁 Gift",
+                "gift_plan": "🎁 Gift",
+                "trial": "🆓 Trial",
+                "admin_adjust": "⚙️ Admin",
+            }
+
+        blocks: List = [rich_tables.heading(title),
+                        rich_tables.grid_table(sum_headers, sum_rows,
+                                               aligns=["left", "right"])]
+        if txs:
+            rows = []
+            for tx in txs:
+                label = type_labels.get(tx["type"], f"• {tx['type']}")
+                amt = fmt(abs(tx["amount"]), lang, currency)
+                sign = "+" if tx["amount"] >= 0 else "-"
+                iso = fmt_iso(tx["created_at"])
+                date = iso[5:16] if iso else ""
+                rows.append((date, label, f"{sign}{amt}"))
+            blocks.append(rich_tables.divider())
+            blocks.append(rich_tables.heading(tx_title, size=4))
+            blocks.append(rich_tables.grid_table(tx_headers, rows,
+                                                 aligns=["center", "left", "right"]))
+        else:
+            blocks.append(rich_tables.divider())
+            blocks.append(rich_tables.paragraph(empty))
+        return rich_tables.rich_message(*blocks, is_rtl=is_rtl)
+
+    # ------------------------------------------------------------------
     # small helpers
     # ------------------------------------------------------------------
 
@@ -553,8 +647,8 @@ HTTP_CONNECT_TIMEOUT = 10.0                # httpx connect timeout
 TRIAL_DEFAULT_DAYS = 3                     # default trial duration (days)
 TRIAL_DEFAULT_GB = 5                       # default trial traffic (GB)
 TOPUP_DEFAULT_PRICE_PER_GB = 2000          # default top-up price per GB (toman)
-PAYMENT_UNIQUE_SUFFIX_MIN = 1000           # cryptographic 4-digit suffix lower bound
-PAYMENT_UNIQUE_SUFFIX_RANGE = 9000         # cryptographic 4-digit suffix range
+PAYMENT_UNIQUE_SUFFIX_MIN = 100            # small 3-digit suffix lower bound (100–999)
+PAYMENT_UNIQUE_SUFFIX_RANGE = 900          # small 3-digit suffix range → max +999 toman surcharge
 EXPIRY_CHECK_INTERVAL_SECONDS = 3600       # expiry-checker task cadence (1h)
 TRAFFIC_CHECK_INTERVAL_SECONDS = 600       # traffic-alert task cadence (10min)
 SERVER_HEALTH_INTERVAL_SECONDS = 300       # server-health task cadence (5min)
@@ -570,7 +664,169 @@ REFERRAL_CODE_LEN = 6                      # length of random suffix in REFxxxxx
 EMAIL_ENTROPY_BYTES = 8                    # bytes of entropy in gen_email
 DEFAULT_PAYMENT_MIN_AMOUNT = 50000         # default payment minimum amount (toman)
 BROADCAST_MAX_TEXT_CHARS = 4000            # truncate broadcast text (Telegram limit)
-DB_BACKUP_INTERVAL_SECONDS = 86400         # scheduled DB backup cadence (24h)
+DB_BACKUP_INTERVAL_SECONDS = 86400         # scheduled DB backup cadence (24h, default fallback)
+
+# ---- Purchase warning text (PURCHASE-WARNING) — shown as a collapsible
+# <blockquote expandable> in the plan view + review page, in both EN and FA.
+# The user asked for this exact wording so buyers understand the fair-use
+# policy before paying.
+PURCHASE_WARNING_EN = (
+    "⚠️ <b>Please note:</b> If you share any of the provided configurations in "
+    "public \u201cfree internet\u201d channels or with a large group of people "
+    "(such as extended family, etc.), your configuration will be automatically "
+    "deactivated once the system detects unusual traffic patterns and a heavy "
+    "load. Therefore, please restrict usage to immediate family members only, "
+    "so that we are not forced to disable your access and let you down."
+)
+PURCHASE_WARNING_FA = (
+    "⚠️ <b>توجه:</b> در صورتی که هر یک از کانفیگ‌های ارائه‌شده را در کانال‌های "
+    "عمومی اینترنت آزاد منتشر کنید یا در اختیار افراد زیاد (از جمله فامیل و ...) "
+    "قرار دهید، سیستم به‌طور خودکار با تشخیص الگوی غیرعادی ترافیک و بار سنگین، "
+    "کانفیگ شما را غیرفعال خواهد کرد. خواهشمندیم استفاده را صرفاً به اعضای خانواده "
+    "محدود نمایید تا مجبور به غیرفعال‌سازی نشویم و شرمندهٔ شما نشویم."
+)
+
+# ---- Default guide texts (GUIDES) — editable by the admin. These are the
+# rich defaults shown when the admin hasn't customised them yet. The admin
+# can override each one individually from Settings → Guides.
+DEFAULT_GUIDE_USAGE_EN = (
+    "📖 <b>Using the bot — quick walkthrough</b>\n\n"
+    "<b>1. Buy a plan</b>\n"
+    "Tap 🛒 <b>Buy VPN</b> → pick a plan → review → <b>Confirm & Pay</b>. "
+    "Your account is created instantly and the subscription link appears right away.\n\n"
+    "<b>2. Check your account</b>\n"
+    "📱 <b>My Accounts</b> shows every config you own: status, traffic used, "
+    "expiry date, and the subscription link. Tap any account for details.\n\n"
+    "<b>3. Renew or top up</b>\n"
+    "Inside an account, tap 🔄 <b>Renew</b> to extend the expiry, or ➕ <b>Top-up Traffic</b> "
+    "to add more data without changing the expiry.\n\n"
+    "<b>4. Balance & payments</b>\n"
+    "💳 <b>Charge Wallet</b> lets you pay by card. After paying, send your receipt "
+    "(photo or text). An admin approves it and the balance lands in your wallet. "
+    "You can also redeem 🎫 <b>Gift Codes</b> for instant balance.\n\n"
+    "<b>5. Free trial</b>\n"
+    "🎁 <b>Free Trial</b> gives you a small account to test the service. One trial per user.\n\n"
+    "<b>6. Referrals</b>\n"
+    "🔗 <b>Referral</b> gives you a personal invite link. When a friend buys their first "
+    "plan using your link, you can claim bonus days + GB on your own account.\n\n"
+    "<b>7. Support</b>\n"
+    "💬 <b>Support</b> opens a ticket. Describe your issue and the team will reply — "
+    "all within Telegram.\n\n"
+    "<b>8. QR code</b>\n"
+    "Inside any account, tap 📱 <b>QR</b> to get a scannable code for the subscription link — "
+    "perfect for quickly importing into a mobile app."
+)
+DEFAULT_GUIDE_USAGE_FA = (
+    "📖 <b>استفاده از ربات — راهنمای سریع</b>\n\n"
+    "<b>۱. خرید پلن</b>\n"
+    "روی 🛒 <b>خرید VPN</b> بزن → یه پلن انتخاب کن → بررسی → <b>تأیید و پرداخت</b>. "
+    "اکانتت همین‌جا ساخته می‌شه و لینک سابسکریپشن فوراً نشون داده می‌شه.\n\n"
+    "<b>۲. مشاهده اکانت</b>\n"
+    "📱 <b>اکانت‌های من</b> همه‌ی کانفیگ‌هات رو نشون می‌ده: وضعیت، مصرف حجم، "
+    "تاریخ انقضا و لینک سابسکریپشن. روی هر اکانت بزن تا جزئیاتش رو ببینی.\n\n"
+    "<b>۳. تمدید یا افزایش حجم</b>\n"
+    "توی هر اکانت، 🔄 <b>تمدید</b> رو بزن تا تاریخ انقضا عقب بره، یا ➕ <b>افزایش حجم</b> "
+    "رو بزن تا بدون تغییر تاریخ، حجمت زیاد بشه.\n\n"
+    "<b>۴. موجودی و پرداخت</b>\n"
+    "💳 <b>شارژ کیف پول</b> بهت اجازه می‌ده با کارت پرداخت کنی. بعد از پرداخت، رسیدت "
+    "(عکس یا متن) رو بفرست. یه ادمین تأییدش می‌کنه و موجودی به کیف پولت میاد. "
+    "همچنین می‌تونی 🎫 <b>کد هدیه</b> برای موجودی آنی استفاده کنی.\n\n"
+    "<b>۵. اکانت رایگان</b>\n"
+    "🎁 <b>اکانت رایگان</b> یه اکانت کوچیک بهت می‌ده تا سرویس رو امتحان کنی. هر کاربر یه‌بار.\n\n"
+    "<b>۶. دعوت دوستان</b>\n"
+    "🔗 <b>دعوت دوستان</b> بهت یه لینک شخصی می‌ده. وقتی یه دوست با لینکت اولین پلنش رو خرید، "
+    "می‌تونی پاداش روز + گیگ روی اکانت خودت دریافت کنی.\n\n"
+    "<b>۷. پشتیبانی</b>\n"
+    "💬 <b>پشتیبانی</b> یه تیکت باز می‌کنه. مشکلت رو بنویس تا تیم پشتیبانی جواب بده — "
+    "همه‌چیز همین توی تلگرام.\n\n"
+    "<b>۸. بارکد QR</b>\n"
+    "توی هر اکانت، 📱 <b>QR</b> رو بزن تا یه بارکد از لینک سابسکریپشن بگیری — "
+    "عالی برای وارد کردن سریع توی اپ موبایل."
+)
+DEFAULT_GUIDE_CONNECTION_EN = (
+    "🔌 <b>How to connect — step by step</b>\n\n"
+    "<b>What is a subscription link?</b>\n"
+    "A subscription (sub) link is a single URL that contains all your VPN servers. "
+    "When you paste it into a V2Ray client, the client fetches the full server list "
+    "and keeps it updated automatically. You only need to add it once.\n\n"
+    "<b>Pick your app:</b>\n\n"
+    "📱 <b>Android — v2rayNG</b> (free, recommended)\n"
+    "1. Install <b>v2rayNG</b> from Google Play or GitHub.\n"
+    "2. Open the app → tap the menu (≡) → <b>Subscription</b> → <b>Subscription settings</b>.\n"
+    "3. Tap <b>+</b> → paste your subscription URL → tap <b>✔</b>.\n"
+    "4. Tap <b>Update subscription</b> (the ↻ icon).\n"
+    "5. Go back → tap the server name → tap <b>V</b> at the bottom to connect.\n"
+    "6. The key icon in your status bar means you're connected.\n\n"
+    "📱 <b>iOS — Streisand</b> (free) or <b>V2Box</b>\n"
+    "1. Install <b>Streisand</b> from the App Store.\n"
+    "2. Open the app → <b>Settings</b> → <b>Subscriptions</b> → <b>Add</b>.\n"
+    "3. Paste your subscription URL → <b>Save</b>.\n"
+    "4. Go back → pick a server → toggle the switch to <b>On</b>.\n"
+    "5. Allow Streisand to add a VPN configuration when iOS asks.\n\n"
+    "💻 <b>Windows — v2rayN</b> (free)\n"
+    "1. Download <b>v2rayN</b> from GitHub (get the latest release zip).\n"
+    "2. Unzip and run <b>v2rayN.exe</b>.\n"
+    "3. Menu → <b>Subscription</b> → <b>Subscription settings</b> → <b>Add</b>.\n"
+    "4. Paste your subscription URL → <b>OK</b>.\n"
+    "5. Menu → <b>Subscription</b> → <b>Update subscription</b>.\n"
+    "6. Right-click the server in the list → <b>Set as active server</b>.\n"
+    "7. Press <b>Enter</b> or click the big <b>V</b> icon to connect.\n\n"
+    "🍎 <b>macOS — Foxray</b> (App Store) or <b>V2RayU</b>\n"
+    "1. Install <b>Foxray</b> from the App Store.\n"
+    "2. Open Foxray → <b>Subscription</b> tab → <b>+</b>.\n"
+    "3. Paste your subscription URL → <b>Update</b>.\n"
+    "4. Switch to the <b>Servers</b> tab → pick one → toggle <b>On</b>.\n\n"
+    "💡 <b>Tips</b>\n"
+    "• If a server feels slow, try another one from the subscription list.\n"
+    "• If your connection suddenly stops working, tap <b>Update subscription</b> "
+    "in your app — the server list refreshes and new configs appear.\n"
+    "• The subscription link is personal. Don't share it (see the warning on the buy page).\n\n"
+    "🛠 <b>Not working?</b>\n"
+    "1. Make sure you tapped <b>Update subscription</b> after pasting the link.\n"
+    "2. Try a different server from the list.\n"
+    "3. If nothing works, open a 💬 <b>Support</b> ticket — send a screenshot of the error."
+)
+DEFAULT_GUIDE_CONNECTION_FA = (
+    "🔌 <b>نحوه اتصال — قدم به قدم</b>\n\n"
+    "<b>لینک سابسکریپشن چیه؟</b>\n"
+    "لینک سابسکریپشن (sub) یه آدرسه که همه‌ی سرورهای VPN توش هست. وقتی توی یه کلاینت V2Ray "
+    "می‌ذاریش، کلاینت لیست کامل سرورها رو می‌گیره و خودکار به‌روز نگه می‌داره. فقط یه‌بار لازمه اضافه کنی.\n\n"
+    "<b>برنامه‌ت رو انتخاب کن:</b>\n\n"
+    "📱 <b>اندروید — v2rayNG</b> (رایگان، پیشنهاد ما)\n"
+    "۱. <b>v2rayNG</b> رو از گوگل پلی یا گیت‌هاب نصب کن.\n"
+    "۲. اپ رو باز کن → منو (≡) → <b>Subscription</b> → <b>Subscription settings</b>.\n"
+    "۳. <b>+</b> رو بزن → لینک سابسکریپشنت رو پیست کن → <b>✔</b>.\n"
+    "۴. <b>Update subscription</b> (آیکون ↻) رو بزن.\n"
+    "۵. برگرد → اسم سرور رو بزن → <b>V</b> پایین صفحه رو بزن تا وصل بشی.\n"
+    "۶. آیکون کلید توی نوار وضعیت یعنی وصل شدی.\n\n"
+    "📱 <b>آی‌او‌اس — Streisand</b> (رایگان) یا <b>V2Box</b>\n"
+    "۱. <b>Streisand</b> رو از اپ استور نصب کن.\n"
+    "۲. اپ رو باز کن → <b>Settings</b> → <b>Subscriptions</b> → <b>Add</b>.\n"
+    "۳. لینک سابسکریپشنت رو پیست کن → <b>Save</b>.\n"
+    "۴. برگرد → یه سرور انتخاب کن → کلید رو روی <b>On</b> بذار.\n"
+    "۵. وقتی آی‌او‌اس پرسید، اجازه بده تنظیمات VPN رو اضافه کنه.\n\n"
+    "💻 <b>ویندوز — v2rayN</b> (رایگان)\n"
+    "۱. <b>v2rayN</b> رو از گیت‌هاب دانلود کن (آخرین نسخه zip).\n"
+    "۲. از حالت فشرده خارج کن و <b>v2rayN.exe</b> رو اجرا کن.\n"
+    "۳. منو → <b>Subscription</b> → <b>Subscription settings</b> → <b>Add</b>.\n"
+    "۴. لینک سابسکریپشنت رو پیست کن → <b>OK</b>.\n"
+    "۵. منو → <b>Subscription</b> → <b>Update subscription</b>.\n"
+    "۶. روی سرور توی لیست راست‌کلیک کن → <b>Set as active server</b>.\n"
+    "۷. <b>Enter</b> رو بزن یا آیکون بزرگ <b>V</b> رو بزن تا وصل بشی.\n\n"
+    "🍎 <b>مک — Foxray</b> (اپ استور) یا <b>V2RayU</b>\n"
+    "۱. <b>Foxray</b> رو از اپ استور نصب کن.\n"
+    "۲. Foxray رو باز کن → تب <b>Subscription</b> → <b>+</b>.\n"
+    "۳. لینک سابسکریپشنت رو پیست کن → <b>Update</b>.\n"
+    "۴. به تب <b>Servers</b> برو → یکی رو انتخاب کن → <b>On</b> کن.\n\n"
+    "💡 <b>نکته‌ها</b>\n"
+    "• اگه یه سرور کند به نظر میاد، یه سرور دیگه از لیست ساب امتحان کن.\n"
+    "• اگه اتصالت یهو قطع شد، توی اپ <b>Update subscription</b> رو بزن — لیست سرورها به‌روز می‌شه.\n"
+    "• لینک سابسکریپشن شخصیه. به کسی ندید (هشدار صفحه خرید رو ببین).\n\n"
+    "🛠 <b>کار نمی‌کنه؟</b>\n"
+    "۱. مطمئن شو بعد از پیست کردن، <b>Update subscription</b> رو زدی.\n"
+    "۲. یه سرور دیگه از لیست امتحان کن.\n"
+    "۳. اگه هیچ‌کدوم جواب نداد، یه تیکت 💬 <b>پشتیبانی</b> باز کن — اسکرین‌شات خطا رو بفرست."
+)
 
 # Concurrency limiter for panel API calls from background tasks (M15).
 # The bot runs on a 1-core / 1 GB RAM box alongside the 3x-ui panel, so we
@@ -610,44 +866,75 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "copied": "📋 Copied to clipboard.",
         # main menu
         "welcome": (
-            "👋 <b>Welcome to {bot_name}!</b>\n\n"
-            "🔐 Premium VPN service with instant delivery.\n"
-            "📱 Manage your accounts right here in Telegram.\n\n"
-            "<b>What I can do:</b>\n"
-            "• 🛒 Buy a VPN subscription instantly\n"
-            "• 📱 View account status & traffic usage\n"
-            "• 🔄 Renew & top-up subscriptions\n"
-            "• 🎁 Get a free trial\n"
-            "• 🔗 Earn rewards via referrals\n"
-            "• 💬 Get support without leaving Telegram\n\n"
-            "Pick an option below 👇"
+            "👋 <b>Hey, welcome to {bot_name}!</b>\n\n"
+            "Glad to see you here. This is your VPN control panel — "
+            "everything happens right inside Telegram, nice and simple.\n\n"
+            "<b>Here's what you can do:</b>\n"
+            "• 🛒 Grab a VPN plan in a few taps\n"
+            "• 📱 Check your account status and traffic\n"
+            "• 🔄 Renew or top up whenever you need\n"
+            "• 🎁 Try a free trial first, no strings attached\n"
+            "• 🔗 Invite friends and earn bonus data\n"
+            "• 💬 Reach support without ever leaving the chat\n\n"
+            "Tap something below to get going 👇"
         ),
-        "menu_main": "🏠 <b>Main Menu</b>\n\nWhat would you like to do?",
-        "buy": "🛒 Buy VPN",
+        "menu_main": "🏠 <b>Main Menu</b>\n\nWhat can I do for you?",
+        "buy": "🛒 Buy Service",
         "my_accounts": "📱 My Accounts",
         "trial": "🎁 Free Trial",
-        "balance": "💳 Balance",
+        "balance": "💳 Wallet",
         "referral": "🔗 Referral",
         "gift": "🎫 Gift Code",
         "support": "💬 Support",
         "guide": "📚 Guide",
         "language": "🌐 Language",
         "admin_panel": "⚙️ Admin Panel",
+        # MENU-RESTRUCTURE: new combined sections
+        "wallet": "💳 Wallet",
+        "wallet_title": "💳 <b>Wallet</b>",
+        "help": "📚 Help & Support",
+        "help_title": "📚 <b>Help & Support</b>",
+        "help_desc": "Need a hand? Browse the guides or open a support ticket — we're here to help.\n\n• 📖 Guides for using the bot and connecting\n• 🎫 Open a ticket for any issue\n• ⏱ We usually reply within a few hours",
+        "more_features": "✨ More Features",
+        "more_features_title": "✨ <b>More Features</b>\n\nExtra settings and options:",
         # buy flow
-        "choose_plan": "🛒 <b>Choose a Plan</b>\n\nSelect a subscription plan:",
+        "choose_plan": "🛒 <b>Pick a plan</b>\n\nChoose the one that fits you — you can always renew or top up later:",
         "no_plans": "😔 No plans available yet. Please check back later or contact support.",
         "your_balance": "💳 Your balance: <b>{balance}</b>",
-        "sufficient": "✅ You have enough balance.",
-        "insufficient": "⚠️ Insufficient balance. You need <b>{diff}</b> more.\n\nUse Charge Wallet or redeem a gift code.",
+        "sufficient": "✅ Your balance is enough for this plan.",
+        "insufficient": "⚠️ <b>Not enough balance.</b>\nYou still need <b>{diff}</b> to buy this plan.",
+        "review_short_hint": "👇 Top up your wallet below to continue.",
         "ask_account_name": (
-            "✏️ <b>Name your account</b>\n\n"
-            "Send a friendly name (e.g. <code>phone</code>, <code>laptop</code>) — only letters, numbers, <code>-</code> and <code>_</code>.\n"
-            "Send <code>-</code> for an automatic name."
+            "✏️ <b>Name this config (optional)</b>\n\n"
+            "Send a short label like <code>phone</code> or <code>laptop</code> so you can tell your configs apart.\n"
+            "Only letters, numbers, <code>-</code> and <code>_</code>.\n\n"
+            "Send <code>-</code> or just hit Cancel to use an automatic name."
         ),
-        "invalid_name": "❌ Invalid name. Use 2-24 characters: letters, digits, dash or underscore.",
-        "review_purchase": "📋 <b>Review your order</b>",
+        "invalid_name": "❌ Hmm, that name won't work. Use 2-24 characters: letters, digits, dash or underscore.",
+        "review_purchase": "📋 <b>Review your order</b>\nCheck the details, add a name or promo if you like, then confirm.",
         "confirm_pay": "✅ Confirm & Pay",
-        "apply_promo": "🎟 Promo Code",
+        "apply_promo": "🎟 Add Promo Code",
+        "set_name_btn": "✏️ Name Config",
+        # SHORTFALL-REQUEST: shown on the purchase review page when the user
+        # can't afford the plan and card payments are enabled.
+        "request_shortfall_btn": "⚡ Pay Exact Shortfall",
+        "shortfall_payment_info": (
+            "⚡ <b>Shortfall payment for {plan_name}</b>\n\n"
+            "You need exactly <b>{shortfall}</b> more to buy this plan.\n\n"
+            "💳 Card number: <code>{card_number}</code>\n"
+            "👤 Card holder: {card_holder}\n\n"
+            "💵 Amount to transfer (with unique suffix, tap a number to copy):\n"
+            "{amount_block}\n\n"
+            "💡 Tap an amount to copy it — no commas, ready to paste.\n\n"
+            "After transferring, tap \"Send Receipt\" below and attach your receipt."
+        ),
+        "name_auto": "(auto)",
+        "name_label": "🏷 Name",
+        "promo_label": "🎟 Promo",
+        "promo_none": "none",
+        "price_label": "💵 Price",
+        "final_price_label": "💰 To pay",
+        "discount_label": "✂️ You save",
         "creating_account": "⏳ Creating your VPN account...",
         "purchase_success": "✅ <b>Account created successfully!</b>",
         "purchase_failed": "❌ Failed to create account: {msg}\n\nPlease try again or contact support.",
@@ -705,7 +992,7 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "referral_title": "🔗 <b>Referral Program</b>",
         "referral_disabled": "😔 The referral program is currently disabled.",
         "referral_desc": "Invite friends and earn rewards automatically when they buy their first plan!",
-        "referral_how": "📤 <b>How it works</b>\n1️⃣ Share your referral link with friends\n2️⃣ They sign up and buy their first plan\n3️⃣ You instantly get +{days} days and +{gb} GB on your account",
+        "referral_how": "📤 <b>How it works</b>\n1️⃣ Share your referral link with friends\n2️⃣ They sign up and buy their first plan\n3️⃣ You get +{days} days and +{gb} GB — claim it on your account anytime",
         "your_link": "📤 <b>Your referral link</b>",
         "share_link": "📤 Share Link",
         "referral_stats": "📊 <b>Your Stats</b>",
@@ -713,6 +1000,14 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "referral_no_history": "No referrals yet — share your link to start earning!",
         "ref_status_bought": "✅ Bought",
         "ref_status_pending": "⏳ Pending",
+        "ref_claim_btn": "🎁 Claim Reward",
+        "ref_claimable": "🎁 You have <b>{count}</b> unclaimed referral reward(s)!",
+        "ref_claim_success": "✅ <b>Reward claimed!</b>\n\n🎁 +{days} days and +{gb} GB added to <code>{email}</code>.\n\nThanks for spreading the word!",
+        "ref_claim_no_account": "⚠️ You need an active paid account to claim referral rewards.\n\nBuy a plan first, then come back here to claim your bonus.",
+        "ref_claim_none": "✅ No unclaimed rewards right now.\n\nShare your link to earn more!",
+        "ref_claim_pick": "Pick the account to receive the bonus:",
+        "ref_claim_failed": "❌ <b>Couldn't apply the reward</b>\n\nThe panel returned an error: <code>{msg}</code>\n\nYour referral bonus is untouched — please try again in a moment.",
+        "delete_failed": "⚠️ <b>Couldn't delete the account</b>\n\nThe panel returned an error: <code>{msg}</code>\n\nYour account is still active. Please try again in a moment.",
         # gift
         "enter_gift": "🎫 <b>Redeem gift code</b>\n\nSend me your code:",
         "gift_invalid": "❌ Invalid gift code. Try again:",
@@ -721,7 +1016,7 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "gift_plan_ok": "✅ <b>Gift redeemed!</b>\n🎁 Plan: <b>{plan}</b>",
         # support
         "support_title": "💬 <b>Support Center</b>",
-        "support_desc": "Need help? Open a ticket and our team will assist you.\n\n• 🎫 Create a ticket for any issue\n• ⏱ We usually reply within a few hours\n• 🔒 Your conversation is private",
+        "support_desc": "Need a hand? Open a ticket and our team will jump in.\n\n• 🎫 Open a ticket for any issue\n• ⏱ We usually reply within a few hours\n• 🔒 Your conversation is private",
         "new_ticket": "🎫 New Ticket",
         "my_tickets": "📋 My Tickets",
         "choose_category": "🎫 <b>New support ticket</b>\n\nChoose a category:",
@@ -730,19 +1025,23 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "cat_account": "👤 Account",
         "cat_other": "📝 Other",
         "ask_subject": "📝 <b>Category:</b> {category}\n\nNow send a short subject for your ticket:",
-        "ask_message": "📝 <b>Subject:</b> {subject}\n\nNow describe your issue in detail:",
+        "ask_message": "📝 <b>Subject:</b> {subject}\n\nNow describe your issue in detail.\n\n💡 You can also attach a file (photo, video, voice, audio, document, sticker, GIF, or round-video) — send it with a caption.",
         "ticket_created": "✅ <b>Ticket #{id} created!</b>\n\n📝 Subject: {subject}\n🏷 Category: {category}\n⏱ We will respond as soon as possible.",
         "reply": "💬 Reply",
         "reopen": "🔓 Reopen",
         "close": "🔒 Close",
         "ask_reply": "💬 <b>Reply to ticket #{id}</b>\n📝 {subject}\n\nType your message:",
-        "ask_reply_with_media": "💬 Send your reply (text or attach a photo/screenshot as evidence):",
+        "ask_reply_with_media": "💬 Send your reply. You can send text OR attach ANY file type: photo, video, voice, audio/music, document, sticker, GIF, or round-video. (Attach with a caption if you want to add text.)",
         "manage_user": "👤 Manage User",
         "view_media": "📎 View Media",
         "media_photo": "Photo",
         "media_document": "Document",
         "media_video": "Video",
         "media_voice": "Voice",
+        "media_audio": "Audio / Music",
+        "media_animation": "GIF",
+        "media_video_note": "Round Video",
+        "media_sticker": "Sticker",
         "media_sent": "✅ Media sent.",
         "reply_sent_admin": "✅ Reply sent to user.",
         "reply_sent_user": "✅ Reply sent to admin.",
@@ -756,7 +1055,11 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "tickets_filter_open": "🟢 Open",
         "tickets_filter_all": "📋 All",
         # guide
-        "guide_title": "📚 <b>VPN Setup Guide</b>",
+        "guide_title": "📚 <b>Guide Center</b>",
+        "guide_usage_title": "📖 <b>Using the bot</b>",
+        "guide_connection_title": "🔌 <b>Connection Guide</b>",
+        "guide_usage_btn": "📖 Using the Bot",
+        "guide_connection_btn": "🔌 How to Connect",
         # language
         "lang_title": "🌐 <b>Language / زبان</b>\n\nChoose your language:",
         "lang_set": "✅ Language set to English.",
@@ -765,7 +1068,7 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "sub_url": "📡 <b>Subscription URL</b> (auto-updates all servers)",
         "links_sub_only": "📡 <b>Your subscription link</b>\n\nUse this single URL in any V2Ray client (v2rayNG, Streisand, v2rayN, Foxray…) — it auto-syncs all servers and stays up to date.",
         "qr_sub": "🖼 QR Code",
-        "how_to_use": "📱 <b>How to connect</b>",
+        "how_to_use": "📱 How to connect",
         # misc
         "help_text": (
             "ℹ️ <b>Help</b>\n\n"
@@ -787,8 +1090,10 @@ MESSAGES: Dict[str, Dict[str, str]] = {
             "💳 <b>Payment Details</b>\n\n"
             "💳 Card: <code>{card_number}</code>\n"
             "👤 Card holder: {card_holder}\n\n"
-            "💰 <b>Pay EXACTLY this amount:</b> {unique_amount} {unit}\n\n"
-            "⚠️ The extra digits are for verification. Pay the exact amount shown above.\n\n"
+            "💰 <b>Pay EXACTLY this amount (tap a number to copy):</b>\n"
+            "{amount_block}\n\n"
+            "⚠️ The extra digits are for verification. Pay the exact amount shown above.\n"
+            "💡 Tap an amount to copy it — no commas, ready to paste in your banking app.\n\n"
             "After payment, send your receipt (photo or text) using the button below."
         ),
         "send_receipt": "📤 Send Receipt",
@@ -852,43 +1157,72 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "invalid_number": "❌ لطفاً یک عدد معتبر وارد کنید.",
         "copied": "📋 کپی شد.",
         "welcome": (
-            "👋 <b>به ربات VPN خوش آمدید!</b>\n\n"
-            "🔐 سرویس VPN پریمیوم با تحویل آنی.\n"
-            "📱 مدیریت اکانت‌ها مستقیم از همین تلگرام.\n\n"
-            "<b>کارهایی که می‌توانید انجام دهید:</b>\n"
-            "• 🛒 خرید اشتراک VPN به‌صورت آنی\n"
-            "• 📱 مشاهدهٔ وضعیت اکانت و مصرف حجم\n"
-            "• 🔄 تمدید و افزایش حجم\n"
-            "• 🎁 دریافت اکانت آزمایشی رایگان\n"
-            "• 🔗 کسب پاداش با دعوت دوستان\n"
-            "• 💬 پشتیبانی بدون خروج از تلگرام\n\n"
-            "یک گزینه انتخاب کنید 👇"
+            "👋 <b>سلام، به {bot_name} خوش اومدی!</b>\n\n"
+            "خوشحالیم که اینجایی. این پنل کنترل VPN توئه — \u200cهمه‌چیز همین توی تلگرام انجام می‌شه، ساده و راحت.\n\n"
+            "<b>کارایی که می‌تونی بکنی:</b>\n"
+            "• 🛒 با چند تا ضربه، اشتراک VPN بگیر\n"
+            "• 📱 وضعیت اکانت و مصرف حجمت رو ببین\n"
+            "• 📅 هر وقت خواستی تمدید کن یا حجم بگیر\n"
+            "• 🎁 اول یه اکانت رایگان امتحان کن، بی‌قید و شرط\n"
+            "• 🔗 دوستات رو دعوت کن و پاداش بگیر\n"
+            "• 💬 بدون خروج از چت، با پشتیبانی حرف بزن\n\n"
+            "یکی از دکمه‌های زیر رو بزن تا شروع کنیم 👇"
         ),
-        "menu_main": "🏠 <b>منوی اصلی</b>\n\nچه کاری می‌خواهید انجام دهید؟",
-        "buy": "🛒 خرید VPN",
+        "menu_main": "🏠 <b>منوی اصلی</b>\n\nچیکار برات انجام بدم؟",
+        "buy": "🛒 خرید سرویس",
         "my_accounts": "📱 اکانت‌های من",
-        "trial": "🎁 اکانت رایگان",
-        "balance": "💳 موجودی",
+        "trial": "🎁 تست رایگان",
+        "balance": "💳 کیف پول",
         "referral": "🔗 دعوت دوستان",
         "gift": "🎫 کد هدیه",
         "support": "💬 پشتیبانی",
         "guide": "📚 راهنما",
         "language": "🌐 زبان",
         "admin_panel": "⚙️ پنل مدیریت",
-        "choose_plan": "🛒 <b>انتخاب پلن</b>\n\nیک پلن انتخاب کنید:",
+        # MENU-RESTRUCTURE: new combined sections
+        "wallet": "💳 کیف پول",
+        "wallet_title": "💳 <b>کیف پول</b>",
+        "help": "📚 راهنما و پشتیبانی",
+        "help_title": "📚 <b>راهنما و پشتیبانی</b>",
+        "help_desc": "نیاز به کمکی؟ راهنماها رو ببین یا یه تیکت پشتیبانی باز کن — اینجاییم که کمکت کنم.\n\n• 📖 راهنمای استفاده از ربات و اتصال\n• 🎫 برای هر مشکلی تیکت بزن\n• ⏱ معمولاً ظرف چند ساعت جواب می‌دیم",
+        "more_features": "✨ قابلیت‌های بیشتر",
+        "more_features_title": "✨ <b>قابلیت‌های بیشتر</b>\n\nتنظیمات و گزینه‌های اضافه:",
+        "choose_plan": "🛒 <b>یک پلن انتخاب کن</b>\n\nهمون پلنی رو بگیر که به کارت میاد — هر وقت خواستی می‌تونی تمدید کنی یا حجم بگیری:",
         "no_plans": "😔 هنوز پلنی تعریف نشده. بعداً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.",
         "your_balance": "💳 موجودی شما: <b>{balance}</b>",
-        "sufficient": "✅ موجودی کافی است.",
-        "insufficient": "⚠️ موجودی کافی نیست. <b>{diff}</b> دیگر نیاز دارید.\n\nاز شارژ کیف پول استفاده کنید یا کد هدیه دریافت کنید.",
+        "sufficient": "✅ موجودیت برای این پلن کافیه.",
+        "insufficient": "⚠️ <b>موجودی کافی نیست.</b>\nبرای خرید این پلن <b>{diff}</b> دیگه نیاز داری.",
+        "review_short_hint": "👇 برای ادامه، کیف پولت رو شارژ کن.",
         "ask_account_name": (
-            "✏️ <b>نام اکانت</b>\n\n"
-            "یک نام دلخواه بفرستید (مثلاً <code>phone</code> یا <code>laptop</code>) — فقط حروف انگلیسی، عدد، خط تیره و زیرخط.\n"
-            "برای نام خودکار، <code>-</code> بفرستید."
+            "✏️ <b>اسم این کانفیگ (اختیاری)</b>\n\n"
+            "یه اسم کوتاه بذار مثل <code>phone</code> یا <code>laptop</code> تا کانفیگ‌هات رو از هم تشخیص بدی.\n"
+            "فقط حروف انگلیسی، عدد، خط تیره و زیرخط.\n\n"
+            "برای اسم خودکار، <code>-</code> بفرست یا فقط لغو رو بزن."
         ),
-        "invalid_name": "❌ نام نامعتبر است. ۲ تا ۲۴ کاراکتر: حروف، عدد، خط تیره یا زیرخط.",
-        "review_purchase": "📋 <b>بررسی سفارش</b>",
+        "invalid_name": "❌ این اسم جواب نمی‌ده. ۲ تا ۲۴ کاراکتر: حروف، عدد، خط تیره یا زیرخط.",
+        "review_purchase": "📋 <b>بررسی سفارش</b>\nجزئیات رو ببین، اگه خواستی اسم یا کد تخفیف بزن، بعد تأیید کن.",
         "confirm_pay": "✅ تأیید و پرداخت",
         "apply_promo": "🎟 کد تخفیف",
+        "set_name_btn": "✏️ اسم کانفیگ",
+        # SHORTFALL-REQUEST (FA)
+        "request_shortfall_btn": "⚡ پرداخت مبلغ مورد نیاز",
+        "shortfall_payment_info": (
+            "⚡ <b>پرداخت مبلغ باقی مانده برای {plan_name}</b>\n\n"
+            "دقیقاً <b>{shortfall}</b> دیگه برای خرید این پلن لازم داری.\n\n"
+            "💳 شماره کارت: <code>{card_number}</code>\n"
+            "👤 صاحب کارت: {card_holder}\n\n"
+            "💵 مبلغ قابل واریز (با پسوند یکتا، برای کپی روی عدد بزنید):\n"
+            "{amount_block}\n\n"
+            "💡 برای کپی، روی عدد داخل کادر بزنید — بدون کاما، آمادهٔ پیست.\n\n"
+            "بعد از واریز، روی «ارسال رسید» بزن و رسیدت رو بفرست."
+        ),
+        "name_auto": "(خودکار)",
+        "name_label": "🏷 اسم",
+        "promo_label": "🎟 تخفیف",
+        "promo_none": "بدون",
+        "price_label": "💵 قیمت",
+        "final_price_label": "💰 قابل پرداخت",
+        "discount_label": "✂️ تخفیف شما",
         "creating_account": "⏳ در حال ساخت اکانت VPN...",
         "purchase_success": "✅ <b>اکانت با موفقیت ساخته شد!</b>",
         "purchase_failed": "❌ ساخت اکانت ناموفق بود: {msg}\n\nدوباره تلاش کنید یا با پشتیبانی تماس بگیرید.",
@@ -939,7 +1273,7 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "referral_title": "🔗 <b>برنامهٔ دعوت دوستان</b>",
         "referral_disabled": "😔 برنامهٔ دعوت دوستان در حال حاضر غیرفعال است.",
         "referral_desc": "دوستان خود را دعوت کنید و با اولین خریدشان، به‌طور خودکار پاداش بگیرید!",
-        "referral_how": "📤 <b>نحوهٔ کار</b>\n۱️⃣ لینک دعوت خود را برای دوستان بفرستید\n۲️⃣ آن‌ها ثبت‌نام می‌کنند و اولین پلن را می‌خرند\n۳️⃣ شما فوراً +{days} روز و +{gb} گیگابایت روی اکانت خود دریافت می‌کنید",
+        "referral_how": "📤 <b>نحوه کار</b>\n۱️⃣ لینک دعوت خودت رو برای دوستات بفرست\n۲️⃣ اونا ثبت‌نام می‌کنن و اولین پلن رو می‌خرن\n۳️⃣ تو +{days} روز و +{gb} گیگابایت می‌گیری — هر وقت خواستی روی اکانتت دریافتش کن",
         "your_link": "📤 <b>لینک دعوت شما</b>",
         "share_link": "📤 اشتراک‌گذاری",
         "referral_stats": "📊 <b>آمار شما</b>",
@@ -947,13 +1281,21 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "referral_no_history": "هنوز دعوتی ندارید — لینک خود را اشتراک بگذارید تا پاداش بگیرید!",
         "ref_status_bought": "✅ خرید کرده",
         "ref_status_pending": "⏳ در انتظار",
+        "ref_claim_btn": "🎁 دریافت پاداش",
+        "ref_claimable": "🎁 شما <b>{count}</b> پاداش رفرال دریافت‌نشده دارید!",
+        "ref_claim_success": "✅ <b>پاداش دریافت شد!</b>\n\n🎁 +{days} روز و +{gb} گیگابایت به <code>{email}</code> اضافه شد.\n\nممنون که لینک رو پخش کردی!",
+        "ref_claim_no_account": "⚠️ برای دریافت پاداش رفرال، باید یه اکانت فعال پرداختی داشته باشی.\n\nاول یه پلن بخر، بعد بیا اینجا پاداشت رو بگیر.",
+        "ref_claim_none": "✅ الان پاداش دریافت‌نشده‌ای نداری.\n\nلینکت رو پخش کن تا بیشتر بگیری!",
+        "ref_claim_pick": "اکانتی که می‌خوای پاداش روش اعمال بشه رو انتخاب کن:",
+        "ref_claim_failed": "❌ <b>پاداش اعمال نشد</b>\n\nپنل این خطا رو داد: <code>{msg}</code>\n\nپاداش رفرالت دست‌نخورده‌ست — یه لحظه دیگه دوباره امتحان کن.",
+        "delete_failed": "⚠️ <b>اکانت حذف نشد</b>\n\nپنل این خطا رو داد: <code>{msg}</code>\n\nاکانتت هنوز فعاله. یه لحظه دیگه دوباره امتحان کن.",
         "enter_gift": "🎫 <b>کد هدیه</b>\n\nکد خود را بفرستید:",
         "gift_invalid": "❌ کد هدیه نامعتبر است. دوباره تلاش کنید:",
         "gift_used_code": "❌ این کد قبلاً استفاده شده است.",
         "gift_balance_ok": "✅ <b>کد ثبت شد!</b>\n💰 <b>{amount}</b> به موجودی شما اضافه شد.",
         "gift_plan_ok": "✅ <b>کد ثبت شد!</b>\n🎁 پلن: <b>{plan}</b>",
         "support_title": "💬 <b>مرکز پشتیبانی</b>",
-        "support_desc": "نیاز به کمک دارید؟ یک تیکت باز کنید تا تیم ما کمکتان کند.\n\n• 🎫 برای هر مشکلی تیکت بزنید\n• ⏱ معمولاً ظرف چند ساعت پاسخ می‌دهیم\n• 🔒 گفتگو کاملاً محرمانه است",
+        "support_desc": "نیاز به کمکی؟ یه تیکت باز کن تا تیم ما کمکت کنه.\n\n• 🎫 برای هر مشکلی تیکت بزن\n• ⏱ معمولاً ظرف چند ساعت جواب می‌دیم\n• 🔒 گفتگو کاملاً محرمانه‌ست",
         "new_ticket": "🎫 تیکت جدید",
         "my_tickets": "📋 تیکت‌های من",
         "choose_category": "🎫 <b>تیکت پشتیبانی جدید</b>\n\nیک دسته‌بندی انتخاب کنید:",
@@ -962,19 +1304,23 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "cat_account": "👤 اکانت",
         "cat_other": "📝 سایر",
         "ask_subject": "📝 <b>دسته:</b> {category}\n\nحالا یک موضوع کوتاه برای تیکت بنویسید:",
-        "ask_message": "📝 <b>موضوع:</b> {subject}\n\nحالا مشکل خود را شرح دهید:",
+        "ask_message": "📝 <b>موضوع:</b> {subject}\n\nحالا مشکل خود را شرح دهید.\n\n💡 می‌توانید فایل هم پیوست کنید (عکس، ویدیو، ویس، آهنگ/صوت، فایل، استیکر، GIF یا ویدیو دایره‌ای) — همراه با کپشن بفرستید.",
         "ticket_created": "✅ <b>تیکت #{id} ساخته شد!</b>\n\n📝 موضوع: {subject}\n🏷 دسته: {category}\n⏱ به‌زودی پاسخ می‌دهیم.",
         "reply": "💬 پاسخ",
         "reopen": "🔓 باز کردن مجدد",
         "close": "🔒 بستن",
         "ask_reply": "💬 <b>پاسخ به تیکت #{id}</b>\n📝 {subject}\n\nپیام خود را بنویسید:",
-        "ask_reply_with_media": "💬 پاسخ خود را بفرستید (متن یا عکس/اسکرین‌شات به‌عنوان مدرک پیوست کنید):",
+        "ask_reply_with_media": "💬 پاسخ خود را بفرستید. می‌توانید متن بفرستید یا هر نوع فایلی پیوست کنید: عکس، ویدیو، ویس، آهنگ/صوت، فایل، استیکر، GIF یا ویدیو دایره‌ای. (اگه می‌خواید متن هم بگید، فایل رو همراه کپشن بفرستید.)",
         "manage_user": "👤 مدیریت کاربر",
         "view_media": "📎 مشاهده رسانه",
         "media_photo": "عکس",
         "media_document": "فایل",
         "media_video": "ویدیو",
         "media_voice": "پیام صوتی",
+        "media_audio": "آهنگ / صوت",
+        "media_animation": "GIF",
+        "media_video_note": "ویدیو دایره‌ای",
+        "media_sticker": "استیکر",
         "media_sent": "✅ رسانه ارسال شد.",
         "reply_sent_admin": "✅ پاسخ به کاربر ارسال شد.",
         "reply_sent_user": "✅ پاسخ به مدیریت ارسال شد.",
@@ -987,14 +1333,18 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "ticket_status_closed": "🔴 بسته شده",
         "tickets_filter_open": "🟢 باز",
         "tickets_filter_all": "📋 همه",
-        "guide_title": "📚 <b>راهنمای راه‌اندازی VPN</b>",
+        "guide_title": "📚 <b>مرکز راهنما</b>",
+        "guide_usage_title": "📖 <b>استفاده از ربات</b>",
+        "guide_connection_title": "🔌 <b>راهنمای اتصال</b>",
+        "guide_usage_btn": "📖 استفاده از ربات",
+        "guide_connection_btn": "🔌 نحوه اتصال",
         "lang_title": "🌐 <b>Language / زبان</b>\n\nزبان خود را انتخاب کنید:",
         "lang_set": "✅ زبان به فارسی تغییر یافت.",
         "conn_links": "🔗 <b>لینک‌های اتصال</b>",
         "sub_url": "📡 <b>لینک سابسکریپشن</b> (همهٔ سرورها را خودکار به‌روز می‌کند)",
         "links_sub_only": "📡 <b>لینک سابسکریپشن شما</b>\n\nاز همین یک لینک در هر کلاینت V2Ray (v2rayNG، Streisand، v2rayN، Foxray…) استفاده کنید — همهٔ سرورها را خودکار همگام و همیشه به‌روز نگه می‌دارد.",
         "qr_sub": "🖼 بارکد QR",
-        "how_to_use": "📱 <b>نحوهٔ اتصال</b>",
+        "how_to_use": "📱 نحوه اتصال",
         "help_text": (
             "ℹ️ <b>راهنما</b>\n\n"
             "از دکمه‌های منو برای جابه‌جایی استفاده کنید. دستورات:\n"
@@ -1015,8 +1365,10 @@ MESSAGES: Dict[str, Dict[str, str]] = {
             "💳 <b>اطلاعات پرداخت</b>\n\n"
             "💳 شماره کارت: <code>{card_number}</code>\n"
             "👤 صاحب کارت: {card_holder}\n\n"
-            "💰 <b>دقیقاً این مبلغ را پرداخت کنید:</b> {unique_amount} {unit}\n\n"
-            "⚠️ ارقام مازاد برای تأیید تراکنش هستند. دقیقاً همین مبلغ را پرداخت کنید.\n\n"
+            "💰 <b>دقیقاً این مبلغ را پرداخت کنید (برای کپی روی عدد بزنید):</b>\n"
+            "{amount_block}\n\n"
+            "⚠️ ارقام مازاد برای تأیید تراکنش هستند. دقیقاً همین مبلغ را پرداخت کنید.\n"
+            "💡 برای کپی، روی عدد داخل کادر بزنید — بدون کاما، آمادهٔ پیست در اپلیکیشن بانکی.\n\n"
             "پس از پرداخت، رسید خود (عکس یا متن) را با دکمهٔ زیر بفرستید."
         ),
         "send_receipt": "📤 ارسال رسید",
@@ -1072,8 +1424,10 @@ def t(key: str, lang: str = "en", **kwargs) -> str:
     if kwargs:
         try:
             text = text.format(**kwargs)
-        except Exception:
-            pass
+        except Exception as e:
+            # LOW — log format failures so missing/extra placeholders are
+            # visible during development instead of silently leaking {x} to users.
+            logger.warning("t() format failed for key=%r lang=%r: %s", key, lang, e)
     return text
 
 
@@ -1122,6 +1476,40 @@ def payment_unit_str(currency: str, lang: str) -> str:
     if currency == "usd":
         return "دلار" if lang == "fa" else "USD"
     return "تومان" if lang == "fa" else "Toman"
+
+
+def _amount_block(unique_amount, currency: str, lang: str) -> str:
+    """Build the copyable amount block for the ``payment_info`` and
+    ``shortfall_payment_info`` templates.
+
+    Each amount is wrapped in a ``<code>`` tag so the user can copy it
+    with a single tap, and rendered with raw ASCII digits (no thousands
+    separators, no Persian-digit conversion) so it pastes cleanly into
+    Iranian banking apps which only accept plain ASCII numerals.
+
+    For the toman currency both the toman and the rial (×10) amounts are
+    shown, since some banking apps/approx receipt forms expect rial. For
+    USD only the dollar amount is shown.
+    """
+    try:
+        amt = int(unique_amount)
+    except (ValueError, TypeError):
+        amt = 0
+    if currency == "toman":
+        rial = amt * 10
+        if lang == "fa":
+            return (
+                f"🪙 تومان: <code>{amt}</code> تومان\n"
+                f"🪙 ریال: <code>{rial}</code> ریال"
+            )
+        return (
+            f"🪙 Toman: <code>{amt}</code> Toman\n"
+            f"🪙 Rial: <code>{rial}</code> Rial"
+        )
+    # USD / other currencies
+    if lang == "fa":
+        return f"💵 دلار: <code>{amt}</code> دلار"
+    return f"💵 USD: <code>{amt}</code> USD"
 
 
 def L(lang: str) -> str:
@@ -1186,15 +1574,18 @@ class Database:
         and skip their own commit (the context manager commits everything at once).
         """
         token = self._TXN.set(True)
-        await self._db.execute("BEGIN IMMEDIATE")
+        begun = False
         try:
+            await self._db.execute("BEGIN IMMEDIATE")
+            begun = True
             yield
             await self._db.commit()
         except Exception:
-            try:
-                await self._db.execute("ROLLBACK")
-            except Exception:
-                pass
+            if begun:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except Exception:
+                    pass
             raise
         finally:
             self._TXN.reset(token)
@@ -1285,8 +1676,8 @@ class Database:
                 created_at  TEXT DEFAULT (datetime('now')),
                 renewed_at  TEXT,
                 FOREIGN KEY (user_tg_id) REFERENCES users(tg_id),
-                FOREIGN KEY (server_id) REFERENCES servers(id),
-                FOREIGN KEY (plan_id) REFERENCES plans(id)
+                FOREIGN KEY (server_id) REFERENCES servers(id) ON DELETE SET NULL,
+                FOREIGN KEY (plan_id) REFERENCES plans(id) ON DELETE SET NULL
             );
 
             CREATE TABLE IF NOT EXISTS transactions (
@@ -1393,7 +1784,8 @@ class Database:
                 account_email   TEXT,
                 bonus_days      INTEGER,
                 bonus_gb        INTEGER,
-                created_at      TEXT DEFAULT (datetime('now'))
+                created_at      TEXT DEFAULT (datetime('now')),
+                UNIQUE(referrer_tg_id, referred_tg_id)
             );
 
             CREATE TABLE IF NOT EXISTS payments (
@@ -1429,7 +1821,7 @@ class Database:
         """Add columns that may not exist on legacy databases."""
         add_cols = {
             "users": [("referral_rewarded", "INTEGER DEFAULT 0"), ("language_selected", "INTEGER DEFAULT 0"),
-                      ("trial_used_at", "TEXT")],
+                      ("trial_used_at", "TEXT"), ("blocked_bot", "INTEGER DEFAULT 0")],
             "servers": [
                 ("sub_uri", "TEXT"),
                 ("capacity", "INTEGER DEFAULT 0"),
@@ -1441,6 +1833,13 @@ class Database:
             "transactions": [("admin_id", "INTEGER")],
             "tickets": [("category", "TEXT DEFAULT 'other'"), ("last_sender", "TEXT DEFAULT 'user'")],
             "ticket_messages": [("media_type", "TEXT"), ("media_file_id", "TEXT"), ("media_caption", "TEXT")],
+            # SHORTFALL-REQUEST: when a user clicks "Request Shortfall" on
+            # the purchase review page, we create a payment for the exact
+            # missing amount and store the plan they wanted to buy here.
+            # On approval, the bot asks the user "ready to buy plan X?" and
+            # offers a one-tap "Buy Now" button so they don't have to
+            # navigate back to the plan list.
+            "payments": [("resume_plan_id", "INTEGER")],
         }
         for table, cols in add_cols.items():
             async with self._db.execute(f"PRAGMA table_info({table})") as cur:
@@ -1481,6 +1880,21 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_payments_pending "
                 "  ON payments(status) WHERE status = 'pending';",
             ]),
+            (5, "referral_rewards_unique_and_indexes", [
+                # H7 — prevent double-claim race: two concurrent Claim Reward
+                # calls would both INSERT a reward row for the same
+                # (referrer, referred) pair. The UNIQUE index below makes the
+                # second INSERT fail (handled via INSERT OR IGNORE by callers).
+                # SQLite can't add a UNIQUE constraint to an existing table
+                # directly, so we create a unique INDEX (equivalent enforcement).
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_referral_rewards_pair "
+                "  ON referral_rewards(referrer_tg_id, referred_tg_id);",
+                # Speed up get_expiring_accounts / get_all_active_accounts.
+                "CREATE INDEX IF NOT EXISTS idx_accounts_active_expiry "
+                "  ON accounts(expiry_time) WHERE is_active = 1 AND expiry_time > 0;",
+                "CREATE INDEX IF NOT EXISTS idx_accounts_active "
+                "  ON accounts(is_active) WHERE is_active = 1;",
+            ]),
         ]
         for ver, name, stmts in migrations:
             if ver <= current:
@@ -1515,6 +1929,20 @@ class Database:
             "force_join_channels": json.dumps([]),
             "help_text_en": "",
             "help_text_fa": "",
+            # GUIDES — dual guides (usage + connection), editable per language.
+            # Empty default → the handler falls back to DEFAULT_GUIDE_*_EN/FA
+            # constants so users always see something useful, even before the
+            # admin customises them.
+            "guide_usage_en": "",
+            "guide_usage_fa": "",
+            "guide_connection_en": "",
+            "guide_connection_fa": "",
+            # BACKUP-CFG — auto DB backup cadence, configurable from the bot.
+            # backup_enabled=0 → off (use fixed DB_BACKUP_INTERVAL_SECONDS only
+            # as the historical fallback). backup_interval_minutes=1440 = 24h.
+            "backup_enabled": "0",
+            "backup_interval_minutes": "1440",
+            "backup_keep": "3",
         }
         for k, v in defaults.items():
             await self._db.execute(
@@ -1666,21 +2094,34 @@ class Database:
         async with self._db.execute("SELECT COUNT(*) AS cnt FROM users") as cur:
             return (await cur.fetchone())["cnt"]
 
+    async def mark_user_blocked(self, tg_id: int):
+        """Flag a user as having blocked the bot (M19). Set on
+        TelegramForbiddenError during broadcast so the user is excluded from
+        future broadcasts instead of being retried every cycle."""
+        await self._db.execute(
+            "UPDATE users SET blocked_bot = 1 WHERE tg_id = ?", (tg_id,)
+        )
+        await self._auto_commit()
+
     async def get_users_by_filter(self, filter_type: str) -> List[int]:
+        # M19 — exclude users who blocked the bot (flagged on
+        # TelegramForbiddenError during broadcast). Sending to them again just
+        # wastes throttle slots and re-raises the same error every cycle.
+        blocked_clause = "AND blocked_bot = 0"
         if filter_type == "all":
-            sql = "SELECT tg_id FROM users WHERE is_banned = 0"
+            sql = f"SELECT tg_id FROM users WHERE is_banned = 0 {blocked_clause}"
         elif filter_type == "active":
-            sql = """SELECT DISTINCT u.tg_id FROM users u
+            sql = f"""SELECT DISTINCT u.tg_id FROM users u
                      JOIN accounts a ON u.tg_id = a.user_tg_id
-                     WHERE a.is_active = 1 AND u.is_banned = 0"""
+                     WHERE a.is_active = 1 AND u.is_banned = 0 {blocked_clause}"""
         elif filter_type == "expired":
-            sql = """SELECT DISTINCT u.tg_id FROM users u
+            sql = f"""SELECT DISTINCT u.tg_id FROM users u
                      JOIN accounts a ON u.tg_id = a.user_tg_id
-                     WHERE a.is_active = 0 AND u.is_banned = 0"""
+                     WHERE a.is_active = 0 AND u.is_banned = 0 {blocked_clause}"""
         elif filter_type == "trial":
-            sql = """SELECT DISTINCT u.tg_id FROM users u
+            sql = f"""SELECT DISTINCT u.tg_id FROM users u
                      JOIN accounts a ON u.tg_id = a.user_tg_id
-                     WHERE a.is_trial = 1 AND u.is_banned = 0"""
+                     WHERE a.is_trial = 1 AND u.is_banned = 0 {blocked_clause}"""
         elif filter_type == "banned":
             sql = "SELECT tg_id FROM users WHERE is_banned = 1"
         else:
@@ -1712,14 +2153,18 @@ class Database:
     async def search_user(self, query: str) -> List[dict]:
         results: List[dict] = []
         seen = set()
+        # Escape SQL LIKE wildcards in the user-supplied query so an admin
+        # searching for a literal "%" or "_" doesn't match every row.
+        # (Parameter-bound — not a security issue, just a UX correctness fix.)
+        esc_q = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         if query.isdigit():
             async with self._db.execute("SELECT * FROM users WHERE tg_id = ? LIMIT 20", (int(query),)) as cur:
                 for r in await cur.fetchall():
                     results.append(dict(r))
                     seen.add(r["tg_id"])
         async with self._db.execute(
-            "SELECT * FROM users WHERE username LIKE ? OR first_name LIKE ? LIMIT 20",
-            (f"%{query}%", f"%{query}%"),
+            "SELECT * FROM users WHERE username LIKE ? ESCAPE '\\' OR first_name LIKE ? ESCAPE '\\' LIMIT 20",
+            (f"%{esc_q}%", f"%{esc_q}%"),
         ) as cur:
             for r in await cur.fetchall():
                 if r["tg_id"] not in seen:
@@ -1727,7 +2172,7 @@ class Database:
                     seen.add(r["tg_id"])
         async with self._db.execute(
             """SELECT u.* FROM users u JOIN accounts a ON u.tg_id = a.user_tg_id
-               WHERE a.email LIKE ? LIMIT 20""", (f"%{query}%",),
+               WHERE a.email LIKE ? ESCAPE '\\' LIMIT 20""", (f"%{esc_q}%",),
         ) as cur:
             for r in await cur.fetchall():
                 if r["tg_id"] not in seen:
@@ -1763,7 +2208,17 @@ class Database:
     # Allowlists for safe dynamic UPDATE column names (C5 — SQL-injection
     # hardening). Any column name outside this list is rejected.
     _SERVER_FIELDS = {"alias", "panel_url", "api_token", "sub_uri", "capacity",
-                      "priority", "location", "is_active"}
+                      "priority", "location", "is_active",
+                      # SYNC-COUNTS-1: total_clients and total_traffic are
+                      # legitimate columns updated by task_sync_client_counts
+                      # (every 30 min) and the admin "Sync Counts" button
+                      # (cb_cleanup_sync_counts).  They were missing from this
+                      # allowlist, which caused:
+                      #   ValueError: Invalid server field(s): {'total_clients'}
+                      # at startup.  (update_server_health uses a raw SQL
+                      # query so it bypassed this check, but the sync task
+                      # goes through the kwargs path.)
+                      "total_clients", "total_traffic"}
     _PLAN_FIELDS = {"name", "description", "traffic_gb", "duration_days", "price",
                     "limit_ip", "inbound_ids", "is_active", "sort_order"}
     _ACCOUNT_FIELDS = {"label", "plan_id", "traffic_gb", "expiry_time", "limit_ip",
@@ -1777,6 +2232,9 @@ class Database:
         bad = set(kwargs) - self._SERVER_FIELDS
         if bad:
             raise ValueError(f"Invalid server field(s): {bad}")
+        # M8 — strip trailing slash from panel_url to avoid double-slash URLs.
+        if "panel_url" in kwargs and isinstance(kwargs["panel_url"], str):
+            kwargs["panel_url"] = kwargs["panel_url"].rstrip("/")
         sets = ", ".join(f"{k} = ?" for k in kwargs)
         vals = list(kwargs.values()) + [server_id]
         await self._db.execute(f"UPDATE servers SET {sets} WHERE id = ?", vals)
@@ -1955,6 +2413,18 @@ class Database:
         (UNIQUE). Used by the panel-client import flow (MIGRATE-1) so
         re-importing the same client updates the row instead of crashing
         with an IntegrityError. Returns the account row id."""
+        # M20 — detect silent ownership transfer. If the account already exists
+        # with a DIFFERENT user_tg_id, log a warning so the admin is aware that
+        # re-importing this client moved the account from one user to another.
+        async with self._db.execute(
+            "SELECT user_tg_id FROM accounts WHERE email = ?", (email,)
+        ) as cur:
+            existing = await cur.fetchone()
+        if existing and existing["user_tg_id"] != user_tg_id:
+            logger.warning(
+                "upsert_account: ownership change for %s — was tg_id=%s, now tg_id=%s",
+                email, existing["user_tg_id"], user_tg_id,
+            )
         await self._db.execute(
             """INSERT INTO accounts
                (user_tg_id, server_id, email, sub_id, label, plan_id, traffic_gb,
@@ -2171,15 +2641,31 @@ class Database:
                 return None
             if row["max_uses"] > 0 and row["used_count"] >= row["max_uses"]:
                 return None
-            if row["expires_at"] and datetime.fromisoformat(row["expires_at"]) < datetime.now(timezone.utc):
-                return None
+            if row["expires_at"]:
+                dt = datetime.fromisoformat(row["expires_at"])
+                # H17 — defend against naive expiry strings stored by older
+                # code or manual DB edits. Treat naive as UTC.
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if dt < datetime.now(timezone.utc):
+                    return None
             return dict(row)
 
-    async def use_promo_code(self, code: str):
-        await self._db.execute(
-            "UPDATE promo_codes SET used_count = used_count + 1 WHERE code = ?", (code.upper(),)
+    async def use_promo_code(self, code: str) -> bool:
+        """Atomic increment with capacity check (H6).
+
+        Only increments if the code is still under its max_uses (or max_uses=0
+        meaning unlimited). Returns True if THIS call consumed a use. Prevents
+        the race where two concurrent users both validate-then-increment and
+        end up exceeding max_uses.
+        """
+        cur = await self._db.execute(
+            "UPDATE promo_codes SET used_count = used_count + 1 "
+            "WHERE code = ? AND is_active = 1 AND (max_uses = 0 OR used_count < max_uses)",
+            (code.upper(),),
         )
         await self._auto_commit()
+        return cur.rowcount == 1
 
     async def get_promo_codes(self) -> List[dict]:
         async with self._db.execute("SELECT * FROM promo_codes ORDER BY created_at DESC") as cur:
@@ -2333,7 +2819,9 @@ class Database:
 
         Policy (parameters are passed in via ?, never interpolated):
           * ticket_messages older than 180 days WHERE the ticket is closed
-          * payments older than 365 days WHERE status != 'pending'
+          * payments older than the configured retention (default 1825 days =
+            5 years) WHERE status != 'pending'. M2 — was 365 days which is too
+            short for financial audit / dispute resolution.
           * broadcasts older than 90 days
 
         Returns a dict with the per-table purge counts:
@@ -2341,7 +2829,9 @@ class Database:
         """
         now = datetime.now(timezone.utc)
         cutoff_msgs = (now - timedelta(days=180)).strftime("%Y-%m-%d %H:%M:%S")
-        cutoff_pay = (now - timedelta(days=365)).strftime("%Y-%m-%d %H:%M:%S")
+        # M2 — configurable payment retention; default 5 years for audit.
+        pay_days = await self.get_setting_int("payment_retention_days", 1825)
+        cutoff_pay = (now - timedelta(days=pay_days)).strftime("%Y-%m-%d %H:%M:%S")
         cutoff_bcast = (now - timedelta(days=90)).strftime("%Y-%m-%d %H:%M:%S")
 
         cur = await self._db.execute(
@@ -2406,14 +2896,22 @@ class Database:
 
     # ------------------------------------------------------------- referrals
     async def add_referral_reward(self, referrer_tg_id: int, referred_tg_id: int,
-                                  account_email: str, bonus_days: int, bonus_gb: int):
-        await self._db.execute(
-            """INSERT INTO referral_rewards
+                                  account_email: str, bonus_days: int, bonus_gb: int) -> bool:
+        """Record a referral reward. Returns True if THIS call inserted the row.
+
+        Uses INSERT OR IGNORE so a concurrent double-claim (two rapid taps on
+        "Claim Reward") won't produce two rows for the same (referrer, referred)
+        pair — the UNIQUE index enforces it. Callers should check the return
+        value to avoid applying the panel bonus twice (H7).
+        """
+        cur = await self._db.execute(
+            """INSERT OR IGNORE INTO referral_rewards
                (referrer_tg_id, referred_tg_id, account_email, bonus_days, bonus_gb)
                VALUES (?, ?, ?, ?, ?)""",
             (referrer_tg_id, referred_tg_id, account_email, bonus_days, bonus_gb),
         )
         await self._auto_commit()
+        return cur.rowcount == 1
 
     async def get_referral_stats(self, tg_id: int) -> dict:
         """Return referral stats for the user.
@@ -2464,18 +2962,57 @@ class Database:
         ) as cur:
             return [dict(r) for r in await cur.fetchall()]
 
+    async def get_claimable_referral_count(self, tg_id: int) -> int:
+        """Count referred users who bought (referral_rewarded=1) but whose
+        reward hasn't been claimed yet (no row in referral_rewards).
+
+        REFERRAL-CLAIM: a referred user's purchase creates eligibility (marks
+        referral_rewarded=1) but does NOT auto-apply the bonus. The referrer
+        must press "Claim Reward" in the referral section. This method counts
+        how many are waiting to be claimed.
+        """
+        async with self._db.execute(
+            """SELECT COUNT(*) AS cnt FROM users
+               WHERE referred_by = ? AND referral_rewarded = 1
+                 AND tg_id NOT IN (SELECT referred_tg_id FROM referral_rewards
+                                    WHERE referrer_tg_id = ?)""",
+            (tg_id, tg_id),
+        ) as cur:
+            return (await cur.fetchone())["cnt"]
+
+    async def get_claimable_referrals(self, tg_id: int) -> List[dict]:
+        """Return the list of claimable referred users (bought but not rewarded)."""
+        async with self._db.execute(
+            """SELECT u.tg_id, u.username, u.first_name, u.created_at
+               FROM users u
+               WHERE u.referred_by = ? AND u.referral_rewarded = 1
+                 AND u.tg_id NOT IN (SELECT referred_tg_id FROM referral_rewards
+                                      WHERE referrer_tg_id = ?)
+               ORDER BY u.created_at DESC""",
+            (tg_id, tg_id),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
     # ------------------------------------------------------------- payments
     async def add_payment(self, user_tg_id: int, amount: float, unique_amount: float,
                           card_number: str = "", card_holder: str = "",
                           receipt_type: str = "", receipt_file_id: str = "",
-                          receipt_text: str = "") -> int:
+                          receipt_text: str = "",
+                          resume_plan_id: Optional[int] = None) -> int:
+        """Record a new card-payment request.
+
+        ``resume_plan_id`` is set when the payment was created via the
+        "Request Shortfall" flow on the purchase review page. On approval,
+        the bot uses it to send the user a one-tap "Buy Now" button for
+        that plan instead of leaving them to navigate back to the plan list.
+        """
         cur = await self._db.execute(
             """INSERT INTO payments
                (user_tg_id, amount, unique_amount, card_number, card_holder,
-                receipt_type, receipt_file_id, receipt_text)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                receipt_type, receipt_file_id, receipt_text, resume_plan_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (user_tg_id, amount, unique_amount, card_number, card_holder,
-             receipt_type, receipt_file_id, receipt_text),
+             receipt_type, receipt_file_id, receipt_text, resume_plan_id),
         )
         await self._auto_commit()
         return cur.lastrowid
@@ -2616,6 +3153,16 @@ class PanelAPI:
             "Accept": "application/json",
         }
 
+    @staticmethod
+    def _e(email: str) -> str:
+        """URL-encode an email for use in a path segment (M7).
+
+        Bot-generated emails (tg_<16hex>) are safe, but admin-imported clients
+        may contain '+', '%', or other reserved URI characters that would
+        break the path. quote(safe='') encodes everything except A-Za-z0-9_.-~
+        """
+        return quote(str(email), safe='')
+
     async def _request(self, method: str, panel_url: str, token: str,
                        path: str, **kwargs) -> dict:
         url = f"{panel_url}{path}"
@@ -2681,15 +3228,42 @@ class PanelAPI:
         )
 
     async def get_client(self, panel_url: str, token: str, email: str) -> Optional[dict]:
-        r = await self._request("GET", panel_url, token, f"/panel/api/clients/get/{email}")
-        return r.get("obj") if r.get("success") else None
+        """Fetch a single client's full record.
+
+        The 3X-UI ``/clients/get/{email}`` endpoint returns a WRAPPED object:
+        ``{"success": true, "obj": {"client": {...}, "inboundIds": [...]}}`` —
+        NOT the raw client. Many callers expect the raw client dict (with
+        ``email``, ``tgId``, etc. at the top level), so we unwrap here and
+        merge ``inboundIds`` into the client dict for convenience.
+
+        Older panel versions may return the raw client directly (with
+        ``inboundIds`` merged in). We handle both shapes defensively so
+        ``set_client_tg_id`` works regardless of panel version — this was
+        the root cause of the persistent "client email is required" error
+        when assigning Telegram IDs to migrated clients.
+        """
+        r = await self._request("GET", panel_url, token, f"/panel/api/clients/get/{self._e(email)}")
+        if not r.get("success"):
+            return None
+        obj = r.get("obj")
+        if not isinstance(obj, dict):
+            return None
+        # Wrapped shape: {"client": {...}, "inboundIds": [...]}
+        if "client" in obj and isinstance(obj["client"], dict):
+            client = dict(obj["client"])
+            if "inboundIds" in obj:
+                client["inboundIds"] = obj["inboundIds"]
+            return client
+        # Raw shape (older panels): the client dict itself, possibly with
+        # inboundIds merged in at the top level.
+        return obj
 
     async def get_client_traffic(self, panel_url: str, token: str, email: str) -> Optional[dict]:
-        r = await self._request("GET", panel_url, token, f"/panel/api/clients/traffic/{email}")
+        r = await self._request("GET", panel_url, token, f"/panel/api/clients/traffic/{self._e(email)}")
         return r.get("obj") if r.get("success") else None
 
     async def get_client_links(self, panel_url: str, token: str, email: str) -> List[str]:
-        r = await self._request("GET", panel_url, token, f"/panel/api/clients/links/{email}")
+        r = await self._request("GET", panel_url, token, f"/panel/api/clients/links/{self._e(email)}")
         return r.get("obj", []) if r.get("success") else []
 
     async def get_sub_links(self, panel_url: str, token: str, sub_id: str) -> List[str]:
@@ -2701,32 +3275,38 @@ class PanelAPI:
                             inbound_ids: Optional[List[int]] = None) -> dict:
         """Update a client via ``/clients/update/{email}``.
 
-        Per the 3X-UI API reference, the body must have the SAME shape as
-        ``/clients/add`` — i.e. ``{"client": {...}, "inboundIds": [...]}`` —
-        NOT the bare client object. Sending the bare object makes the panel
-        return ``"client email is required"`` because it looks for
-        ``body.client.email`` and finds nothing.
+        Per the 3X-UI source (``web/controller/inbound.go`` → ``upClient``),
+        the ``/clients/update/{email}`` handler binds the request body
+        **directly** to a ``model.Client`` struct — i.e. it expects the BARE
+        client JSON in the body:
 
-        ``inbound_ids`` is optional; if omitted, the client's existing inbound
-        memberships are preserved (the panel keeps them when the field is
-        absent from the body).
+            {"email": "...", "tgId": 123, "enable": true, ...}
+
+        It does NOT expect the wrapped ``{"client": {...}, "inboundIds": [...]}`
+        shape that ``/clients/add`` uses. Sending the wrapped shape makes the
+        panel look for ``email`` at the top level, find nothing, and return
+        ``"client email is required"`` — which is exactly the error this call
+        used to produce.
+
+        ``inbound_ids`` is accepted for signature compatibility but is NOT
+        sent in the body: the panel's update handler does not read it. Inbound
+        memberships are managed separately via ``/clients/{email}/attach`` and
+        ``/clients/{email}/detach``, so omitting the field here leaves the
+        client's existing inbound memberships untouched.
         """
-        body: Dict[str, Any] = {"client": client_data}
-        if inbound_ids is not None:
-            body["inboundIds"] = inbound_ids
         return await self._request(
-            "POST", panel_url, token, f"/panel/api/clients/update/{email}", json=body
+            "POST", panel_url, token, f"/panel/api/clients/update/{self._e(email)}", json=client_data
         )
 
     async def delete_client(self, panel_url: str, token: str, email: str,
                             keep_traffic: bool = False) -> dict:
         return await self._request(
             "POST", panel_url, token,
-            f"/panel/api/clients/del/{email}?keepTraffic={'1' if keep_traffic else '0'}",
+            f"/panel/api/clients/del/{self._e(email)}?keepTraffic={'1' if keep_traffic else '0'}",
         )
 
     async def reset_client_traffic(self, panel_url: str, token: str, email: str) -> dict:
-        return await self._request("POST", panel_url, token, f"/panel/api/clients/resetTraffic/{email}")
+        return await self._request("POST", panel_url, token, f"/panel/api/clients/resetTraffic/{self._e(email)}")
 
     async def enable_client(self, panel_url: str, token: str, email: str) -> dict:
         """Enable a client via bulkEnable (single API call)."""
@@ -2771,11 +3351,11 @@ class PanelAPI:
         return r.get("obj", []) if r.get("success") else []
 
     async def get_client_ips(self, panel_url: str, token: str, email: str) -> List[str]:
-        r = await self._request("POST", panel_url, token, f"/panel/api/clients/ips/{email}")
+        r = await self._request("POST", panel_url, token, f"/panel/api/clients/ips/{self._e(email)}")
         return r.get("obj", []) if r.get("success") else []
 
     async def clear_client_ips(self, panel_url: str, token: str, email: str) -> dict:
-        return await self._request("POST", panel_url, token, f"/panel/api/clients/clearIps/{email}")
+        return await self._request("POST", panel_url, token, f"/panel/api/clients/clearIps/{self._e(email)}")
 
     async def get_last_online(self, panel_url: str, token: str, emails: List[str]) -> dict:
         r = await self._request("POST", panel_url, token, "/panel/api/clients/lastOnline",
@@ -2821,42 +3401,85 @@ class PanelAPI:
                                email: str, tg_id: int) -> dict:
         """Set the ``tgId`` field on a panel client (MIGRATE-1).
 
-        ``/clients/update/{email}`` expects the FULL client JSON wrapped as
-        ``{"client": {...}, "inboundIds": [...]}`` (same shape as ``add``),
-        so we fetch the current record via :meth:`get_client`, set ``tgId``,
-        and PUT it back. We extract ``inboundIds`` from the fetched record and
-        pass it explicitly so the panel keeps the client attached to the same
-        inbounds — previously we stripped it, which on some panel versions
-        detached the client from all inbounds.
+        ``/clients/update/{email}`` expects the BARE client JSON in the body
+        (NOT wrapped in ``{"client": ...}`` — that wrapper shape is only for
+        ``/clients/add``). So we fetch the current record via
+        :meth:`get_client`, set ``tgId``, and POST the bare client back.
+
+        Robustness notes:
+        * ``get_client`` unwraps the panel's ``{"client": {...},
+          "inboundIds": [...]}`` response, so ``client`` here is the RAW
+          client dict (with ``email``, ``tgId``, etc. at the top level).
+        * Always force ``client["email"] = email`` as a belt-and-suspenders
+          guard against panels that omit ``email`` from the get response.
+        * Strip ``inboundIds`` from the client dict before sending — the
+          update endpoint doesn't read it, and leaving an array field on a
+          struct that expects a scalar can cause binding issues on some
+          panel builds. The client's inbound memberships are preserved by
+          the panel (they're managed via separate attach/detach endpoints).
+        * Strip DB-metadata fields the panel's Go unmarshaler may reject
+          (``id``, ``createdAt``, ``updatedAt``, ``traffic``).
+        * Detailed debug logging of the outgoing body + response so the next
+          failure leaves a clear trace in the logs.
         """
         client = await self.get_client(panel_url, token, email)
         if not client or not isinstance(client, dict):
+            logger.warning("set_client_tg_id: get_client(%s) returned %r", email, client)
             return {"success": False, "msg": "client not found on panel", "obj": None}
         client = dict(client)
-        # inboundIds is a top-level field on the get response (not inside the
-        # client object); extract it for the update wrapper.
+        # Pop inboundIds — the update endpoint doesn't read it. We keep it
+        # only for the debug log below.
         inbound_ids = client.pop("inboundIds", None)
         # Strip DB-metadata fields the panel's Go unmarshaler may reject.
         for k in ("id", "createdAt", "updatedAt", "traffic"):
             client.pop(k, None)
+        # TGID-FIX v3: normalize array-typed fields. The 3X-UI Go struct
+        # (model.Client) defines some fields as []string, but the /clients/get
+        # endpoint may serialize them as bare strings (e.g. allowedIPs="" or
+        # allowedIPs="1.2.3.4,5.6.7.8" instead of ["1.2.3.4","5.6.7.8"]).
+        # Sending the string form back to /clients/update makes Go's
+        # json.Unmarshal fail with "cannot unmarshal string into Go struct
+        # field Client.allowedIPs of type []string". We coerce every known
+        # array field to a proper list before posting the body back.
+        for arr_field in ("allowedIPs",):
+            val = client.get(arr_field)
+            if val is None:
+                client[arr_field] = []
+            elif isinstance(val, str):
+                # Comma-separated → list. Empty string becomes [].
+                client[arr_field] = [s.strip() for s in val.split(",") if s.strip()]
+            elif isinstance(val, list):
+                pass  # already correct
+            else:
+                # Unexpected type — safest to send an empty list.
+                client[arr_field] = []
+        # Guarantee email is present — some panel versions omit it from the
+        # get response, and /clients/update REQUIRES email at the top level
+        # of the bare client body.
+        client["email"] = email
         client["tgId"] = tg_id
-        # Pass inbound_ids back so the panel preserves attachments.
-        return await self.update_client(panel_url, token, email, client, inbound_ids=inbound_ids)
+        logger.info("set_client_tg_id: updating %s tgId=%d, body keys=%s, inbounds=%s",
+                    email, tg_id, sorted(client.keys()), inbound_ids)
+        result = await self.update_client(panel_url, token, email, client)
+        if not result.get("success"):
+            logger.warning("set_client_tg_id: panel rejected update for %s: %s | sent body client keys=%s",
+                           email, result.get("msg"), sorted(client.keys()))
+        return result
 
     async def attach_client(self, panel_url: str, token: str, email: str,
                             inbound_ids: List[int]) -> dict:
         return await self._request("POST", panel_url, token,
-                                   f"/panel/api/clients/{email}/attach", json={"inboundIds": inbound_ids})
+                                   f"/panel/api/clients/{self._e(email)}/attach", json={"inboundIds": inbound_ids})
 
     async def detach_client(self, panel_url: str, token: str, email: str,
                             inbound_ids: List[int]) -> dict:
         return await self._request("POST", panel_url, token,
-                                   f"/panel/api/clients/{email}/detach", json={"inboundIds": inbound_ids})
+                                   f"/panel/api/clients/{self._e(email)}/detach", json={"inboundIds": inbound_ids})
 
     async def set_external_links(self, panel_url: str, token: str, email: str,
                                  links: List[dict]) -> dict:
         return await self._request("POST", panel_url, token,
-                                   f"/panel/api/clients/{email}/externalLinks",
+                                   f"/panel/api/clients/{self._e(email)}/externalLinks",
                                    json={"externalLinks": links})
 
     # ------------------------------------------------------------- groups
@@ -2970,12 +3593,14 @@ class LoadBalancer:
 
         best = None
         best_score = float("inf")
+        all_full = True  # M6 — track whether every healthy server is at capacity
         for srv in healthy:
             local_count = srv.get("total_clients", 0)
             capacity = srv.get("capacity", 0) or 0
             # Capacity check: skip servers that are full
             if capacity > 0 and local_count >= capacity:
                 continue
+            all_full = False
             # Online load (best-effort, non-fatal)
             online_count = 0
             try:
@@ -2989,6 +3614,12 @@ class LoadBalancer:
             if score < best_score:
                 best_score = score
                 best = srv
+        # M6 — do NOT oversell when every server is at capacity. Returning the
+        # first healthy server would breach the admin's capacity limit. Return
+        # None so the caller can show "no servers available".
+        if best is None and all_full and healthy:
+            logger.warning("LoadBalancer: all %d healthy server(s) at capacity — refusing to oversell", len(healthy))
+            return None
         return best or (healthy[0] if healthy else None)
 
     async def select_inbounds_for_plan(self, server: dict,
@@ -3001,9 +3632,16 @@ class LoadBalancer:
                 wanted = json.loads(raw)
             except Exception:
                 wanted = []
-        # wanted entries look like "server_id_inbound_id"
-        allowed = {int(x.split("_", 1)[1]) for x in wanted
-                   if "_" in x and int(x.split("_", 1)[0]) == server["id"]}
+        # wanted entries look like "server_id_inbound_id".
+        # H18 — guard against malformed entries (manual DB edits, migration
+        # bugs) that would crash int() and break every purchase on that server.
+        allowed = set()
+        for x in wanted:
+            if "_" not in x:
+                continue
+            sid_s, _sep, iid_s = x.partition("_")
+            if sid_s.isdigit() and iid_s.isdigit() and int(sid_s) == server["id"]:
+                allowed.add(int(iid_s))
         inbounds = await self.db.get_inbounds(server["id"], enabled_only=True)
         if not inbounds:
             panel_inbounds = await self.api.get_inbounds(server["panel_url"], server["api_token"])
@@ -3018,8 +3656,13 @@ class LoadBalancer:
     async def select_trial_inbounds(self, server: dict, trial_inbounds: List[str]) -> List[int]:
         """Select inbounds for a trial account on ``server``.
         Unlike plans, trial uses ALL inbounds when no specific ones are configured."""
-        allowed = {int(x.split("_", 1)[1]) for x in trial_inbounds
-                   if "_" in x and int(x.split("_", 1)[0]) == server["id"]}
+        allowed = set()
+        for x in trial_inbounds:
+            if "_" not in x:
+                continue
+            sid_s, _sep, iid_s = x.partition("_")
+            if sid_s.isdigit() and iid_s.isdigit() and int(sid_s) == server["id"]:
+                allowed.add(int(iid_s))
         inbounds = await self.db.get_inbounds(server["id"], enabled_only=True)
         if not inbounds:
             panel_inbounds = await self.api.get_inbounds(server["panel_url"], server["api_token"])
@@ -3039,7 +3682,8 @@ class LoadBalancer:
             entries = json.loads(raw)
         except Exception:
             return []
-        return list({int(x.split("_", 1)[0]) for x in entries if "_" in x})
+        return list({int(x.partition("_")[0]) for x in entries
+                     if "_" in x and x.partition("_")[0].isdigit()})
 
 
 # ============================================================================
@@ -3068,15 +3712,38 @@ def fmt_gb(gb: int, lang: str = "en") -> str:
 
 
 def fmt_days(days: int, lang: str = "en") -> str:
+    """Human-friendly duration formatting.
+
+    Avoids the awkward "1.0mo" / "0.5y" shorthand in favour of readable
+    units. For Persian we use the proper month/year words so the user sees
+    "۱ ماه" instead of "۱.۰mo".
+    """
     if days == 0:
         return "∞" if lang == "en" else "نامحدود"
     if days >= 365:
-        s = f"{days/365:.1f}y"
-    elif days >= 30:
-        s = f"{days/30:.1f}mo"
-    else:
-        s = f"{days}d"
-    return to_fa_digits(s) if lang == "fa" else s
+        years = days / 365
+        whole = int(years)
+        if whole >= 1 and abs(years - whole) < 0.05:
+            if lang == "fa":
+                return f"{to_fa_digits(str(whole))} سال"
+            return f"{whole} year{'s' if whole != 1 else ''}"
+        # Fallback to days if not a clean year count.
+        if lang == "fa":
+            return to_fa_digits(f"{days} روز")
+        return f"{days} days"
+    if days >= 30:
+        months = days / 30
+        whole = int(months)
+        if whole >= 1 and abs(months - whole) < 0.05:
+            if lang == "fa":
+                return f"{to_fa_digits(str(whole))} ماه"
+            return f"{whole} month{'s' if whole != 1 else ''}"
+        if lang == "fa":
+            return to_fa_digits(f"{days} روز")
+        return f"{days} days"
+    if lang == "fa":
+        return to_fa_digits(f"{days} روز")
+    return f"{days} day{'s' if days != 1 else ''}"
 
 
 def fmt_iso(iso_str, fmt: str = "%Y-%m-%d %H:%M") -> str:
@@ -3118,9 +3785,14 @@ def fmt_remaining(expiry_ms: int, lang: str = "en") -> str:
     hours = (diff % MS_PER_DAY) // 3_600_000
     if days > 0:
         s = f"{days}d {hours}h"
-    else:
+    elif hours > 0:
         minutes = (diff % 3_600_000) // 60_000
         s = f"{hours}h {minutes}m"
+    else:
+        # LOW — sub-hour durations showed "0h Nm" which looks odd.
+        # Show just the minutes when there are no hours.
+        minutes = (diff % 3_600_000) // 60_000
+        s = f"{minutes}m"
     return to_fa_digits(s) if lang == "fa" else s
 
 
@@ -3175,6 +3847,40 @@ def escape_html(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+# ---- Bidirectional-text helper ------------------------------------------------
+# Unicode bidi control characters used to force a run of LTR text (e.g. a
+# 16-digit card number written as "6037 9919 2616 0239") to render
+# left-to-right even when it appears inside an RTL (Farsi) paragraph.
+#
+# Why this is needed: the Unicode Bidirectional Algorithm (UAX #9) treats each
+# space-separated group of digits as an independent "European Number" run.
+# Inside an RTL paragraph the neutral characters (spaces) between those runs
+# take the paragraph direction, so the groups are laid out right-to-left and
+# the card number visually reverses to "0239 2616 9919 6037". Wrapping the
+# whole string in an LTR embedding (LRE … PDF) overrides the paragraph
+# direction for that run and keeps the digits in their original order.
+#
+# This works inside <code>…</code> (HTML) and inside Rich Message cells (plain
+# text) alike, because bidi controls operate at the Unicode layer, below the
+# rendering markup.
+LRE = "\u202a"   # LEFT-TO-RIGHT EMBEDDING
+PDF = "\u202c"   # POP DIRECTIONAL FORMATTING
+
+
+def ltr(text) -> str:
+    """Wrap ``text`` so it always renders left-to-right.
+
+    Use for card numbers, transaction IDs, URLs — anything that is logically
+    LTR but would be visually reordered inside an RTL (Farsi) message.
+    Returns the input unchanged if it is empty / not a string.
+    """
+    if not text or not isinstance(text, str):
+        return text if isinstance(text, str) else str(text) if text is not None else ""
+    # Strip any pre-existing LRE/PDF/LRM/RLM marks to avoid double-wrapping.
+    cleaned = text.replace(LRE, "").replace(PDF, "").replace("\u200e", "").replace("\u200f", "")
+    return f"{LRE}{cleaned}{PDF}"
+
+
 async def safe_notify(coro, context: str = "notify"):
     """Await a bot.send_message / send_document / send_photo coroutine and
     swallow only the *expected* Telegram errors:
@@ -3207,16 +3913,82 @@ async def safe_notify(coro, context: str = "notify"):
         logger.warning("%s — unexpected error: %s", context, e, exc_info=True)
 
 
+# ---- Media-type helpers (used by ticket + receipt flows) -------------------
+
+#: Every Telegram message type the bot can persist as a ticket/receipt
+#: attachment.  Each entry maps the media_type string (stored in the DB) to
+#: the label-translation key used in inline-keyboard buttons and the inline
+#: "[📎 label]" marker shown in the ticket thread view.
+TICKET_MEDIA_TYPES: dict = {
+    "photo":       "media_photo",
+    "document":    "media_document",
+    "video":       "media_video",
+    "voice":       "media_voice",
+    "audio":       "media_audio",
+    "animation":   "media_animation",
+    "video_note":  "media_video_note",
+    "sticker":     "media_sticker",
+}
+
+
+def extract_ticket_media(message: Message) -> tuple:
+    """Inspect an incoming message and extract any attached media.
+
+    Returns a 4-tuple ``(media_type, media_file_id, caption, text_only)``:
+    - ``media_type``  : one of the keys in :data:`TICKET_MEDIA_TYPES`, or
+                        ``""`` for plain-text messages.
+    - ``media_file_id``: the Telegram ``file_id`` of the attachment (or ``""``).
+    - ``caption``     : the attachment's caption (or ``""``).  Stickers and
+                        round-video notes can't carry a caption.
+    - ``text_only``   : the message text for plain-text messages (already
+                        trimmed to ``TICKET_REPLY_MAX_CHARS``), or ``""``.
+
+    Supports every commonly-sent Telegram content type: photo, document,
+    video, voice, audio (music/MP3), animation (GIF), video_note (round
+    video), and sticker.
+    """
+    cap = (message.caption or "").strip()
+    if message.photo:
+        return "photo", message.photo[-1].file_id, cap, ""
+    if message.document:
+        return "document", message.document.file_id, cap, ""
+    if message.video:
+        return "video", message.video.file_id, cap, ""
+    if message.voice:
+        # Voice messages can't have a caption in Telegram.
+        return "voice", message.voice.file_id, "", ""
+    if message.audio:
+        return "audio", message.audio.file_id, cap, ""
+    if message.animation:
+        return "animation", message.animation.file_id, cap, ""
+    if message.video_note:
+        # Round-video notes can't have a caption in Telegram.
+        return "video_note", message.video_note.file_id, "", ""
+    if message.sticker:
+        # Stickers can't have a caption in Telegram.
+        return "sticker", message.sticker.file_id, "", ""
+    txt = (message.text or "").strip()
+    return "", "", "", txt[:TICKET_REPLY_MAX_CHARS]
+
+
+def _media_label_map(lang: str) -> dict:
+    """Build a {media_type: localised_label} map for every supported
+    attachment type.  Used by the ticket thread view, the inline
+    "View Media" buttons, and the reopen re-render."""
+    return {mt: t(lkey, lang) for mt, lkey in TICKET_MEDIA_TYPES.items()}
+
+
 async def _send_ticket_reply_notify(bot: Bot, chat_id: int, notify_text: str,
                                     media_type: str, media_file_id: str,
                                     reply_markup: Optional[InlineKeyboardMarkup] = None,
                                     context: str = "ticket-reply notify"):
     """Send a ticket-reply notification, optionally carrying the attached media.
 
-    If ``media_type`` is one of ``photo`` / ``document`` / ``video`` / ``voice``
-    and ``media_file_id`` is non-empty, the message is delivered via the matching
-    ``bot.send_*`` method with ``notify_text`` as caption (Telegram allows
-    captions up to 1024 chars). Otherwise a plain ``bot.send_message`` is used.
+    Supports every attachment type in :data:`TICKET_MEDIA_TYPES`.  For most
+    types the message is delivered via the matching ``bot.send_*`` method
+    with ``notify_text`` as caption (Telegram allows captions up to 1024
+    chars).  Stickers can't carry a caption, so the sticker is sent first
+    and the notification text is sent as a separate follow-up message.
 
     All Telegram-side errors are funnelled through :func:`safe_notify` so a
     blocked admin / user never aborts the surrounding handler. (TICKET-1)
@@ -3234,6 +4006,26 @@ async def _send_ticket_reply_notify(bot: Bot, chat_id: int, notify_text: str,
     elif media_type == "voice" and media_file_id:
         coro = bot.send_voice(chat_id, voice=media_file_id, caption=notify_text,
                               reply_markup=reply_markup)
+    elif media_type == "audio" and media_file_id:
+        coro = bot.send_audio(chat_id, audio=media_file_id, caption=notify_text,
+                              reply_markup=reply_markup)
+    elif media_type == "animation" and media_file_id:
+        coro = bot.send_animation(chat_id, animation=media_file_id, caption=notify_text,
+                                  reply_markup=reply_markup)
+    elif media_type == "video_note" and media_file_id:
+        # Round-video notes don't render captions well in some clients, but
+        # the API does accept a caption — send it through.
+        coro = bot.send_video_note(chat_id, video_note=media_file_id,
+                                   caption=notify_text[:200],
+                                   reply_markup=reply_markup)
+    elif media_type == "sticker" and media_file_id:
+        # Stickers can't carry a caption: send the sticker, then a follow-up
+        # text message carrying the notification + reply keyboard.
+        await safe_notify(
+            bot.send_sticker(chat_id, sticker=media_file_id),
+            context=context + " (sticker)",
+        )
+        coro = bot.send_message(chat_id, notify_text, reply_markup=reply_markup)
     else:
         coro = bot.send_message(chat_id, notify_text, reply_markup=reply_markup)
     await safe_notify(coro, context=context)
@@ -3331,7 +4123,8 @@ async def show_view(message: Message,
                     *,
                     text: Optional[str] = None,
                     rich: Optional[InputRichMessage] = None,
-                    reply_markup=None) -> Message:
+                    reply_markup=None,
+                    disable_web_page_preview: bool = False) -> Message:
     """Replace the current chat message with a new view.
 
     Why this exists
@@ -3348,12 +4141,26 @@ async def show_view(message: Message,
       (with the inline keyboard attached).  Returns the new ``Message``.
     * ``text`` provided  → try ``edit_text`` first (keeps the message id, so
       multi-step "⏳ … → ✅ done" status updates within one handler keep
-      working).  If that fails — because the current message is a rich message
-      or otherwise uneditable — fall back to delete + send a new text message.
+      working).  If that fails — because the current message is a rich message,
+      a photo/media message, or was already deleted — fall back to delete +
+      send a new text message.
 
-    This lets every admin screen call ``show_view`` uniformly and mix plain
-    text and rich tables freely, while preserving the original edit-in-place
-    UX wherever a rich table is not used.
+    Photo-message handling (TICKET-MEDIA-1)
+    ---------------------------------------
+    When a user replies to a ticket with a screenshot, the bot sends a PHOTO
+    message (with caption + inline keyboard) to the admin/user via
+    ``_send_ticket_reply_notify``.  When the recipient taps any button on that
+    photo (Reply / Close / Reopen / Back), the handler's ``callback.message``
+    is a photo, not text — and Telegram's ``editMessageText`` API only works
+    on text messages (it returns ``"Bad Request: there is no text in the
+    message to edit"``).  ``show_view`` detects this specific error and falls
+    back to delete + answer, so ticket buttons work on photo notifications.
+
+    "Message is not modified" handling
+    ----------------------------------
+    When the new content is byte-identical to the current message (e.g. the
+    user taps the same button twice), Telegram returns ``"message is not
+    modified"``.  We swallow this silently — no flicker, no delete+resend.
     """
     if rich is not None:
         try:
@@ -3362,15 +4169,39 @@ async def show_view(message: Message,
             pass
         return await message.answer_rich(rich_message=rich, reply_markup=reply_markup)
     # Text view: edit in place when possible (best UX, stable message id),
-    # otherwise delete + resend (handles rich→text and already-deleted cases).
+    # otherwise delete + resend (handles rich→text, photo→text, and
+    # already-deleted cases).  ``disable_web_page_preview`` is forwarded so
+    # screens that show a raw subscription URL don't trigger an ugly
+    # link-preview card.
     try:
-        return await message.edit_text(text, reply_markup=reply_markup)
+        return await message.edit_text(text, reply_markup=reply_markup,
+                                       disable_web_page_preview=disable_web_page_preview)
+    except TelegramBadRequest as e:
+        msg_low = str(e).lower()
+        # "message is not modified" → content identical; swallow silently to
+        # avoid an unnecessary delete+resend flicker (e.g. double-tap).
+        if "not modified" in msg_low:
+            return message
+        # "no text in the message to edit" → current message is a photo/media
+        # message (ticket-reply notification with a screenshot).  Fall through
+        # to the delete + answer fallback below so the new text view replaces
+        # the photo cleanly.
+        # "message to edit not found" → the message was already deleted; fall
+        # through to the answer-only path.
+        if "no text" not in msg_low and "not found" not in msg_low and "message to edit" not in msg_low:
+            # Unknown TelegramBadRequest — re-raise so real errors aren't masked.
+            raise
     except Exception:
-        try:
-            await message.delete()
-        except Exception:
-            pass
-        return await message.answer(text, reply_markup=reply_markup)
+        # Non-Telegram errors → fall through to the delete + answer fallback.
+        pass
+    # Fallback: delete the old (photo / rich / deleted) message and send a
+    # fresh text message with the new content + keyboard.
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    return await message.answer(text, reply_markup=reply_markup,
+                                disable_web_page_preview=disable_web_page_preview)
 
 
 def make_qr_png(data: str) -> Optional[bytes]:
@@ -3511,20 +4342,40 @@ class ImportCB(CallbackData, prefix="imp"):
 # ============================================================================
 
 def kb_main_menu(is_admin: bool, lang: str = "en") -> InlineKeyboardMarkup:
+    """Main menu — restructured (MENU-RESTRUCTURE).
+
+    Layout:
+      Row 1 — Buy Service (single, full-width; the primary action)
+      Row 2 — Free Trial | My Accounts
+      Row 3 — Wallet | Referral
+      Row 4 — Help & Support | More Features
+
+    Rationale:
+      * "Buy Service" is the single most-used action → gets its own row at the
+        top so it's impossible to miss.
+      * "Free Trial" is the second priority (per user request) → first button
+        in the grid, right under Buy.
+      * "Wallet" consolidates Balance + Charge Wallet + Gift Code into one
+        section (opened via a single button here).
+      * "Help & Support" merges the old separate Guide and Support buttons
+        into one section.
+      * "More Features" holds Language (and Admin Panel for admins) so the
+        main menu stays uncluttered.
+    """
     kb = InlineKeyboardBuilder()
+    # Row 1 — primary action, single button.
     kb.button(text=t("buy", lang), callback_data=MenuCB(action="buy").pack(), style="primary")
-    kb.button(style="primary", text=t("my_accounts", lang), callback_data=MenuCB(action="my_accounts").pack())
+    # Row 2 — trial (first priority after buy) + my accounts.
     kb.button(text=t("trial", lang), callback_data=MenuCB(action="trial").pack(), style="success")
-    kb.button(style="success", text=t("charge_wallet_btn", lang), callback_data=MenuCB(action="charge_wallet").pack())
-    kb.button(style="primary", text=t("balance", lang), callback_data=MenuCB(action="balance").pack())
+    kb.button(style="primary", text=t("my_accounts", lang), callback_data=MenuCB(action="my_accounts").pack())
+    # Row 3 — wallet (balance + charge + gift) + referral.
+    kb.button(style="primary", text=t("wallet", lang), callback_data=MenuCB(action="balance").pack())
     kb.button(style="primary", text=t("referral", lang), callback_data=MenuCB(action="referral").pack())
-    kb.button(style="success", text=t("gift", lang), callback_data=MenuCB(action="gift").pack())
-    kb.button(style="primary", text=t("support", lang), callback_data=MenuCB(action="support").pack())
-    kb.button(style="primary", text=t("guide", lang), callback_data=MenuCB(action="guide").pack())
-    kb.button(style="primary", text=t("language", lang), callback_data=MenuCB(action="language").pack())
-    if is_admin:
-        kb.button(text=t("admin_panel", lang), callback_data=AdminCB(action="main").pack(), style="danger")
-    kb.adjust(2, 2, 2, 2, 2, 2, 1 if is_admin else 0)
+    # Row 4 — merged help & support + more features.
+    kb.button(style="primary", text=t("help", lang), callback_data=MenuCB(action="help").pack())
+    kb.button(style="primary", text=t("more_features", lang), callback_data=MenuCB(action="more_features").pack())
+    # adjust: row1=1, row2=2, row3=2, row4=2
+    kb.adjust(1, 2, 2, 2)
     return kb.as_markup()
 
 
@@ -3571,11 +4422,84 @@ def kb_plans(plans: List[dict], lang: str, currency: str) -> InlineKeyboardMarku
 
 
 def kb_plan_view(plan_id: int, lang: str) -> InlineKeyboardMarkup:
+    """Plan detail page — single Buy button (UI-REDESIGN).
+
+    The old layout had separate Buy + Promo buttons here, which forked the
+    flow into two paths (and the promo path skipped the name step, causing
+    the "no label after promo" bug). Now there's one Buy button that enters
+    a single review page where name + promo + payment are all handled.
+    """
     kb = InlineKeyboardBuilder()
-    kb.button(text=t("confirm_pay", lang), callback_data=BuyCB(action="start", plan_id=plan_id, step="name").pack(), style="success")
-    kb.button(text=t("apply_promo", lang), callback_data=BuyCB(action="promo", plan_id=plan_id, step="enter").pack(), style="primary")
+    kb.button(text=t("buy", lang), callback_data=BuyCB(action="start", plan_id=plan_id, step="review").pack(), style="success")
     kb.button(text=t("back", lang), callback_data=MenuCB(action="buy").pack(), style="danger")
-    kb.adjust(1, 2)
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def kb_purchase_review(plan_id: int, lang: str, has_name: bool = False,
+                       has_promo: bool = False, can_afford: bool = True,
+                       payment_enabled: bool = True) -> InlineKeyboardMarkup:
+    """Single review page keyboard (UI-REDESIGN + PURCHASE-UX-2).
+
+    One unified page where the user can: set/change a name, add a promo code,
+    and confirm payment. This replaces the old two-path flow where promo and
+    name were separate entry points that never met.
+
+    PURCHASE-UX-2: the "Confirm & Pay" button is **only** shown when the user
+    can actually afford the plan.  When they can't, tapping it would just
+    trigger a rejection toast — confusing and frustrating.  Instead, the
+    insufficient-balance state shows actionable top-up buttons:
+
+      * 💳 Charge Wallet  — go to the wallet/charge flow (any amount).
+      * 🎫 Gift Code      — redeem a gift code for instant balance.
+      * ⚡ Pay Exact Shortfall (only if card payments are enabled) — create a
+        card payment for exactly the missing amount, tagged with this plan so
+        after admin approval the user gets a one-tap "buy this plan" button.
+
+    Name + promo buttons remain available in both states (the user can set
+    them while they decide how to top up).
+    """
+    kb = InlineKeyboardBuilder()
+    name_label = t("set_name_btn", lang) + (" ✏️" if has_name else "")
+    promo_label = t("apply_promo", lang) + (" ✅" if has_promo else "")
+    if can_afford:
+        # Row 1: Confirm & Pay (full width).
+        kb.button(text=t("confirm_pay", lang),
+                  callback_data=BuyCB(action="confirm", plan_id=plan_id, step="execute").pack(),
+                  style="success")
+        # Row 2: Name | Promo.
+        kb.button(text=name_label,
+                  callback_data=BuyCB(action="set_name", plan_id=plan_id, step="enter").pack(),
+                  style="primary")
+        kb.button(text=promo_label,
+                  callback_data=BuyCB(action="promo", plan_id=plan_id, step="enter").pack(),
+                  style="primary")
+        # Row 3: Back.
+        kb.button(text=t("back", lang), callback_data=MenuCB(action="buy").pack(), style="danger")
+        kb.adjust(1, 2, 1)
+    else:
+        # Can't afford — NO Confirm & Pay button (would just reject).
+        # Row 1: Charge Wallet | Gift Code (two top-up paths).
+        kb.button(text=t("charge_wallet_btn", lang),
+                  callback_data=MenuCB(action="charge_wallet").pack(), style="primary")
+        kb.button(text=t("gift", lang),
+                  callback_data=MenuCB(action="gift").pack(), style="success")
+        # Row 2: Pay Exact Shortfall (full width, only if card payments on).
+        if payment_enabled:
+            kb.button(text=t("request_shortfall_btn", lang),
+                      callback_data=BuyCB(action="shortfall", plan_id=plan_id, step="request").pack(),
+                      style="primary")
+        # Row 3: Name | Promo (still available).
+        kb.button(text=name_label,
+                  callback_data=BuyCB(action="set_name", plan_id=plan_id, step="enter").pack(),
+                  style="primary")
+        kb.button(text=promo_label,
+                  callback_data=BuyCB(action="promo", plan_id=plan_id, step="enter").pack(),
+                  style="primary")
+        # Row 4: Back.
+        kb.button(text=t("back", lang), callback_data=MenuCB(action="buy").pack(), style="danger")
+        # Layout: 2 (charge, gift) / 1 (shortfall) / 2 (name, promo) / 1 (back)
+        kb.adjust(2, 1, 2, 1) if payment_enabled else kb.adjust(2, 2, 1)
     return kb.as_markup()
 
 
@@ -3756,7 +4680,7 @@ def kb_admin_plan_view(plan_id: int, is_active: bool) -> InlineKeyboardMarkup:
         kb.button(text="❌ Disable", callback_data=PlanCB(action="toggle", plan_id=plan_id).pack(), style="danger")
     else:
         kb.button(text="✅ Enable", callback_data=PlanCB(action="toggle", plan_id=plan_id).pack(), style="success")
-    kb.button(text="🗑 Delete", callback_data=PlanCB(action="delete", plan_id=plan_id).pack(), style="danger")
+    kb.button(text="🗑 Delete", callback_data=PlanCB(action="delete_ask", plan_id=plan_id).pack(), style="danger")
     kb.button(text="🔙 Plans", callback_data=AdminCB(action="plans").pack(), style="danger")
     kb.adjust(2, 2, 1)
     return kb.as_markup()
@@ -3819,12 +4743,7 @@ def kb_ticket_view(ticket_id: int, is_admin: bool, lang: str = "en", status: str
     # Per-message "View Media" buttons (one per media-bearing message).
     media_buttons = 0
     if messages:
-        media_label_map = {
-            "photo": t("media_photo", lang),
-            "document": t("media_document", lang),
-            "video": t("media_video", lang),
-            "voice": t("media_voice", lang),
-        }
+        media_label_map = _media_label_map(lang)
         for m in messages:
             mt = m.get("media_type") or ""
             if mt and m.get("media_file_id"):
@@ -3887,8 +4806,27 @@ def kb_language(lang: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(style="primary", text="🇬🇧 English", callback_data=LangCB(code="en").pack())
     kb.button(style="primary", text="🇮🇷 فارسی", callback_data=LangCB(code="fa").pack())
-    kb.button(text=t("back", lang), callback_data=MenuCB(action="main").pack(), style="danger")
+    # MENU-RESTRUCTURE: back goes to "More Features" instead of main menu,
+    # since the language picker is now reached via More Features.
+    kb.button(text=t("back", lang), callback_data=MenuCB(action="more_features").pack(), style="danger")
     kb.adjust(2, 1)
+    return kb.as_markup()
+
+
+def kb_more_features(lang: str, is_admin: bool = False) -> InlineKeyboardMarkup:
+    """MENU-RESTRUCTURE: "More Features" submenu.
+
+    Holds secondary settings so the main menu stays clean:
+      • Language picker
+      • Admin Panel (only for full admins; routed through AdminCB:main so
+        payment-only admins get their limited menu)
+    """
+    kb = InlineKeyboardBuilder()
+    kb.button(style="primary", text=t("language", lang), callback_data=MenuCB(action="language").pack())
+    if is_admin:
+        kb.button(text=t("admin_panel", lang), callback_data=AdminCB(action="main").pack(), style="danger")
+    kb.button(text=t("back_menu", lang), callback_data=MenuCB(action="main").pack(), style="primary")
+    kb.adjust(1)
     return kb.as_markup()
 
 
@@ -4045,8 +4983,19 @@ class AuthMiddleware:
                                 await event.answer(t("force_join", lang, channels=channels_text),
                                                    reply_markup=kb.as_markup())
                             elif isinstance(event, CallbackQuery):
-                                await event.message.edit_text(t("force_join", lang, channels=channels_text),
-                                                              reply_markup=kb.as_markup())
+                                # FORCE-JOIN-PHOTO: use show_view() instead of
+                                # event.message.edit_text(). When the user taps a
+                                # button on a PHOTO message (e.g. a ticket-reply
+                                # notification that carried a screenshot, sent by
+                                # _send_ticket_reply_notify), edit_text would fail
+                                # with "there is no text in the message to edit"
+                                # and the button spinner would hang forever.
+                                # show_view() detects the photo, deletes it, and
+                                # sends the force-join prompt as a fresh text
+                                # message so the user can act on it.
+                                await show_view(event.message,
+                                                text=t("force_join", lang, channels=channels_text),
+                                                reply_markup=kb.as_markup())
                                 await event.answer(t("force_join_failed", lang), show_alert=True)
                         except TelegramForbiddenError:
                             pass  # user blocked the bot — expected
@@ -4169,8 +5118,12 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
     @router.message(Command("help"))
     async def cmd_help(message: Message, db_user: dict):
         lang = _lang(db_user)
-        help_text = await db.get_setting(f"help_text_{lang}") or t("help_text", lang)
-        await message.answer(help_text,
+        # GUIDES: /help now shows the usage guide (admin-configurable, falls
+        # back to the rich default). This replaces the old short help_text.
+        usage = await db.get_setting(f"guide_usage_{lang}", "")
+        if not (usage and usage.strip()):
+            usage = DEFAULT_GUIDE_USAGE_FA if lang == "fa" else DEFAULT_GUIDE_USAGE_EN
+        await message.answer(usage,
                              reply_markup=kb_main_menu(await _can_access_admin(message.from_user.id), lang))
 
     # ------------------------------------------------------------ /language
@@ -4209,6 +5162,46 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
     async def cb_language(callback: CallbackQuery, db_user: dict):
         await callback.message.edit_text(t("lang_title", _lang(db_user)),
                                          reply_markup=kb_language(_lang(db_user)))
+        await callback.answer()
+
+    # -------------------------------------------------- MENU-RESTRUCTURE
+    @router.callback_query(MenuCB.filter(F.action == "help"))
+    async def cb_help(callback: CallbackQuery, db_user: dict):
+        """Merged Help & Support submenu (MENU-RESTRUCTURE).
+
+        Replaces the old separate "Support" and "Guide" main-menu buttons
+        with a single screen that offers both guides and ticket actions.
+        """
+        lang = _lang(db_user)
+        is_admin = await _can_access_admin(callback.from_user.id)
+        text = f"{t('help_title', lang)}\n\n{t('help_desc', lang)}"
+        kb = InlineKeyboardBuilder()
+        kb.button(text=t("guide_usage_btn", lang),
+                  callback_data=MenuCB(action="guide_usage").pack(), style="primary")
+        kb.button(text=t("guide_connection_btn", lang),
+                  callback_data=MenuCB(action="guide_connection").pack(), style="primary")
+        kb.button(text=t("new_ticket", lang), callback_data=MenuCB(action="new_ticket").pack(), style="success")
+        kb.button(style="primary", text=t("my_tickets", lang), callback_data=MenuCB(action="my_tickets").pack())
+        if is_admin and callback.from_user.id in ADMIN_IDS:
+            open_count = await db.count_open_tickets()
+            badge = f" ({open_count})" if open_count else ""
+            kb.button(style="danger", text=f"🛡 Tickets{badge}", callback_data=AdminCB(action="tickets").pack())
+        kb.button(text=t("back_menu", lang), callback_data=MenuCB(action="main").pack(), style="primary")
+        kb.adjust(2, 2, 1)
+        await show_view(callback.message, text=text, reply_markup=kb.as_markup())
+        await callback.answer()
+
+    @router.callback_query(MenuCB.filter(F.action == "more_features"))
+    async def cb_more_features(callback: CallbackQuery, db_user: dict):
+        """More Features submenu (MENU-RESTRUCTURE).
+
+        Holds secondary settings (Language, and Admin Panel for admins) so
+        the main menu stays uncluttered.
+        """
+        lang = _lang(db_user)
+        is_admin = await _can_access_admin(callback.from_user.id)
+        await show_view(callback.message, text=t("more_features_title", lang),
+                        reply_markup=kb_more_features(lang, is_admin=is_admin))
         await callback.answer()
 
     @router.callback_query(LangCB.filter())
@@ -4326,18 +5319,106 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             await callback.answer(t("not_found", _lang(db_user)), show_alert=True)
             return
         lang = _lang(db_user)
-        await callback.message.edit_text(fmt_plan_card(plan, lang, await _currency()),
-                                         reply_markup=kb_plan_view(plan["id"], lang))
+        currency = await _currency()
+        # UI-REDESIGN: plan card + collapsible fair-use warning. The
+        # <blockquote expandable> keeps the message compact by default but
+        # lets curious buyers expand it. Requires Telegram Bot API 7.3+
+        # (aiogram 3.7+), which we already use.
+        text = fmt_plan_card(plan, lang, currency)
+        warning = PURCHASE_WARNING_FA if lang == "fa" else PURCHASE_WARNING_EN
+        text += f"\n\n<blockquote expandable>{warning}</blockquote>"
+        # Show the user's balance here too so they know before tapping Buy.
+        balance = db_user.get("balance", 0)
+        text += f"\n{t('your_balance', lang, balance=fmt_price(balance, lang, currency))}"
+        if balance >= plan["price"]:
+            text += f"\n{t('sufficient', lang)}"
+        else:
+            text += f"\n{t('insufficient', lang, diff=fmt_price(plan['price'] - balance, lang, currency))}"
+        await callback.message.edit_text(text, reply_markup=kb_plan_view(plan["id"], lang))
         await callback.answer()
 
-    # Step 1 — ask for a custom account name
+    # ====================================================== PURCHASE REVIEW
+    # UI-REDESIGN: a single review page replaces the old two-path flow.
+    # The user picks a plan → lands on the review page → can set a name,
+    # add a promo, or confirm payment, all from one place. This fixes the
+    # old bug where the promo path skipped the name step.
+
+    async def _render_purchase_review(message: Message, state: FSMContext, db_user: dict,
+                                       plan: dict) -> Message:
+        """Render the unified purchase review page.
+
+        Pulls plan_id, account_name (optional), promo_code + final_price
+        (optional) from FSM state and shows everything in one place:
+        plan card, name, promo, price breakdown, balance, and the
+        collapsible fair-use warning.
+        """
+        lang = _lang(db_user)
+        currency = await _currency()
+        data = await state.get_data()
+        account_name = data.get("account_name", "")
+        promo_code = data.get("promo_code")
+        final_price = data.get("final_price", plan["price"])
+        discount = max(0.0, plan["price"] - final_price)
+        balance = db_user.get("balance", 0)
+
+        text = fmt_plan_card(plan, lang, currency)
+        text += f"\n\n{t('review_purchase', lang)}\n"
+        # Name line
+        name_disp = escape_html(account_name) if account_name else t("name_auto", lang)
+        text += f"{t('name_label', lang)}: {name_disp}\n"
+        # Promo line
+        if promo_code and discount > 0:
+            text += f"{t('promo_label', lang)}: <code>{escape_html(promo_code)}</code>\n"
+            text += f"{t('discount_label', lang)}: {fmt_price(discount, lang, currency)}\n"
+            text += f"{t('final_price_label', lang)}: <b>{fmt_price(final_price, lang, currency)}</b>\n"
+        else:
+            text += f"{t('promo_label', lang)}: {t('promo_none', lang)}\n"
+            text += f"{t('final_price_label', lang)}: <b>{fmt_price(final_price, lang, currency)}</b>\n"
+        # Balance line
+        text += f"{t('your_balance', lang, balance=fmt_price(balance, lang, currency))}\n"
+        if balance >= final_price:
+            text += t("sufficient", lang)
+        else:
+            text += t("insufficient", lang, diff=fmt_price(final_price - balance, lang, currency))
+            # PURCHASE-UX-2: actionable hint pointing the user at the top-up
+            # buttons that appear below (Charge Wallet / Gift / Pay Shortfall).
+            text += f"\n{t('review_short_hint', lang)}"
+        # Collapsible warning
+        warning = PURCHASE_WARNING_FA if lang == "fa" else PURCHASE_WARNING_EN
+        text += f"\n<blockquote expandable>{warning}</blockquote>"
+
+        # Whether card payments are enabled — controls whether the
+        # "Request Shortfall" button appears for users who can't afford.
+        payment_enabled = await db.get_setting_int("payment_enabled", 0)
+        kb = kb_purchase_review(plan["id"], lang,
+                                has_name=bool(account_name),
+                                has_promo=bool(promo_code and discount > 0),
+                                can_afford=balance >= final_price,
+                                payment_enabled=bool(payment_enabled))
+        await state.set_state(None)  # leave FSM but keep data
+        return await show_view(message, text=text, reply_markup=kb)
+
+    # Step 1 — enter the review page directly (no name ask first).
     @router.callback_query(BuyCB.filter(F.action == "start"))
     async def cb_buy_start(callback: CallbackQuery, callback_data: BuyCB, state: FSMContext, db_user: dict):
         plan = await db.get_plan(callback_data.plan_id)
         if not plan:
             await callback.answer(t("not_found", _lang(db_user)), show_alert=True)
             return
+        # Clear any stale purchase state from a previous attempt, then seed
+        # fresh data for this plan.
+        await state.clear()
+        await state.update_data(plan_id=callback_data.plan_id, account_name="",
+                                promo_code="", final_price=plan["price"])
+        await _render_purchase_review(callback.message, state, db_user, plan)
+        await callback.answer()
+
+    # Step 2a — optional: set a custom account name.
+    @router.callback_query(BuyCB.filter(F.action == "set_name"))
+    async def cb_buy_name(callback: CallbackQuery, state: FSMContext, callback_data: BuyCB, db_user: dict):
         lang = _lang(db_user)
+        # Preserve existing state (plan_id, promo, etc.) — only set the FSM
+        # state to waiting_for_account_name so ms_account_name can fire.
         await state.set_state(UserStates.waiting_for_account_name)
         await state.update_data(plan_id=callback_data.plan_id)
         await callback.message.edit_text(t("ask_account_name", lang), reply_markup=kb_cancel(lang))
@@ -4353,23 +5434,13 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         await state.update_data(account_name=name)
         data = await state.get_data()
         plan = await db.get_plan(data["plan_id"])
-        currency = await _currency()
-        balance = db_user.get("balance", 0)
+        if not plan:
+            await state.clear()
+            await message.answer(t("not_found", lang), reply_markup=kb_back_to_menu(lang))
+            return
+        await _render_purchase_review(message, state, db_user, plan)
 
-        text = fmt_plan_card(plan, lang, currency)
-        text += f"\n\n{t('review_purchase', lang)}\n"
-        if name:
-            text += f"🏷 {escape_html(name)}\n"
-        text += f"{t('your_balance', lang, balance=fmt_price(balance, lang, currency))}\n"
-        if balance >= plan["price"]:
-            text += t("sufficient", lang)
-        else:
-            text += t("insufficient", lang, diff=fmt_price(plan["price"] - balance, lang, currency))
-
-        await state.set_state(None)  # leave FSM but keep data
-        await message.answer(text, reply_markup=kb_confirm_purchase(plan["id"], lang))
-
-    # Promo-code entry during purchase
+    # Step 2b — optional: apply a promo code.
     @router.callback_query(BuyCB.filter(F.action == "promo"))
     async def cb_buy_promo(callback: CallbackQuery, state: FSMContext, callback_data: BuyCB, db_user: dict):
         lang = _lang(db_user)
@@ -4400,27 +5471,78 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             discount = promo["discount_amount"]
         final_price = max(0.0, plan["price"] - discount)
         await state.update_data(promo_code=code, final_price=final_price)
-        await state.set_state(None)
+        await _render_purchase_review(message, state, db_user, plan)
 
+    # Step 2c — SHORTFALL-REQUEST: user can't afford the plan, so they request
+    # a payment for exactly the missing amount. After admin approval the user
+    # gets a one-tap "Buy Now" button to resume this purchase without having
+    # to navigate back to the plan list.
+    @router.callback_query(BuyCB.filter(F.action == "shortfall"))
+    async def cb_buy_shortfall(callback: CallbackQuery, callback_data: BuyCB,
+                                state: FSMContext, db_user: dict):
+        lang = _lang(db_user)
+        # Payment must be enabled for the shortfall flow to make sense.
+        if not await db.get_setting_int("payment_enabled", 0):
+            await callback.answer(t("payment_disabled", lang), show_alert=True)
+            return
+        plan = await db.get_plan(callback_data.plan_id)
+        if not plan:
+            await callback.answer(t("not_found", lang), show_alert=True)
+            return
+        data = await state.get_data()
+        final_price = data.get("final_price", plan["price"])
         balance = db_user.get("balance", 0)
-        text = fmt_plan_card(plan, lang, currency)
-        text += f"\n\n{t('promo_applied', lang, code=code, discount=fmt_price(discount, lang, currency))}\n"
-        text += f"💵 {fmt_price(final_price, lang, currency)}\n"
-        text += t("your_balance", lang, balance=fmt_price(balance, lang, currency)) + "\n"
-        if balance >= final_price:
-            text += t("sufficient", lang)
+        # Shortfall = amount the user still needs. Clamp to >= 1 so we don't
+        # create a zero-amount payment (which the panel/admin would reject).
+        shortfall = max(1, math.ceil(final_price - balance))
+        # Small 3-digit suffix (100–999) — same collision-avoidance as the
+        # normal charge-wallet flow (C6). Keeps the surcharge tiny so the
+        # user never pays thousands extra on top of the shortfall.
+        suffix = secrets.randbelow(PAYMENT_UNIQUE_SUFFIX_RANGE) + PAYMENT_UNIQUE_SUFFIX_MIN
+        unique_amount = shortfall + suffix
+        # Stash everything ms_receipt needs, plus the plan_id so we can tag
+        # the payment record with resume_plan_id.
+        await state.update_data(
+            original_amount=shortfall,
+            unique_amount=unique_amount,
+            shortfall_plan_id=plan["id"],
+            shortfall_plan_name=plan["name"],
+        )
+        # CARD-RTL: wrap with ltr() so the digit groups keep their left-to-right
+        # order inside an RTL (Farsi) paragraph. Without this, "6037 9919 2616
+        # 0239" is visually reversed to "0239 2616 9919 6037".
+        card_number = ltr(await db.get_setting("payment_card_number", "-"))
+        card_holder = await db.get_setting("payment_card_holder", "-")
+        currency = await _currency()
+        # Show the user a clear "you need to pay exactly this" message with
+        # the plan name so they remember what the shortfall is for.
+        if lang == "fa":
+            extra = (
+                f"\n\n💡 این مبلغ دقیقاً برای خرید پلن «{escape_html(plan['name'])}» است. "
+                f"بعد از تأیید ادمین، موجودیت شارژ میشه و می‌تونی همین پلن رو با یه کلیک بخری."
+            )
         else:
-            text += t("insufficient", lang, diff=fmt_price(final_price - balance, lang, currency))
+            extra = (
+                f"\n\n💡 This amount is exactly what you need for the \"{escape_html(plan['name'])}\" plan. "
+                f"After admin approval, your balance will be topped up and you can buy this plan in one tap."
+            )
+        await callback.message.edit_text(
+            t("shortfall_payment_info", lang,
+              plan_name=escape_html(plan["name"]),
+              shortfall=fmt_price(shortfall, lang, currency),
+              card_number=card_number, card_holder=card_holder,
+              amount_block=_amount_block(unique_amount, currency, lang))
+            + extra,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(style="success", text=t("send_receipt", lang),
+                                      callback_data=PaymentCB(action="send_receipt", amount=0).pack())],
+                [InlineKeyboardButton(style="danger", text=t("back_menu", lang),
+                                      callback_data=MenuCB(action="main").pack())],
+            ]),
+        )
+        await callback.answer()
 
-        kb = InlineKeyboardBuilder()
-        kb.button(text=t("confirm_pay", lang),
-                  callback_data=BuyCB(action="confirm", plan_id=plan["id"], step="execute").pack(),
-                  style="success")
-        kb.button(text=t("cancel", lang), callback_data=MenuCB(action="buy").pack(), style="danger")
-        kb.adjust(1, 1)
-        await message.answer(text, reply_markup=kb.as_markup())
-
-    # Execute the purchase
+    # Step 3 — execute the purchase.
     @router.callback_query(BuyCB.filter(F.action == "confirm"))
     async def cb_buy_confirm(callback: CallbackQuery, callback_data: BuyCB,
                              state: FSMContext, db_user: dict):
@@ -4532,45 +5654,44 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             )
             return
 
-        # C2 — Atomic referral bonus claim. mark_referral_rewarded returns
-        # True only if THIS call performed the transition; if a parallel
-        # purchase already claimed the bonus, we skip the panel-side reward
-        # entirely (no double-grant). The user is still marked as referred,
-        # so disabling the referral program doesn't retroactively grant
-        # bonuses on later purchases.
+        # C2 — Atomic referral eligibility claim. mark_referral_rewarded
+        # returns True only if THIS call performed the transition; if a
+        # parallel purchase already claimed, we skip entirely.
+        #
+        # REFERRAL-CLAIM (new logic): we NO LONGER auto-apply the bonus to
+        # the referrer's account at purchase time. Instead, we just mark the
+        # referred user as eligible (referral_rewarded=1). The referrer must
+        # press "Claim Reward" in the referral section — and they must have
+        # their own active paid account to receive it. This ensures the
+        # referrer is also a paying customer, and gives them control over
+        # which account receives the bonus.
         if db_user.get("referred_by") and not db_user.get("referral_rewarded"):
             won_claim = await db.mark_referral_rewarded(callback.from_user.id)
             referrer_id = db_user["referred_by"]
             ref_enabled = await db.get_setting_int("referral_enabled", 1)
-            bonus_days = await db.get_setting_int("referral_bonus_days", 0)
-            bonus_gb = await db.get_setting_int("referral_bonus_gb", 0)
-            if won_claim and ref_enabled and (bonus_days > 0 or bonus_gb > 0):
-                ref_accounts = await db.get_user_accounts(referrer_id)
-                active_refs = [a for a in ref_accounts if a["is_active"] and not a["is_trial"]]
-                if active_refs:
-                    ref_acc = active_refs[0]
-                    ref_server = await db.get_server(ref_acc["server_id"])
-                    if ref_server:
-                        bonus_bytes = bonus_gb * GB if bonus_gb > 0 else 0
-                        await api.bulk_adjust(
-                            ref_server["panel_url"], ref_server["api_token"],
-                            [ref_acc["email"]], add_days=bonus_days, add_bytes=bonus_bytes,
+            if won_claim and ref_enabled:
+                bonus_days = await db.get_setting_int("referral_bonus_days", 0)
+                bonus_gb = await db.get_setting_int("referral_bonus_gb", 0)
+                # Notify the referrer they have a claimable reward — don't
+                # apply it yet. They need to visit Referral → Claim Reward.
+                try:
+                    notify_text = (
+                        f"🎉 <b>Referral reward waiting!</b>\n\n"
+                        f"A friend just bought a plan using your link.\n"
+                    )
+                    if bonus_days > 0 or bonus_gb > 0:
+                        notify_text += (
+                            f"🎁 You can now claim <b>+{bonus_days} days</b> and "
+                            f"<b>+{bonus_gb} GB</b> on your account.\n\n"
+                            f"Open <b>🔗 Referral</b> → tap <b>Claim Reward</b>."
                         )
-                        await db.add_referral_reward(
-                            referrer_tg_id=referrer_id, referred_tg_id=callback.from_user.id,
-                            account_email=ref_acc["email"], bonus_days=bonus_days, bonus_gb=bonus_gb,
-                        )
-                        try:
-                            await bot.send_message(
-                                referrer_id,
-                                f"🎉 <b>Referral Bonus!</b>\n\n"
-                                f"A friend just bought a plan thanks to you!\n"
-                                f"🎁 +{bonus_days}d +{bonus_gb} GB applied to <code>{escape_html(ref_acc['email'])}</code>",
-                            )
-                        except TelegramBadRequest:
-                            pass
-                        except Exception as e:
-                            logger.warning("referral notify failed: %s", e)
+                    else:
+                        notify_text += "Open 🔗 Referral to see your stats."
+                    await bot.send_message(referrer_id, notify_text)
+                except TelegramBadRequest:
+                    pass
+                except Exception as e:
+                    logger.warning("referral-claimable notify failed: %s", e)
 
         # Delivery message
         delivery = f"{t('purchase_success', lang)}\n\n"
@@ -4625,7 +5746,11 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             plan_name=plan["name"] if plan else ("Trial" if account.get("is_trial") else "-"),
             currency=await _currency(),
         )
-        await callback.message.edit_text(text, reply_markup=kb_account_details(account["email"], account["is_active"], lang, account.get("is_trial", False)))
+        # Use show_view (not edit_text) so the back-from-QR case works: when
+        # the user is on a QR photo message, edit_text would fail because a
+        # photo cannot be turned into text. show_view falls back to delete+send.
+        await show_view(callback.message, text=text,
+            reply_markup=kb_account_details(account["email"], account["is_active"], lang, account.get("is_trial", False)))
         await callback.answer()
 
     @router.callback_query(AccountCB.filter(F.action == "links"))
@@ -4654,7 +5779,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
                       callback_data=AccountCB(action="qr", email=account["email"]).pack())
         kb.button(text=t("back", lang), callback_data=AccountCB(action="view", email=account["email"]).pack(), style="primary")
         kb.adjust(1)
-        await callback.message.edit_text(text, reply_markup=kb.as_markup(), disable_web_page_preview=True)
+        await show_view(callback.message, text=text, reply_markup=kb.as_markup(), disable_web_page_preview=True)
         await callback.answer()
 
     @router.callback_query(AccountCB.filter(F.action == "guide"))
@@ -4669,22 +5794,20 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             await callback.answer(t("not_found", lang), show_alert=True)
             return
         sub_url = build_sub_url(server, account.get("sub_id", ""))
-        text = f"{t('guide_title', lang)}\n\n"
+        # GUIDES: use the admin-configurable connection guide (with the
+        # subscription URL prepended so the user has everything in one place).
+        text = f"{t('guide_connection_title', lang)}\n\n"
         if sub_url:
             text += f"🌐 {t('sub_url', lang)}\n<code>{escape_html(sub_url)}</code>\n\n"
-        text += (
-            "📱 <b>v2rayNG (Android)</b>\n"
-            "1. Install v2rayNG\n2. Copy subscription URL → Subscription → add → paste → update\n3. Pick a server, tap V\n\n"
-            "📱 <b>Streisand (iOS)</b>\n"
-            "1. Install app\n2. Add subscription URL\n3. Select server → toggle on\n\n"
-            "🖥 <b>v2rayN (Windows)</b>\n"
-            "1. Install v2rayN\n2. Add subscription URL\n3. Select server → connect\n"
-        )
+        conn_guide = await db.get_setting(f"guide_connection_{lang}", "")
+        if not (conn_guide and conn_guide.strip()):
+            conn_guide = DEFAULT_GUIDE_CONNECTION_FA if lang == "fa" else DEFAULT_GUIDE_CONNECTION_EN
+        text += conn_guide
         kb = InlineKeyboardBuilder()
         kb.button(style="primary", text=t("get_link", lang), callback_data=AccountCB(action="links", email=account["email"]).pack())
         kb.button(text=t("back", lang), callback_data=AccountCB(action="view", email=account["email"]).pack(), style="primary")
         kb.adjust(2)
-        await callback.message.edit_text(text, reply_markup=kb.as_markup(), disable_web_page_preview=True)
+        await show_view(callback.message, text=text, reply_markup=kb.as_markup(), disable_web_page_preview=True)
         await callback.answer()
 
     @router.callback_query(AccountCB.filter(F.action == "traffic"))
@@ -4829,11 +5952,17 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         text += t("your_balance", lang, balance=fmt_price(balance, lang, currency)) + "\n"
         if balance < plan["price"]:
             text += t("insufficient", lang, diff=fmt_price(plan["price"] - balance, lang, currency))
+            text += f"\n{t('review_short_hint', lang)}"
         kb = InlineKeyboardBuilder()
         if balance >= plan["price"]:
             kb.button(text=t("renew", lang),
                       callback_data=AccountCB(action="renew_confirm", email=account["email"]).pack(),
                       style="success")
+        else:
+            # PURCHASE-UX-2: can't afford — offer a direct top-up shortcut so
+            # the user isn't sent back empty-handed.
+            kb.button(text=t("charge_wallet_btn", lang),
+                      callback_data=MenuCB(action="charge_wallet").pack(), style="primary")
         kb.button(text=t("back", lang), callback_data=AccountCB(action="view", email=account["email"]).pack(), style="danger")
         kb.adjust(1)
         await callback.message.edit_text(text, reply_markup=kb.as_markup())
@@ -4859,12 +5988,25 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             return
         # C8 — atomic balance deduction (replaces the read-then-write race).
         if not await db.try_deduct_balance(callback.from_user.id, plan["price"]):
+            # M10 — show the ACTUAL shortfall (price - balance), not the full
+            # price. The user already knows the plan price; what they need to
+            # know is how much MORE they have to deposit.
+            cur_balance = db_user.get("balance", 0)
+            diff = max(0, plan["price"] - cur_balance)
             await callback.answer(
-                t("insufficient", lang, diff=fmt_price(plan["price"], lang, await _currency())),
+                t("insufficient", lang, diff=fmt_price(diff, lang, await _currency())),
                 show_alert=True,
             )
             return
-        add_bytes = plan["traffic_gb"] * GB if plan["traffic_gb"] > 0 else 0
+        # H2 — preserve unlimited accounts. traffic_gb=0 means UNLIMITED;
+        # adding plan GB would silently cap it. Keep it 0 (unlimited) and
+        # skip the bytes top-up entirely.
+        if account.get("traffic_gb") == 0:
+            new_traffic = 0
+            add_bytes = 0
+        else:
+            new_traffic = (account["traffic_gb"] or 0) + (plan["traffic_gb"] or 0)
+            add_bytes = plan["traffic_gb"] * GB if plan["traffic_gb"] and plan["traffic_gb"] > 0 else 0
         result = await api.bulk_adjust(
             server["panel_url"], server["api_token"], [account["email"]],
             add_days=plan["duration_days"], add_bytes=add_bytes,
@@ -4877,7 +6019,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         base = account["expiry_time"] if account["expiry_time"] and account["expiry_time"] > now_ms else now_ms
         new_expiry = base + plan["duration_days"] * MS_PER_DAY if plan["duration_days"] > 0 else 0
-        new_traffic = (account["traffic_gb"] + plan["traffic_gb"]) if account["traffic_gb"] and plan["traffic_gb"] else (account["traffic_gb"] or plan["traffic_gb"])
+        # (new_traffic was computed above in the H2 block — preserves unlimited.)
         # C7 — transaction for the multi-step DB writes.
         try:
             async with db.transaction():
@@ -4944,8 +6086,11 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             return
         # C8 — atomic balance deduction.
         if not await db.try_deduct_balance(callback.from_user.id, price):
+            # M11 — show the ACTUAL shortfall, not the full price.
+            cur_balance = db_user.get("balance", 0)
+            diff = max(0, price - cur_balance)
             await callback.answer(
-                t("insufficient", lang, diff=fmt_price(price, lang, await _currency())),
+                t("insufficient", lang, diff=fmt_price(diff, lang, await _currency())),
                 show_alert=True,
             )
             return
@@ -4958,7 +6103,12 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             await db.update_user_balance(callback.from_user.id, price, add=True)
             await callback.answer(f"Failed: {result.get('msg')}", show_alert=True)
             return
-        new_traffic = (account["traffic_gb"] or 0) + gb
+        # H2 — preserve unlimited accounts on top-up too. traffic_gb=0
+        # means UNLIMITED; adding GB would cap it. Keep it unlimited.
+        if account.get("traffic_gb") == 0:
+            new_traffic = 0
+        else:
+            new_traffic = (account["traffic_gb"] or 0) + gb
         # C7 — transaction.
         try:
             async with db.transaction():
@@ -5055,7 +6205,19 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             return
         server = await db.get_server(account["server_id"])
         if server:
-            await api.delete_client(server["panel_url"], server["api_token"], account["email"])
+            res = await api.delete_client(server["panel_url"], server["api_token"], account["email"])
+            # H5 — only remove the DB row if the panel delete succeeded.
+            # Otherwise the panel client lives on but the bot can no longer
+            # manage it — an orphan the user can never delete/renew again.
+            if not res.get("success"):
+                logger.warning("user-side delete_client failed for %s: %s",
+                               account["email"], res.get("msg"))
+                await callback.answer(
+                    t("delete_failed", lang, msg=res.get("msg", "")) if "delete_failed" in MESSAGES.get(lang, {}) else
+                    f"⚠️ Delete failed on panel: {res.get('msg', 'unknown error')}",
+                    show_alert=True,
+                )
+                return
         await db.delete_account(account["email"])
         await callback.answer("✅")
         accounts = await db.get_user_accounts(callback.from_user.id)
@@ -5150,7 +6312,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
                 await db.add_account(
                     user_tg_id=callback.from_user.id, server_id=server["id"], email=email, sub_id=sub_id,
                     plan_id=None, traffic_gb=gb, expiry_time=expiry_time, limit_ip=limit_ip,
-                    inbound_ids=json.dumps(inbound_ids), is_trial=True, label="Trial",
+                    inbound_ids=json.dumps(inbound_ids), is_trial=True, label="",
                 )
                 await db.add_transaction(
                     user_tg_id=callback.from_user.id, amount=0, type_="trial",
@@ -5187,30 +6349,41 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         await callback.message.edit_text(text, reply_markup=kb.as_markup(), disable_web_page_preview=True)
         await callback.answer("✅")
 
-    # ====================================================== BALANCE
+    # ====================================================== WALLET (was BALANCE)
+    # MENU-RESTRUCTURE: this handler now serves as the "Wallet" hub — the
+    # single entry point from the main menu for balance info, charging, and
+    # gift codes. The title changed from "Your Balance" to "Wallet".
+    #
+    # WALLET-TABLE v3: renders the wallet as a real bordered/striped Rich
+    # Message table (summary kv-grid + transactions grid), matching the
+    # style used throughout the admin panel.  The previous plain-HTML
+    # version was a regression introduced in UI-OVERHAUL-2 because Rich
+    # Message headings were leaking literal <b> tags — that happened only
+    # because HTML was being passed into heading() text.  The dedicated
+    # rich_tables.wallet_rich() builder uses PLAIN text (no <b> tags) so
+    # nothing leaks, and the table layout is restored.  Farsi requests
+    # is_rtl=True so the table lays out right-to-left.
     @router.callback_query(MenuCB.filter(F.action == "balance"))
     async def cb_balance(callback: CallbackQuery, db_user: dict):
         lang = _lang(db_user)
         currency = await _currency()
         balance = db_user.get("balance", 0)
-        text = f"{t('balance_title', lang)}\n\n💵 {fmt_price(balance, lang, currency)}\n"
-        text += f"🛒 {fmt_num(db_user.get('total_orders', 0), lang)}\n"
-        text += f"💸 {fmt_price(db_user.get('total_spent', 0), lang, currency)}\n"
-        txs = await db.get_user_transactions(callback.from_user.id, limit=5)
-        if txs:
-            text += f"\n{t('recent_tx', lang)}\n"
-            for tx in txs:
-                icon = {"purchase": "🛒", "renewal": "🔄", "topup": "➕", "deposit": "💰",
-                        "gift_balance": "🎁", "gift_plan": "🎁", "trial": "🆓",
-                        "admin_adjust": "⚙️"}.get(tx["type"], "•")
-                text += f"{icon} {fmt_iso(tx['created_at'])} · {fmt_price(tx['amount'], lang, currency)} · {escape_html((tx.get('description') or '')[:24])}\n"
-        text += f"\n{t('topup_hint', lang)}"
+        txs = await db.get_user_transactions(callback.from_user.id, limit=10)
+        rich = rich_tables.wallet_rich(
+            balance=balance,
+            total_orders=db_user.get("total_orders", 0),
+            total_spent=db_user.get("total_spent", 0),
+            txs=txs,
+            lang=lang,
+            currency=currency,
+            fmt=fmt_price,
+        )
         kb = InlineKeyboardBuilder()
         kb.button(text=t("charge_wallet_btn", lang), callback_data=MenuCB(action="charge_wallet").pack(), style="primary")
         kb.button(style="success", text=t("gift", lang), callback_data=MenuCB(action="gift").pack())
         kb.button(style="danger", text=t("back_menu", lang), callback_data=MenuCB(action="main").pack())
         kb.adjust(2, 1)
-        await callback.message.edit_text(text, reply_markup=kb.as_markup())
+        await show_view(callback.message, rich=rich, reply_markup=kb.as_markup())
         await callback.answer()
 
     # ====================================================== CHARGE WALLET
@@ -5237,7 +6410,9 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             )
         kb.button(text=t("custom_amount", lang), callback_data=PaymentCB(action="custom_amount").pack(), style="primary")
         kb.button(style="success", text=t("gift", lang), callback_data=MenuCB(action="gift").pack())
-        kb.button(text=t("back_menu", lang), callback_data=MenuCB(action="main").pack(), style="danger")
+        # MENU-RESTRUCTURE: back goes to Wallet (balance) instead of main menu,
+        # since charge-wallet is reached from the Wallet hub.
+        kb.button(text=t("back", lang), callback_data=MenuCB(action="balance").pack(), style="danger")
         kb.adjust(2, 1, 2)
         await callback.message.edit_text(t("choose_amount", lang), reply_markup=kb.as_markup())
         await callback.answer()
@@ -5246,19 +6421,23 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
     async def cb_payment_select_amount(callback: CallbackQuery, callback_data: PaymentCB, state: FSMContext, db_user: dict):
         lang = _lang(db_user)
         original_amount = callback_data.amount
-        # Cryptographic 4-digit suffix (9000 values instead of 900) reduces
-        # payment-amount collisions when multiple users pay the same base.
+        # Small 3-digit suffix (100–999, 900 values) — keeps the surcharge
+        # tiny (max +999 toman) while still distinguishing same-base payments
+        # from different users.
         suffix = secrets.randbelow(PAYMENT_UNIQUE_SUFFIX_RANGE) + PAYMENT_UNIQUE_SUFFIX_MIN
         unique_amount = original_amount + suffix
         await state.update_data(original_amount=original_amount, unique_amount=unique_amount)
-        card_number = await db.get_setting("payment_card_number", "-")
+        # CARD-RTL: wrap with ltr() so the digit groups keep their left-to-right
+        # order inside an RTL (Farsi) paragraph. Without this, "6037 9919 2616
+        # 0239" is visually reversed to "0239 2616 9919 6037".
+        card_number = ltr(await db.get_setting("payment_card_number", "-"))
         card_holder = await db.get_setting("payment_card_holder", "-")
         currency = await _currency()
-        # L8 — pass amount (no unit, via fmt_num) + explicit {unit} word so the
-        # template renders cleanly for toman AND usd without double-printing.
+        # Amount block: copyable toman + rial (or USD) amounts in <code> tags
+        # with raw ASCII digits — see _amount_block().
         await callback.message.edit_text(
             t("payment_info", lang, card_number=card_number, card_holder=card_holder,
-              unique_amount=fmt_num(unique_amount, lang), unit=payment_unit_str(currency, lang)),
+              amount_block=_amount_block(unique_amount, currency, lang)),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(style="success", text=t("send_receipt", lang), callback_data=PaymentCB(action="send_receipt", amount=0).pack())],
                 [InlineKeyboardButton(style="danger", text=t("back_menu", lang), callback_data=MenuCB(action="main").pack())],
@@ -5281,9 +6460,15 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
     @router.message(UserStates.waiting_for_custom_amount)
     async def ms_custom_amount(message: Message, state: FSMContext, db_user: dict):
         lang = _lang(db_user)
+        # H8 — guard against non-text input (photo/sticker/voice). The FSM
+        # filter StateFilter fires on ANY message type; without this guard,
+        # a photo sends message.text=None and None.strip() raises
+        # AttributeError (NOT caught by except ValueError), crashing the
+        # handler and leaving the user stuck in the state.
+        raw = (message.text or "").strip()
         try:
-            amount = int(message.text.strip())
-        except ValueError:
+            amount = int(raw)
+        except (ValueError, TypeError):
             await message.answer(t("invalid_number", lang), reply_markup=kb_cancel(lang))
             return
         # Use the admin-configurable minimum amount (M12 — was hardcoded 10000).
@@ -5294,17 +6479,20 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
                 reply_markup=kb_cancel(lang),
             )
             return
-        # Cryptographic 4-digit suffix (9000 values instead of 900) — C6.
+        # Small 3-digit suffix (100–999, 900 values) — C6.
         suffix = secrets.randbelow(PAYMENT_UNIQUE_SUFFIX_RANGE) + PAYMENT_UNIQUE_SUFFIX_MIN
         unique_amount = amount + suffix
         await state.update_data(original_amount=amount, unique_amount=unique_amount)
-        card_number = await db.get_setting("payment_card_number", "-")
+        # CARD-RTL: wrap with ltr() so the digit groups keep their left-to-right
+        # order inside an RTL (Farsi) paragraph. Without this, "6037 9919 2616
+        # 0239" is visually reversed to "0239 2616 9919 6037".
+        card_number = ltr(await db.get_setting("payment_card_number", "-"))
         card_holder = await db.get_setting("payment_card_holder", "-")
         currency = await _currency()
-        # L8 — amount + {unit} word (see cb_payment_select_amount for rationale).
+        # Amount block: copyable toman + rial (or USD) amounts in <code> tags.
         await message.answer(
             t("payment_info", lang, card_number=card_number, card_holder=card_holder,
-              unique_amount=fmt_num(unique_amount, lang), unit=payment_unit_str(currency, lang)),
+              amount_block=_amount_block(unique_amount, currency, lang)),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(style="success", text=t("send_receipt", lang), callback_data=PaymentCB(action="send_receipt", amount=0).pack())],
                 [InlineKeyboardButton(style="danger", text=t("back_menu", lang), callback_data=MenuCB(action="main").pack())],
@@ -5327,6 +6515,11 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         data = await state.get_data()
         original_amount = data.get("original_amount", 0)
         unique_amount = data.get("unique_amount", 0)
+        # SHORTFALL-REQUEST: if this receipt is for a shortfall payment, the
+        # state holds shortfall_plan_id. We tag the payment record so the
+        # approval handler can offer the user a one-tap "Buy Now" button.
+        resume_plan_id = data.get("shortfall_plan_id")
+        shortfall_plan_name = data.get("shortfall_plan_name", "")
 
         receipt_type = ""
         receipt_file_id = ""
@@ -5362,11 +6555,30 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             receipt_type=receipt_type,
             receipt_file_id=receipt_file_id,
             receipt_text=receipt_text,
+            resume_plan_id=resume_plan_id,
         )
-        await message.answer(
-            t("receipt_received", lang, amount=fmt_price(unique_amount, lang, await _currency())),
-            reply_markup=kb_back_to_menu(lang),
-        )
+        # User-facing confirmation: if this was a shortfall payment, hint
+        # that they'll get a Buy Now button after approval.
+        if resume_plan_id and shortfall_plan_name:
+            if lang == "fa":
+                extra = (
+                    f"\n\n💡 بعد از تأیید ادمین، موجودیت شارژ میشه و دکمهٔ «خرید پلن {escape_html(shortfall_plan_name)}» "
+                    f"برات ظاهر میشه تا با یه کلیک خرید رو کامل کنی."
+                )
+            else:
+                extra = (
+                    f"\n\n💡 After admin approval, your balance will be topped up and a "
+                    f"\"Buy {escape_html(shortfall_plan_name)}\" button will appear so you can finish the purchase in one tap."
+                )
+            await message.answer(
+                t("receipt_received", lang, amount=fmt_price(unique_amount, lang, await _currency())) + extra,
+                reply_markup=kb_back_to_menu(lang),
+            )
+        else:
+            await message.answer(
+                t("receipt_received", lang, amount=fmt_price(unique_amount, lang, await _currency())),
+                reply_markup=kb_back_to_menu(lang),
+            )
         # Notify every admin that a new payment needs their review.
         # Includes payment-only admins (who can approve/reject) in addition
         # to full ADMIN_IDS.
@@ -5387,6 +6599,10 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
                     f"🧾 Receipt: {receipt_type}\n"
                     f"⏳ Status: <b>awaiting your review</b>"
                 )
+                # If this is a shortfall payment, tell the admin which plan
+                # the user wants to buy — helps them prioritise/understand.
+                if resume_plan_id and shortfall_plan_name:
+                    admin_text += f"\n🎯 Shortfall for plan: <b>{escape_html(shortfall_plan_name)}</b> (id #{resume_plan_id})"
                 # Forward the receipt media to the admin if there is one, so
                 # they can see it without even clicking through.
                 if receipt_file_id and receipt_type == "photo":
@@ -5423,19 +6639,31 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         stats = await db.get_referral_stats(callback.from_user.id)
         bonus_days = await db.get_setting_int("referral_bonus_days", 0)
         bonus_gb = await db.get_setting_int("referral_bonus_gb", 0)
+        # REFERRAL-CLAIM: count unclaimed rewards so we can show a Claim button.
+        claimable = await db.get_claimable_referral_count(callback.from_user.id)
         me = await bot.get_me()
         ref_link = f"https://t.me/{me.username}?start={db_user.get('referral_code','')}"
-        # Transparent "how it works" explanation.
+        # Transparent "how it works" explanation — updated to mention the
+        # claim requirement and the active-account requirement.
+        how_text = (
+            t('referral_how', lang, days=bonus_days, gb=bonus_gb)
+            + "\n\n"
+            + ("⚠️ <b>توجه:</b> برای دریافت پاداش، باید خودت یه اکانت فعال پرداختی داشته باشی. بعد از خرید دوستت، برو به بخش دعوت و پاداش رو دریافت کن."
+               if lang == "fa"
+               else "⚠️ <b>Note:</b> To claim your reward, you need your own active paid account. After your friend buys, come back here and tap Claim Reward.")
+        )
         text = (
             f"{t('referral_title', lang)}\n\n"
-            f"{t('referral_how', lang, days=bonus_days, gb=bonus_gb)}\n\n"
+            f"{how_text}\n\n"
             f"{t('referral_stats', lang)}\n"
             f"• {fmt_num(stats['total_referrals'], lang)} — {'Total invited' if lang == 'en' else 'کل دعوت‌شدگان'}\n"
             f"• {fmt_num(stats['completed_referrals'], lang)} — {'Bought (rewarded)' if lang == 'en' else 'خرید کرده (پاداش‌دار)'}\n"
             f"• {fmt_num(stats['pending_referrals'], lang)} — {'Pending (not bought yet)' if lang == 'en' else 'در انتظار (هنوز خرید نکرده)'}\n"
             f"• +{fmt_num(stats['bonus_days_total'], lang)}d / +{fmt_num(stats['bonus_gb_total'], lang)} GB — {'Total bonus earned' if lang == 'en' else 'کل پاداش کسب‌شده'}\n\n"
-            f"{t('your_link', lang)}\n<code>{ref_link}</code>"
         )
+        if claimable > 0:
+            text += f"{t('ref_claimable', lang, count=claimable)}\n\n"
+        text += f"{t('your_link', lang)}\n<code>{ref_link}</code>"
         # Recent referrals history (last 5)
         history = await db.get_referral_history(callback.from_user.id, limit=5)
         if history:
@@ -5450,13 +6678,162 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         else:
             text += f"\n\n{t('referral_no_history', lang)}"
         kb = InlineKeyboardBuilder()
+        # Claim button — only shown when there are unclaimed rewards.
+        if claimable > 0:
+            kb.button(style="success", text=t("ref_claim_btn", lang),
+                      callback_data=MenuCB(action="referral_claim").pack())
         # t.me/share/url lets the user pick a chat to forward the link to.
         share_url = f"https://t.me/share/url?url={ref_link}"
-        kb.button(style="success", text=t("share_link", lang), url=share_url)
+        kb.button(style="primary", text=t("share_link", lang), url=share_url)
         kb.button(text=t("back", lang), callback_data=MenuCB(action="main").pack(), style="danger")
-        kb.adjust(1)
+        kb.adjust(1, 1, 1)
         await callback.message.edit_text(text, reply_markup=kb.as_markup(), disable_web_page_preview=True)
         await callback.answer()
+
+    @router.callback_query(MenuCB.filter(F.action == "referral_claim"))
+    async def cb_referral_claim(callback: CallbackQuery, db_user: dict):
+        """REFERRAL-CLAIM: let the referrer claim their pending reward.
+
+        Requirements:
+        1. The referrer must have at least one active, non-trial account
+           (this ensures they're a paying customer — the whole point of the
+           new logic).
+        2. There must be at least one claimable referral (a referred user who
+           bought but hasn't been rewarded yet).
+
+        If the referrer has multiple active accounts, they pick which one
+        receives the bonus. If they have exactly one, the bonus is applied
+        immediately.
+        """
+        lang = _lang(db_user)
+        claimable = await db.get_claimable_referral_count(callback.from_user.id)
+        if claimable == 0:
+            await callback.answer(t("ref_claim_none", lang), show_alert=True)
+            return
+        # Check for active non-trial accounts.
+        accounts = await db.get_user_accounts(callback.from_user.id)
+        active_paid = [a for a in accounts if a["is_active"] and not a["is_trial"]]
+        if not active_paid:
+            await callback.message.edit_text(
+                t("ref_claim_no_account", lang),
+                reply_markup=kb_back_to_menu(lang),
+            )
+            await callback.answer()
+            return
+        bonus_days = await db.get_setting_int("referral_bonus_days", 0)
+        bonus_gb = await db.get_setting_int("referral_bonus_gb", 0)
+        # If only one active account, apply directly.
+        if len(active_paid) == 1:
+            acc = active_paid[0]
+            srv = await db.get_server(acc["server_id"])
+            if not srv:
+                await callback.answer(t("not_found", lang), show_alert=True)
+                return
+            # H3 — multiply the per-referral bonus by the claimable count.
+            # Previously bulk_adjust was called once (1× bonus) but N reward
+            # rows were recorded, so the referrer only got 1/N of their earned
+            # bonus and could never claim the rest (the rows blocked re-claim).
+            claimables = await db.get_claimable_referrals(callback.from_user.id)
+            count = len(claimables)
+            total_days = bonus_days * count
+            total_gb = bonus_gb * count
+            bonus_bytes = total_gb * GB if total_gb > 0 else 0
+            result = await api.bulk_adjust(
+                srv["panel_url"], srv["api_token"],
+                [acc["email"]], add_days=total_days, add_bytes=bonus_bytes,
+            )
+            # REFERRAL-CLAIM-CHECK: verify the panel actually applied the bonus
+            # BEFORE marking referrals as rewarded. Without this guard, a panel
+            # failure would still record reward rows (consuming the user's
+            # pending bonus) while the account was never extended — an
+            # unrecoverable loss for the user.
+            if not result or not result.get("success"):
+                logger.warning("referral-claim bulk_adjust failed for %s: %s",
+                               acc["email"], (result or {}).get("msg"))
+                await show_view(callback.message,
+                    text=t("ref_claim_failed", lang, msg=(result or {}).get("msg", "unknown error")),
+                    reply_markup=kb_back_to_menu(lang))
+                await callback.answer()
+                return
+            # Record a reward row for EACH claimable referral (now N rows, with
+            # the panel bonus applied N× above). H7 — add_referral_reward uses
+            # INSERT OR IGNORE so a double-tap won't duplicate rows.
+            for ref in claimables:
+                await db.add_referral_reward(
+                    referrer_tg_id=callback.from_user.id,
+                    referred_tg_id=ref["tg_id"],
+                    account_email=acc["email"],
+                    bonus_days=bonus_days, bonus_gb=bonus_gb,
+                )
+            await show_view(callback.message,
+                text=t("ref_claim_success", lang, days=total_days, gb=total_gb,
+                       email=acc["email"]),
+                reply_markup=kb_back_to_menu(lang),
+            )
+            await callback.answer("✅")
+            return
+        # Multiple active accounts — let the user pick which one.
+        text = f"{t('ref_claim_pick', lang)}\n\n"
+        kb = InlineKeyboardBuilder()
+        for acc in active_paid:
+            label = acc.get("label") or acc["email"][:24]
+            kb.button(style="primary", text=f"📱 {label[:28]}",
+                      callback_data=AccountCB(action="ref_claim_apply", email=acc["email"]).pack())
+        kb.button(text=t("back", lang), callback_data=MenuCB(action="referral").pack(), style="danger")
+        kb.adjust(1)
+        await callback.message.edit_text(text, reply_markup=kb.as_markup())
+        await callback.answer()
+
+    @router.callback_query(AccountCB.filter(F.action == "ref_claim_apply"))
+    async def cb_ref_claim_apply(callback: CallbackQuery, callback_data: AccountCB, db_user: dict):
+        """Apply the referral reward to the chosen account."""
+        lang = _lang(db_user)
+        acc = await db.get_account(callback_data.email)
+        if not acc or acc["user_tg_id"] != callback.from_user.id:
+            await callback.answer(t("not_found", lang), show_alert=True)
+            return
+        srv = await db.get_server(acc["server_id"])
+        if not srv:
+            await callback.answer(t("not_found", lang), show_alert=True)
+            return
+        claimable = await db.get_claimable_referral_count(callback.from_user.id)
+        if claimable == 0:
+            await callback.answer(t("ref_claim_none", lang), show_alert=True)
+            return
+        bonus_days = await db.get_setting_int("referral_bonus_days", 0)
+        bonus_gb = await db.get_setting_int("referral_bonus_gb", 0)
+        # H3 — multiply by the claimable count (see cb_referral_claim).
+        claimables = await db.get_claimable_referrals(callback.from_user.id)
+        count = len(claimables)
+        total_days = bonus_days * count
+        total_gb = bonus_gb * count
+        bonus_bytes = total_gb * GB if total_gb > 0 else 0
+        result = await api.bulk_adjust(
+            srv["panel_url"], srv["api_token"],
+            [acc["email"]], add_days=total_days, add_bytes=bonus_bytes,
+        )
+        # REFERRAL-CLAIM-CHECK (mirrors cb_referral_claim): bail out without
+        # recording rewards if the panel rejected the adjustment, so the
+        # user's pending bonus is preserved for a later retry.
+        if not result or not result.get("success"):
+            logger.warning("ref-claim-apply bulk_adjust failed for %s: %s",
+                           acc["email"], (result or {}).get("msg"))
+            await show_view(callback.message,
+                text=t("ref_claim_failed", lang, msg=(result or {}).get("msg", "unknown error")),
+                reply_markup=kb_back_to_menu(lang))
+            await callback.answer()
+            return
+        for ref in claimables:
+            await db.add_referral_reward(
+                referrer_tg_id=callback.from_user.id,
+                referred_tg_id=ref["tg_id"],
+                account_email=acc["email"],
+                bonus_days=bonus_days, bonus_gb=bonus_gb,
+            )
+        await show_view(callback.message,
+            text=t("ref_claim_success", lang, days=total_days, gb=total_gb, email=acc["email"]),
+            reply_markup=kb_back_to_menu(lang))
+        await callback.answer("✅")
 
     # ====================================================== GIFT CODE
     @router.callback_query(MenuCB.filter(F.action == "gift"))
@@ -5585,8 +6962,11 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             kb.button(style="primary", text=f"🛡 Tickets{badge}", callback_data=AdminCB(action="tickets").pack())
         kb.button(text=t("back", lang), callback_data=MenuCB(action="main").pack(), style="danger")
         kb.adjust(2, 2 if callback.from_user.id in ADMIN_IDS else 1)
-        await callback.message.edit_text(f"{t('support_title', lang)}\n\n{t('support_desc', lang)}",
-                                         reply_markup=kb.as_markup())
+        # TICKET-MEDIA-1: use show_view so this works even when the current
+        # message is a photo (ticket-reply notification with a screenshot).
+        await show_view(callback.message,
+                        text=f"{t('support_title', lang)}\n\n{t('support_desc', lang)}",
+                        reply_markup=kb.as_markup())
         await callback.answer()
 
     @router.callback_query(MenuCB.filter(F.action == "new_ticket"))
@@ -5602,9 +6982,10 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
                   callback_data=MenuCB(action="pick_cat", data="account").pack())
         kb.button(style="primary", text=t("cat_other", lang),
                   callback_data=MenuCB(action="pick_cat", data="other").pack())
-        kb.button(text=t("back", lang), callback_data=MenuCB(action="support").pack(), style="danger")
+        kb.button(text=t("back", lang), callback_data=MenuCB(action="help").pack(), style="danger")
         kb.adjust(2, 2, 1)
-        await callback.message.edit_text(t("choose_category", lang), reply_markup=kb.as_markup())
+        # TICKET-MEDIA-1: use show_view (handles photo-message case).
+        await show_view(callback.message, text=t("choose_category", lang), reply_markup=kb.as_markup())
         await callback.answer()
 
     @router.callback_query(MenuCB.filter(F.action == "pick_cat"))
@@ -5614,7 +6995,8 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         await state.set_state(UserStates.waiting_for_ticket_subject)
         await state.update_data(category=category)
         cat_label = t(f"cat_{category}", lang) if category in ("technical", "payment", "account", "other") else category
-        await callback.message.edit_text(t("ask_subject", lang, category=cat_label), reply_markup=kb_cancel(lang))
+        # TICKET-MEDIA-1: use show_view (handles photo-message case).
+        await show_view(callback.message, text=t("ask_subject", lang, category=cat_label), reply_markup=kb_cancel(lang))
         await callback.answer()
 
     @router.message(UserStates.waiting_for_ticket_subject)
@@ -5631,30 +7013,52 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
     @router.message(UserStates.waiting_for_ticket_message)
     async def ms_ticket_message(message: Message, state: FSMContext, db_user: dict):
         lang = _lang(db_user)
-        msg_text = (message.text or "").strip()[:2000]
-        if not msg_text:
+        # Accept either plain text OR a media attachment (with optional
+        # caption) as the initial ticket body.  This mirrors ms_ticket_reply
+        # so users can attach a screenshot/voice the moment they open the
+        # ticket — not just on follow-up replies.
+        media_type, media_file_id, caption, msg_text = extract_ticket_media(message)
+        if not media_type and not msg_text:
             await message.answer(t("ask_message", lang, subject=""), reply_markup=kb_cancel(lang))
             return
+        # For media messages the stored body is the caption (may be empty).
+        if media_type:
+            msg_text = caption[:TICKET_MESSAGE_MAX_CHARS]
         data = await state.get_data()
         subject = data.get("subject", "No subject")
         category = data.get("category", "other")
         await state.clear()
         ticket_id = await db.create_ticket(message.from_user.id, subject, category)
-        await db.add_ticket_message(ticket_id, "user", msg_text)
+        await db.add_ticket_message(
+            ticket_id, "user", msg_text,
+            media_type=media_type,
+            media_file_id=media_file_id,
+            media_caption=caption,
+        )
         cat_label = t(f"cat_{category}", lang) if category in ("technical", "payment", "account", "other") else category
+        # Admin notification: send the text header first, then forward the
+        # media attachment (if any) so the admin sees exactly what the user
+        # attached.  Uses _send_ticket_reply_notify for media-aware delivery.
+        admin_header = (
+            f"🎫 <b>New Ticket #{ticket_id}</b>\n"
+            f"👤 {escape_html(message.from_user.full_name)} (<code>{message.from_user.id}</code>)\n"
+            f"🏷 {cat_label}\n"
+            f"📝 {escape_html(subject)}\n💬 {escape_html(msg_text[:500])}"
+        )
+        admin_kb = kb_ticket_view(ticket_id, True, "en", "open",
+                                  user_tg_id=message.from_user.id)
         for admin_id in ADMIN_IDS:
-            await safe_notify(
-                bot.send_message(
-                    admin_id,
-                    f"🎫 <b>New Ticket #{ticket_id}</b>\n"
-                    f"👤 {escape_html(message.from_user.full_name)} (<code>{message.from_user.id}</code>)\n"
-                    f"🏷 {cat_label}\n"
-                    f"📝 {escape_html(subject)}\n💬 {escape_html(msg_text[:500])}",
-                    reply_markup=kb_ticket_view(ticket_id, True, "en", "open",
-                                                user_tg_id=message.from_user.id),
-                ),
-                context="new-ticket admin notify",
-            )
+            if media_type:
+                await _send_ticket_reply_notify(
+                    bot, admin_id, admin_header,
+                    media_type, media_file_id, admin_kb,
+                    context="new-ticket admin notify",
+                )
+            else:
+                await safe_notify(
+                    bot.send_message(admin_id, admin_header, reply_markup=admin_kb),
+                    context="new-ticket admin notify",
+                )
         await message.answer(t("ticket_created", lang, id=ticket_id, subject=escape_html(subject), category=cat_label),
                              reply_markup=kb_back_to_menu(lang))
 
@@ -5663,7 +7067,9 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         lang = _lang(db_user)
         tickets = await db.get_user_tickets(callback.from_user.id)
         if not tickets:
-            await callback.message.edit_text(t("no_tickets", lang), reply_markup=kb_back_to_menu(lang))
+            # TICKET-MEDIA-1: use show_view — the "Back" button on a ticket
+            # photo notification routes here, so callback.message may be a photo.
+            await show_view(callback.message, text=t("no_tickets", lang), reply_markup=kb_back_to_menu(lang))
             await callback.answer()
             return
         kb = InlineKeyboardBuilder()
@@ -5673,9 +7079,10 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             kb.button(style="primary",
                       text=f"{badge} #{tk['id']} — {cat_emoji} {tk['subject'][:22]}",
                       callback_data=TicketCB(action="view", ticket_id=tk["id"]).pack())
-        kb.button(text=t("back", lang), callback_data=MenuCB(action="support").pack(), style="danger")
+        kb.button(text=t("back", lang), callback_data=MenuCB(action="help").pack(), style="danger")
         kb.adjust(1)
-        await callback.message.edit_text(t("my_tickets", lang), reply_markup=kb.as_markup())
+        # TICKET-MEDIA-1: use show_view (handles photo-message case).
+        await show_view(callback.message, text=t("my_tickets", lang), reply_markup=kb.as_markup())
         await callback.answer()
 
     @router.callback_query(TicketCB.filter(F.action == "view"))
@@ -5717,12 +7124,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             )
         # Feature 3 — render each ticket message; if it has a media attachment,
         # show a "[📎 Photo]" line above the caption (or in place of it).
-        media_label_map = {
-            "photo": t("media_photo", lang),
-            "document": t("media_document", lang),
-            "video": t("media_video", lang),
-            "voice": t("media_voice", lang),
-        }
+        media_label_map = _media_label_map(lang)
         for m in messages:
             who = "👤" if m["sender"] == "user" else "🛡"
             mtext = (m.get("message") or "")
@@ -5735,8 +7137,9 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
                 text += "\n\n"
             else:
                 text += f"<b>{who} {fmt_iso(m.get('created_at'))}</b>\n{escape_html(mtext[:TICKET_MESSAGE_MAX_CHARS])}\n\n"
-        await callback.message.edit_text(
-            text,
+        await show_view(
+            callback.message,
+            text=text,
             reply_markup=kb_ticket_view(ticket["id"], is_admin, lang, ticket["status"],
                                         user_tg_id=ticket["user_tg_id"], messages=messages),
         )
@@ -5784,6 +7187,19 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
                 await callback.message.answer_video(video=media_file_id, caption=cap)
             elif media_type == "voice":
                 await callback.message.answer_voice(voice=media_file_id, caption=cap)
+            elif media_type == "audio":
+                await callback.message.answer_audio(audio=media_file_id, caption=cap)
+            elif media_type == "animation":
+                await callback.message.answer_animation(animation=media_file_id, caption=cap)
+            elif media_type == "video_note":
+                # Round-video notes accept a short caption.
+                await callback.message.answer_video_note(video_note=media_file_id,
+                                                         caption=cap[:200])
+            elif media_type == "sticker":
+                # Stickers can't carry a caption — send sticker then a text msg.
+                await callback.message.answer_sticker(sticker=media_file_id)
+                if caption_text:
+                    await callback.message.answer(cap)
             else:
                 await callback.answer(t("not_found", lang), show_alert=True)
                 return
@@ -5811,46 +7227,37 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         # (photo / screenshot) are accepted as evidence.
         header = (f"💬 <b>Reply to ticket #{callback_data.ticket_id}</b>\n"
                   f"📝 {escape_html(ticket['subject'])}\n\n")
-        await callback.message.edit_text(
-            header + t("ask_reply_with_media", lang),
+        # TICKET-MEDIA-1: use show_view instead of edit_text.  When the user
+        # (or admin) taps "Reply" on a ticket-reply NOTIFICATION that was sent
+        # as a photo message (because the reply carried a screenshot),
+        # callback.message is a photo — and edit_text would fail with
+        # "Bad Request: there is no text in the message to edit".  show_view
+        # detects this and falls back to delete + answer, so the reply prompt
+        # replaces the photo cleanly.
+        await show_view(
+            callback.message,
+            text=header + t("ask_reply_with_media", lang),
             reply_markup=kb_cancel(lang),
         )
         await callback.answer()
 
     @router.message(UserStates.waiting_for_ticket_reply)
     async def ms_ticket_reply(message: Message, state: FSMContext, db_user: dict):
-        """Accept text OR photo / document / video / voice (with optional caption)
-        as a ticket reply. Persist the message + media metadata, then notify the
-        other party — sending the media too if any. (TICKET-1 Feature 3)"""
+        """Accept text OR any media attachment (photo, document, video, voice,
+        audio/music, animation/GIF, round-video note, sticker — with optional
+        caption) as a ticket reply. Persist the message + media metadata, then
+        notify the other party — sending the media too if any. (TICKET-1)"""
         lang = _lang(db_user)
         # ---- Extract media + text from the incoming message ------------------
-        media_type = ""
-        media_file_id = ""
-        caption = ""
-        if message.photo:
-            media_type = "photo"
-            media_file_id = message.photo[-1].file_id  # largest size
-            caption = (message.caption or "").strip()
-        elif message.document:
-            media_type = "document"
-            media_file_id = message.document.file_id
-            caption = (message.caption or "").strip()
-        elif message.video:
-            media_type = "video"
-            media_file_id = message.video.file_id
-            caption = (message.caption or "").strip()
-        elif message.voice:
-            media_type = "voice"
-            media_file_id = message.voice.file_id
-            caption = ""  # voice messages can't have a caption
-        else:
-            msg_text = (message.text or "").strip()
-            if not msg_text:
-                header = (f"💬 <b>Reply to ticket</b>\n\n")
-                await message.answer(header + t("ask_reply_with_media", lang),
-                                     reply_markup=kb_cancel(lang))
-                return
-            msg_text = msg_text[:TICKET_REPLY_MAX_CHARS]
+        media_type, media_file_id, caption, msg_text = extract_ticket_media(message)
+        # If neither media nor text was sent (e.g. a location, contact, poll,
+        # dice, or any other unsupported content type), re-prompt the user
+        # instead of silently storing an empty ticket message.
+        if not media_type and not msg_text:
+            header = "💬 <b>Reply to ticket</b>\n\n"
+            await message.answer(header + t("ask_reply_with_media", lang),
+                                 reply_markup=kb_cancel(lang))
+            return
         # For media replies, the stored `message` column is the caption (or an
         # empty string). The media-type marker is rendered at view time.
         if media_type:
@@ -5947,28 +7354,87 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             f"🏷 {cat_label}\n📝 {escape_html(ticket['subject'])}\n"
             f"📊 {t('ticket_status_open', lang)}\n📅 {fmt_iso(ticket.get('created_at'))}\n\n"
         )
+        # LOW — add media markers ([📎 Photo] etc.) just like cb_ticket_view,
+        # so media-bearing messages aren't rendered as empty lines on reopen.
+        media_label_map = _media_label_map(lang)
         for m in messages:
             who = "👤" if m["sender"] == "user" else "🛡"
-            text += f"<b>{who} {fmt_iso(m.get('created_at'))}</b>\n{escape_html(m['message'][:TICKET_MESSAGE_MAX_CHARS])}\n\n"
-        await callback.message.edit_text(text, reply_markup=kb_ticket_view(ticket["id"], False, lang, "open"))
+            mtext = (m.get("message") or "")
+            mt = m.get("media_type") or ""
+            if mt:
+                label = media_label_map.get(mt, "Media")
+                text += f"<b>{who} {fmt_iso(m.get('created_at'))}</b>\n[📎 {label}]"
+                if mtext:
+                    text += f"\n{escape_html(mtext[:TICKET_MESSAGE_MAX_CHARS])}"
+                text += "\n\n"
+            else:
+                text += f"<b>{who} {fmt_iso(m.get('created_at'))}</b>\n{escape_html(mtext[:TICKET_MESSAGE_MAX_CHARS])}\n\n"
+        # TICKET-MEDIA-1: use show_view — the "Reopen" button may be on a
+        # closed-ticket photo notification, so callback.message may be a photo.
+        await show_view(callback.message, text=text,
+                        reply_markup=kb_ticket_view(ticket["id"], False, lang, "open"))
 
-    # ====================================================== GUIDE
+    # ====================================================== GUIDE (GUIDES)
+    # Dual guides: "Using the bot" + "How to connect". Both are editable by
+    # the admin (Settings → Guides). If the admin hasn't set a custom text,
+    # we fall back to the rich DEFAULT_GUIDE_* constants.
+    async def _get_guide_text(kind: str, lang: str) -> str:
+        """Fetch a guide text from settings, falling back to defaults."""
+        key = f"guide_{kind}_{lang}"
+        val = await db.get_setting(key, "")
+        if val and val.strip():
+            return val
+        defaults = {
+            ("usage", "en"): DEFAULT_GUIDE_USAGE_EN,
+            ("usage", "fa"): DEFAULT_GUIDE_USAGE_FA,
+            ("connection", "en"): DEFAULT_GUIDE_CONNECTION_EN,
+            ("connection", "fa"): DEFAULT_GUIDE_CONNECTION_FA,
+        }
+        return defaults.get((kind, lang), DEFAULT_GUIDE_USAGE_EN)
+
     @router.callback_query(MenuCB.filter(F.action == "guide"))
     async def cb_guide(callback: CallbackQuery, db_user: dict):
         lang = _lang(db_user)
         text = (
             f"{t('guide_title', lang)}\n\n"
-            "<b>🤖 Android (v2rayNG)</b>\n"
-            "1. Install v2rayNG\n2. Copy subscription URL\n3. Subscription → add → paste → update\n4. Pick a server, tap V\n\n"
-            "<b>📱 iOS (Streisand / V2Box)</b>\n"
-            "1. Install Streisand\n2. Settings → Subscriptions → add URL\n3. Pick server → connect\n\n"
-            "<b>💻 Windows (v2rayN)</b>\n"
-            "1. Install v2rayN\n2. Subscription → add → paste URL → update\n3. Right-click server → enable\n\n"
-            "<b>🍎 macOS (V2RayU / Foxray)</b>\n"
-            "1. Install app\n2. Add subscription URL\n3. Select server → toggle on\n\n"
-            f"<b>🌐</b> {t('sub_url', lang)}"
+            + ("دو راهنما برای شما آماده شده — یکی برای کار با خود ربات، یکی برای اتصال به VPN. هر کدام را نیاز داری باز کن."
+               if lang == "fa"
+               else "Two guides are here — one for using the bot, one for connecting to the VPN. Open whichever you need.")
         )
-        await callback.message.edit_text(text, reply_markup=kb_back_to_menu(lang))
+        kb = InlineKeyboardBuilder()
+        kb.button(text=t("guide_usage_btn", lang),
+                  callback_data=MenuCB(action="guide_usage").pack(), style="primary")
+        kb.button(text=t("guide_connection_btn", lang),
+                  callback_data=MenuCB(action="guide_connection").pack(), style="primary")
+        kb.button(text=t("back_menu", lang), callback_data=MenuCB(action="main").pack(), style="danger")
+        kb.adjust(1, 1, 1)
+        await callback.message.edit_text(text, reply_markup=kb.as_markup())
+        await callback.answer()
+
+    @router.callback_query(MenuCB.filter(F.action == "guide_usage"))
+    async def cb_guide_usage(callback: CallbackQuery, db_user: dict):
+        lang = _lang(db_user)
+        text = await _get_guide_text("usage", lang)
+        kb = InlineKeyboardBuilder()
+        kb.button(text=t("guide_connection_btn", lang),
+                  callback_data=MenuCB(action="guide_connection").pack(), style="primary")
+        kb.button(text=t("back", lang), callback_data=MenuCB(action="help").pack(), style="primary")
+        kb.button(text=t("back_menu", lang), callback_data=MenuCB(action="main").pack(), style="danger")
+        kb.adjust(1, 1, 1)
+        await callback.message.edit_text(text, reply_markup=kb.as_markup())
+        await callback.answer()
+
+    @router.callback_query(MenuCB.filter(F.action == "guide_connection"))
+    async def cb_guide_connection(callback: CallbackQuery, db_user: dict):
+        lang = _lang(db_user)
+        text = await _get_guide_text("connection", lang)
+        kb = InlineKeyboardBuilder()
+        kb.button(text=t("guide_usage_btn", lang),
+                  callback_data=MenuCB(action="guide_usage").pack(), style="primary")
+        kb.button(text=t("back", lang), callback_data=MenuCB(action="help").pack(), style="primary")
+        kb.button(text=t("back_menu", lang), callback_data=MenuCB(action="main").pack(), style="danger")
+        kb.adjust(1, 1, 1)
+        await callback.message.edit_text(text, reply_markup=kb.as_markup())
         await callback.answer()
 
     return router
@@ -5992,6 +7458,54 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     @router.callback_query.middleware()
     async def _cb_mw(handler, event, data):
         return await guard(handler, event, data)
+
+    # H12 — FSM stale-state guard. Several admin callbacks set a "waiting for
+    # text" state (e.g. waiting_for_reject_reason, waiting_for_broadcast_message,
+    # waiting_for_add_balance, setting_edit_value). If the admin then taps an
+    # OLD inline button (Telegram keeps them live), the stale state persists
+    # and the next text the admin types goes to the WRONG target — e.g.
+    # rejecting the wrong payment, or broadcasting a half-finished message to
+    # thousands of users.
+    #
+    # This outer middleware clears FSM state on EVERY admin callback UNLESS the
+    # callback's action is in the allowlist below (actions that explicitly SET a
+    # new state as part of their flow). This is far more robust than adding
+    # state.clear() to 30+ individual handlers.
+    _FSM_SETTING_ACTIONS = frozenset({
+        "add_balance", "deduct_balance", "acc_extend",       # user balance / extend
+        "create_promo",                                     # promo creation flow
+        "create_gift", "gift_amount",                       # gift code creation flow
+        "broadcast",                                        # broadcast flow
+        "plan_add", "plan_edit_field",                      # plan creation/edit flow
+        "srv_add", "srv_edit",                              # server add/edit flow
+        "import_set_tg",                                    # import flow
+        "admin_ticket_reply",                               # ticket reply flow
+        "setting_edit",                                     # settings edit flow
+        "admin_account_create",                             # admin manual account creation
+        "users",                                            # user search sets its own state
+    })
+
+    @router.callback_query.outer_middleware()
+    async def _fsm_clear_mw(handler, event, data):
+        # Inspect the callback_data to extract the action. We support both
+        # AdminCB (action field) and other callback types (MenuCB/PlanCB/etc.)
+        # — for non-AdminCB callbacks we always clear (they're pure navigation).
+        from aiogram.fsm.context import FSMContext
+        state: Optional[FSMContext] = data.get("state")
+        if state is not None:
+            action: Optional[str] = None
+            # Try AdminCB first (most admin actions use it).
+            try:
+                from aiogram.filters.callback_data import CallbackData
+                # event.data is the packed callback string like "admin:main"
+                raw = getattr(event, "data", None) or ""
+                if raw.startswith("admin:"):
+                    action = raw.split(":", 1)[1].split(":", 1)[0]
+            except Exception:
+                pass
+            if action is None or action not in _FSM_SETTING_ACTIONS:
+                await state.clear()
+        return await handler(event, data)
 
     async def _currency() -> str:
         return await db.get_setting("currency", DEFAULT_CURRENCY) or DEFAULT_CURRENCY
@@ -6023,7 +7537,11 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             )
 
     @router.callback_query(AdminCB.filter(F.action == "main"))
-    async def cb_admin_main(callback: CallbackQuery):
+    async def cb_admin_main(callback: CallbackQuery, state: FSMContext):
+        # ADMIN-NAV-CLEAR: clear any stale FSM state (e.g. setting_edit_value)
+        # so a mid-edit admin who taps a nav button can't accidentally fire
+        # ms_setting_edit with the old edit_type/key/email on their next text.
+        await state.clear()
         if await _is_full_admin(callback.from_user.id):
             await show_view(callback.message, text="⚙️ <b>Admin Panel</b>", reply_markup=kb_admin_menu())
         else:
@@ -6034,7 +7552,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     # ------------------------------------------------------- dashboard
     @router.callback_query(AdminCB.filter(F.action == "dashboard"))
-    async def cb_dashboard(callback: CallbackQuery):
+    async def cb_dashboard(callback: CallbackQuery, state: FSMContext):
+        await state.clear()
         total_users = await db.count_users()
         active = await db.get_all_active_accounts()
         open_tickets = await db.count_open_tickets()
@@ -6062,7 +7581,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     # ====================================================== SERVERS
     @router.callback_query(AdminCB.filter(F.action == "servers"))
-    async def cb_servers(callback: CallbackQuery):
+    async def cb_servers(callback: CallbackQuery, state: FSMContext):
+        await state.clear()
         servers = await db.get_servers()
         await show_view(callback.message, text="🖥 <b>Servers</b>", reply_markup=kb_servers(servers))
         await callback.answer()
@@ -6326,14 +7846,24 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.callback_query(ServerCB.filter(F.action == "delete"))
     async def cb_srv_delete(callback: CallbackQuery, callback_data: ServerCB):
-        await db.delete_server(callback_data.server_id)
+        # H9 — wrap in try/except: even with ON DELETE SET NULL (added in the
+        # accounts FK migration), a concurrent write or an unexpected constraint
+        # could raise IntegrityError. Without this guard the callback would
+        # never be answered (endless spinner).
+        try:
+            await db.delete_server(callback_data.server_id)
+        except Exception as e:
+            logger.error("cb_srv_delete failed: %s", e)
+            await callback.answer(f"❌ {str(e)[:80]}", show_alert=True)
+            return
         servers = await db.get_servers()
         await show_view(callback.message, text="✅ Server deleted.", reply_markup=kb_servers(servers))
         await callback.answer("Deleted")
 
     # ====================================================== PLANS
     @router.callback_query(AdminCB.filter(F.action == "plans"))
-    async def cb_plans(callback: CallbackQuery):
+    async def cb_plans(callback: CallbackQuery, state: FSMContext):
+        await state.clear()
         plans = await db.get_plans(active_only=False)
         await show_view(callback.message, text="📦 <b>Plans</b>", reply_markup=kb_admin_plans(plans))
         await callback.answer()
@@ -6521,9 +8051,32 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         await show_view(callback.message, text="📦 <b>Plans</b>", reply_markup=kb_admin_plans(plans))
         await callback.answer()
 
+    @router.callback_query(PlanCB.filter(F.action == "delete_ask"))
+    async def cb_plan_delete_ask(callback: CallbackQuery, callback_data: PlanCB):
+        # H10 — require a confirmation tap before deleting a plan (one-tap
+        # destructive action was too easy to trigger accidentally).
+        plan = await db.get_plan(callback_data.plan_id)
+        if not plan:
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
+            return
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🗑 Confirm Delete", callback_data=PlanCB(action="delete", plan_id=plan["id"]).pack(), style="danger")
+        kb.button(text="🔙 Back", callback_data=PlanCB(action="admin_view", plan_id=plan["id"]).pack(), style="primary")
+        await show_view(callback.message, text=
+            f"🗑 <b>Delete plan {escape_html(plan['name'])}?</b>\n\n"
+            f"Existing accounts on this plan will keep working but lose their plan reference.",
+            reply_markup=kb.as_markup(),
+        )
+        await callback.answer()
+
     @router.callback_query(PlanCB.filter(F.action == "delete"))
     async def cb_plan_delete(callback: CallbackQuery, callback_data: PlanCB):
-        await db.delete_plan(callback_data.plan_id)
+        try:
+            await db.delete_plan(callback_data.plan_id)
+        except Exception as e:
+            logger.error("cb_plan_delete failed: %s", e)
+            await callback.answer(f"❌ {str(e)[:80]}", show_alert=True)
+            return
         plans = await db.get_plans(active_only=False)
         await show_view(callback.message, text="✅ Deleted.", reply_markup=kb_admin_plans(plans))
         await callback.answer()
@@ -6612,8 +8165,27 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             except ValueError:
                 await message.answer("❌ Number please:", reply_markup=kb_cancel("en"))
                 return
+            # M5 — validate known setting keys to prevent misconfiguration
+            # (negative prices/days/GB, absurd backup counts, etc.).
+            key = data.get("key", "")
+            _INT_RANGES = {
+                "trial_days": (0, 365), "trial_gb": (0, 10000), "trial_limit_ip": (0, 100),
+                "referral_bonus_days": (0, 365), "referral_bonus_gb": (0, 10000),
+                "topup_price_per_gb": (0, 10_000_000), "payment_min_amount": (0, 10_000_000),
+                "backup_interval_min": (1, 10080), "backup_keep": (1, 200),
+                "data_retention_days": (1, 3650),
+            }
+            if key in _INT_RANGES:
+                lo, hi = _INT_RANGES[key]
+                if not (lo <= val <= hi):
+                    await state.clear()
+                    await message.answer(
+                        f"❌ {data.get('label', key)} must be between {lo} and {hi}.",
+                        reply_markup=kb_admin_menu(),
+                    )
+                    return
             await state.clear()
-            await db.set_setting(data["key"], str(val))
+            await db.set_setting(key, str(val))
             await message.answer(f"✅ {data.get('label','Setting')} = {val}", reply_markup=kb_admin_menu())
 
         # ---- bot setting (string or JSON list) ----
@@ -6629,9 +8201,14 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
                     await message.answer("❌ Enter comma-separated numbers (e.g. 5, 10, 20).",
                                          reply_markup=kb_admin_menu())
                     return
+                # M4 — reject 0 and negative values. A "-5 GB" topup button
+                # would call bulk_adjust(addBytes=-5*GB) and REDUCE the user's
+                # quota — a money-losing misconfiguration.
+                vals = [v for v in vals if v > 0]
                 if not vals:
                     await state.clear()
-                    await message.answer("❌ No values entered.", reply_markup=kb_admin_menu())
+                    await message.answer("❌ Enter positive numbers only (e.g. 5, 10, 20).",
+                                         reply_markup=kb_admin_menu())
                     return
                 await state.clear()
                 await db.set_setting(key, json.dumps(vals))
@@ -6663,7 +8240,14 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             if not server:
                 await message.answer("❌ Server not found.", reply_markup=kb_admin_menu())
                 return
-            add_bytes = gb * GB if gb > 0 else 0
+            # H2 — preserve unlimited accounts. traffic_gb=0 means UNLIMITED;
+            # adding GB would silently cap it. Keep it 0 and skip the bytes.
+            if account.get("traffic_gb") == 0:
+                new_traffic = 0
+                add_bytes = 0
+            else:
+                new_traffic = (account["traffic_gb"] or 0) + gb
+                add_bytes = gb * GB if gb > 0 else 0
             r = await api.bulk_adjust(server["panel_url"], server["api_token"], [email],
                                       add_days=days, add_bytes=add_bytes)
             if not r.get("success"):
@@ -6672,7 +8256,6 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
             base = account["expiry_time"] if account["expiry_time"] and account["expiry_time"] > now_ms else now_ms
             new_exp = base + days * MS_PER_DAY if days > 0 else account["expiry_time"]
-            new_traffic = (account["traffic_gb"] + gb) if account["traffic_gb"] and gb else (account["traffic_gb"] or gb)
             await db.update_account(email, expiry_time=new_exp, traffic_gb=new_traffic, is_active=True)
             await db.clear_traffic_alerts(email)
             await db.clear_expiry_reminders(email)
@@ -6880,17 +8463,43 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         tg_id, plan_id = int(tg_id_str), int(plan_id_str)
         plan = await db.get_plan(plan_id)
         if not plan:
-            # L12 — admin-facing i18n.
             await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
-        await show_view(callback.message, text="⏳ Creating account...")
+        # LABEL-FIX: ask the admin for an optional account label before
+        # creating the panel client. Previously the label was hardcoded to
+        # "Admin" with no way to customise it.
+        await state.set_state(AdminStates.waiting_for_admin_account_create)
+        await state.update_data(tg_id=tg_id, plan_id=plan_id)
+        await show_view(callback.message,
+            text=(
+                "🏷 <b>Name this account (optional)</b>\n\n"
+                f"👤 User: <code>{tg_id}</code>\n"
+                f"📦 Plan: {escape_html(plan['name'])}\n\n"
+                "Send a short label (max 30 chars) or <code>-</code> for no label:"
+            ),
+            reply_markup=kb_cancel("en"))
+        await callback.answer()
+
+    @router.message(AdminStates.waiting_for_admin_account_create)
+    async def ms_admin_account_create(message: Message, state: FSMContext):
+        data = await state.get_data()
+        await state.clear()
+        tg_id = data["tg_id"]
+        plan_id = data["plan_id"]
+        plan = await db.get_plan(plan_id)
+        if not plan:
+            await message.answer("❌ Plan not found.", reply_markup=kb_admin_menu())
+            return
+        raw_label = (message.text or "").strip()
+        label = "" if raw_label in ("-", "") else raw_label[:30]
+        await message.answer("⏳ Creating account...")
         server = await lb.select_best_server(lb.plan_server_ids(plan) or None)
         if not server:
-            await show_view(callback.message, text="❌ No servers available.", reply_markup=kb_admin_menu())
+            await message.answer("❌ No servers available.", reply_markup=kb_admin_menu())
             return
         inbound_ids = await lb.select_inbounds_for_plan(server, plan)
         if not inbound_ids:
-            await show_view(callback.message, text="❌ No inbounds available.", reply_markup=kb_admin_menu())
+            await message.answer("❌ No inbounds available.", reply_markup=kb_admin_menu())
             return
         email = gen_email(tg_id, "admin")
         expiry = int((datetime.now(timezone.utc) + timedelta(days=plan["duration_days"])).timestamp() * 1000) if plan["duration_days"] > 0 else 0
@@ -6901,27 +8510,27 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             limit_ip=plan.get("limit_ip", 0), tg_id=tg_id, sub_id=sub_id,
         )
         if not res.get("success"):
-            await show_view(callback.message, text=f"❌ {res.get('msg')}", reply_markup=kb_admin_menu())
+            await message.answer(f"❌ {res.get('msg')}", reply_markup=kb_admin_menu())
             return
         await db.add_account(
             user_tg_id=tg_id, server_id=server["id"], email=email, sub_id=sub_id,
             plan_id=plan["id"], traffic_gb=plan["traffic_gb"], expiry_time=expiry,
-            limit_ip=plan.get("limit_ip", 0), inbound_ids=json.dumps(inbound_ids), label="Admin",
+            limit_ip=plan.get("limit_ip", 0), inbound_ids=json.dumps(inbound_ids), label=label,
         )
         await db.add_transaction(tg_id, 0, "admin_adjust", f"Admin created account ({plan['name']})",
-                                 account_email=email, plan_id=plan["id"], admin_id=callback.from_user.id)
+                                 account_email=email, plan_id=plan["id"], admin_id=message.from_user.id)
+        label_line = f"\n🏷 {escape_html(label)}" if label else ""
         await safe_notify(
             bot.send_message(
                 tg_id,
-                f"🎁 <b>Admin created a VPN account for you!</b>\n\n📦 {escape_html(plan['name'])}\n📧 <code>{escape_html(email)}</code>",
+                f"🎁 <b>Admin created a VPN account for you!</b>\n\n📦 {escape_html(plan['name'])}\n📧 <code>{escape_html(email)}</code>{label_line}",
             ),
             context="manual-account-create user notify",
         )
-        await show_view(callback.message, text=
-            f"✅ Account created for <code>{tg_id}</code>\n📧 <code>{escape_html(email)}</code>",
+        await message.answer(
+            f"✅ Account created for <code>{tg_id}</code>\n📧 <code>{escape_html(email)}</code>{label_line}",
             reply_markup=kb_admin_menu(),
         )
-        await callback.answer()
 
     # ---- admin manages a specific user account ------------------------
     @router.callback_query(AdminCB.filter(F.action == "user_account"))
@@ -6976,6 +8585,12 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             return
         server = await db.get_server(account["server_id"])
         r = await api.reset_client_traffic(server["panel_url"], server["api_token"], email)
+        if r.get("success"):
+            # H16 — clear traffic_alerts so the user gets re-warned when they
+            # cross 80%/95% again after the reset. Without this, the alert
+            # rows from before the reset suppress all future warnings.
+            await db.clear_traffic_alerts(email)
+            await db.clear_expiry_reminders(email)
         await callback.answer("✅ Reset" if r.get("success") else f"❌ {r.get('msg')}", show_alert=True)
 
     @router.callback_query(AdminCB.filter(F.action == "acc_disable"))
@@ -6984,9 +8599,18 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         account = await db.get_account(email)
         server = await db.get_server(account["server_id"]) if account else None
         if server:
-            await api.disable_client(server["panel_url"], server["api_token"], email)
-            await db.update_account(email, is_active=False)
-        await callback.answer("✅ Disabled", show_alert=True)
+            # H4 — only update the DB if the panel call succeeded. Without
+            # this guard, a panel failure leaves the DB saying is_active=False
+            # while the user's VPN keeps working — admin sees "✅ Disabled"
+            # but nothing actually changed on the panel.
+            r = await api.disable_client(server["panel_url"], server["api_token"], email)
+            if r.get("success"):
+                await db.update_account(email, is_active=False)
+                await callback.answer("✅ Disabled", show_alert=True)
+            else:
+                await callback.answer(f"❌ {r.get('msg')}", show_alert=True)
+        else:
+            await callback.answer("❌ Server not found", show_alert=True)
 
     @router.callback_query(AdminCB.filter(F.action == "acc_enable"))
     async def cb_acc_enable(callback: CallbackQuery, callback_data: AdminCB):
@@ -6994,9 +8618,14 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         account = await db.get_account(email)
         server = await db.get_server(account["server_id"]) if account else None
         if server:
-            await api.enable_client(server["panel_url"], server["api_token"], email)
-            await db.update_account(email, is_active=True)
-        await callback.answer("✅ Enabled", show_alert=True)
+            r = await api.enable_client(server["panel_url"], server["api_token"], email)
+            if r.get("success"):
+                await db.update_account(email, is_active=True)
+                await callback.answer("✅ Enabled", show_alert=True)
+            else:
+                await callback.answer(f"❌ {r.get('msg')}", show_alert=True)
+        else:
+            await callback.answer("❌ Server not found", show_alert=True)
 
     @router.callback_query(AdminCB.filter(F.action == "acc_delete"))
     async def cb_acc_delete(callback: CallbackQuery, callback_data: AdminCB):
@@ -7004,7 +8633,13 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         account = await db.get_account(email)
         server = await db.get_server(account["server_id"]) if account else None
         if server:
-            await api.delete_client(server["panel_url"], server["api_token"], email)
+            # H4 — only remove the DB row if the panel delete succeeded.
+            # Otherwise the panel client lives on as an orphan the bot can
+            # never manage again.
+            r = await api.delete_client(server["panel_url"], server["api_token"], email)
+            if not r.get("success"):
+                await callback.answer(f"❌ {r.get('msg')}", show_alert=True)
+                return
         await db.delete_account(email)
         await callback.answer("✅ Deleted", show_alert=True)
         # refresh user view
@@ -7015,7 +8650,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     # ====================================================== FINANCE
     @router.callback_query(AdminCB.filter(F.action == "finance"))
-    async def cb_finance(callback: CallbackQuery):
+    async def cb_finance(callback: CallbackQuery, state: FSMContext):
+        await state.clear()
         rev = await db.get_revenue_stats(days=30)
         cur = await _currency()
         rich = rich_tables.finance_rich(rev, cur, fmt_price)
@@ -7024,7 +8660,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     # ====================================================== PROMOS
     @router.callback_query(AdminCB.filter(F.action == "promos"))
-    async def cb_promos(callback: CallbackQuery):
+    async def cb_promos(callback: CallbackQuery, state: FSMContext):
+        await state.clear()
         promos = await db.get_promo_codes()
         cur = await _currency()
         kb = InlineKeyboardBuilder()
@@ -7062,6 +8699,11 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         except ValueError:
             await message.answer("❌ Number:", reply_markup=kb_cancel("en"))
             return
+        # M3 — discount must be 0-100. >100 gives free plan + credit; <0
+        # makes the user pay more than the plan price.
+        if not 0 <= d <= 100:
+            await message.answer("❌ Discount must be between 0 and 100:", reply_markup=kb_cancel("en"))
+            return
         await state.update_data(disc=d)
         await state.set_state(AdminStates.waiting_for_promo_max_uses)
         await message.answer("🔢 Max uses (0 = unlimited):", reply_markup=kb_cancel("en"))
@@ -7083,7 +8725,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     # ====================================================== GIFT CODES
     @router.callback_query(AdminCB.filter(F.action == "gift_codes"))
-    async def cb_gift_codes(callback: CallbackQuery):
+    async def cb_gift_codes(callback: CallbackQuery, state: FSMContext):
+        await state.clear()
         gifts = await db.get_gift_codes(unused_only=False)
         kb = InlineKeyboardBuilder()
         kb.button(text="➕ Gift (Balance)", callback_data=AdminCB(action="create_gift_balance").pack(), style="success")
@@ -7156,7 +8799,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     # ====================================================== TICKETS
     @router.callback_query(AdminCB.filter(F.action == "tickets"))
-    async def cb_tickets(callback: CallbackQuery, callback_data: AdminCB):
+    async def cb_tickets(callback: CallbackQuery, callback_data: AdminCB, state: FSMContext):
+        await state.clear()
         # L4 — callback_data is required because the @router decorator above
         # uses ``AdminCB.filter(F.action == "tickets")``: aiogram will only
         # route to this handler when the filter matches, and in that case
@@ -7242,7 +8886,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     # ====================================================== BROADCAST
     @router.callback_query(AdminCB.filter(F.action == "broadcast"))
-    async def cb_broadcast(callback: CallbackQuery):
+    async def cb_broadcast(callback: CallbackQuery, state: FSMContext):
+        await state.clear()
         await show_view(callback.message, text="📣 <b>Broadcast</b> — choose target:",
                                          reply_markup=kb_broadcast_targets())
         await callback.answer()
@@ -7261,6 +8906,18 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     @router.message(AdminStates.waiting_for_broadcast_message)
     async def ms_broadcast(message: Message, state: FSMContext):
         text = (message.text or "").strip()[:BROADCAST_MAX_TEXT_CHARS]
+        # BROADCAST-EMPTY-GUARD: if the admin sent a photo / sticker / voice /
+        # animation (or genuinely empty text), message.text is None → text="".
+        # Without this guard the broadcast loop would send just the localized
+        # header to every user in the target group. Reject it up front and
+        # keep the FSM state so the admin can retry (or hit Cancel).
+        if not text:
+            await message.answer(
+                "❌ Empty broadcast — send the message as <b>text / HTML</b> "
+                "(photos and stickers can't be broadcast).",
+                reply_markup=kb_cancel("en"),
+            )
+            return
         data = await state.get_data()
         target = data.get("target", "all")
         await state.clear()
@@ -7287,7 +8944,13 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
                 await asyncio.sleep(BROADCAST_THROTTLE_SECONDS)
             except TelegramForbiddenError:
                 # User blocked the bot — expected, count as failed silently.
+                # M19 — flag the user so they're excluded from future
+                # broadcasts instead of being retried every cycle.
                 failed += 1
+                try:
+                    await db.mark_user_blocked(uid)
+                except Exception:
+                    pass
             except TelegramBadRequest:
                 failed += 1
             except Exception as e:
@@ -7313,7 +8976,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     # ====================================================== CLEANUP
     @router.callback_query(AdminCB.filter(F.action == "cleanup"))
-    async def cb_cleanup(callback: CallbackQuery):
+    async def cb_cleanup(callback: CallbackQuery, state: FSMContext):
+        await state.clear()
         kb = InlineKeyboardBuilder()
         kb.button(text="🧹 Delete depleted (all servers)", callback_data=AdminCB(action="cleanup_depleted").pack(), style="danger")
         kb.button(text="🧹 Sync client counts", callback_data=AdminCB(action="cleanup_sync_counts").pack(), style="primary")
@@ -7343,7 +9007,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     # ====================================================== SETTINGS
     @router.callback_query(AdminCB.filter(F.action == "settings"))
-    async def cb_settings(callback: CallbackQuery):
+    async def cb_settings(callback: CallbackQuery, state: FSMContext):
+        await state.clear()
         cur = await _currency()
         trial_en = await db.get_setting_int("trial_enabled", 0)
         ref_en = await db.get_setting_int("referral_enabled", 1)
@@ -7366,14 +9031,87 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         kb.button(text="💳 Payment", callback_data=SettingsCatCB(category="payment").pack(), style="primary")
         kb.button(text="📢 Force Join", callback_data=SettingsCatCB(category="force_join").pack(), style="primary")
         kb.button(text="➕ Topup", callback_data=SettingsCatCB(category="topup").pack(), style="primary")
-        kb.button(text="📚 Help Text", callback_data=SettingsCatCB(category="help_text").pack(), style="primary")
+        kb.button(text="📚 Guides", callback_data=SettingsCatCB(category="guides").pack(), style="primary")
+        kb.button(text="💾 Backup", callback_data=SettingsCatCB(category="backup").pack(), style="primary")
         kb.button(style="primary", text="💵 Currency", callback_data=AdminCB(action="set_currency").pack())
         kb.button(style="primary", text="👥 Payment Admins", callback_data=AdminCB(action="payment_admins").pack())
         kb.button(text="🔄 Refresh servers", callback_data=AdminCB(action="refresh_servers").pack(), style="primary")
-        kb.button(style="primary", text="💾 DB Backup", callback_data=AdminCB(action="db_backup").pack())
         kb.button(text="🔙 Admin", callback_data=AdminCB(action="main").pack(), style="danger")
         kb.adjust(2, 2, 2, 2, 2, 1)
         await show_view(callback.message, rich=rich, reply_markup=kb.as_markup())
+        await callback.answer()
+
+    # ---- Backup settings (BACKUP-CFG) ----
+    @router.callback_query(SettingsCatCB.filter(F.category == "backup"))
+    async def cb_settings_backup(callback: CallbackQuery):
+        bk_en = await db.get_setting_int("backup_enabled", 0)
+        bk_interval = await db.get_setting_int("backup_interval_minutes", 1440)
+        bk_keep = await db.get_setting_int("backup_keep", 3)
+        # Human-friendly interval display.
+        if bk_interval < 60:
+            interval_disp = f"{bk_interval} min"
+        elif bk_interval < 1440:
+            interval_disp = f"{bk_interval // 60}h {bk_interval % 60}m" if bk_interval % 60 else f"{bk_interval // 60}h"
+        else:
+            days = bk_interval / 1440
+            interval_disp = f"{days:.1f} days" if days != int(days) else f"{int(days)} days"
+        rich = rich_tables.rich_message(
+            rich_tables.heading("💾 Auto DB Backup"),
+            rich_tables.kv_table([
+                ("Enabled", "✅" if bk_en else "❌"),
+                ("Interval", interval_disp),
+                ("Keep on disk", f"{bk_keep} copies"),
+                ("Manual", "Tap DB Backup below"),
+            ]),
+            rich_tables.paragraph(
+                "The backup is sent to the main admin as a Telegram document. "
+                "The SQLite Online Backup API is used so the live bot is not interrupted."
+            ),
+        )
+        kb = InlineKeyboardBuilder()
+        kb.button(style="primary", text=f"{'✅' if bk_en else '❌'} Toggle",
+                  callback_data=AdminCB(action="toggle_backup").pack())
+        kb.button(style="primary", text="⏱ Interval (min)",
+                  callback_data=AdminCB(action="set_backup_interval").pack())
+        kb.button(style="primary", text="📦 Keep count",
+                  callback_data=AdminCB(action="set_backup_keep").pack())
+        kb.button(style="success", text="💾 Backup Now",
+                  callback_data=AdminCB(action="db_backup").pack())
+        kb.button(text="🔙 Settings", callback_data=AdminCB(action="settings").pack(), style="danger")
+        kb.adjust(2, 2, 1, 1)
+        await show_view(callback.message, rich=rich, reply_markup=kb.as_markup())
+        await callback.answer()
+
+    @router.callback_query(AdminCB.filter(F.action == "toggle_backup"))
+    async def cb_toggle_backup(callback: CallbackQuery):
+        cur = await db.get_setting_int("backup_enabled", 0)
+        await db.set_setting("backup_enabled", "0" if cur else "1")
+        await callback.answer(f"Auto backup {'enabled' if not cur else 'disabled'}", show_alert=True)
+        await cb_settings(callback)
+
+    @router.callback_query(AdminCB.filter(F.action == "set_backup_interval"))
+    async def cb_set_backup_interval(callback: CallbackQuery, state: FSMContext):
+        await state.set_state(AdminStates.setting_edit_value)
+        await state.update_data(edit_type="setting_int", key="backup_interval_minutes",
+                                label="Backup interval (minutes)")
+        cur = await db.get_setting_int("backup_interval_minutes", 1440)
+        await show_view(callback.message,
+            text=f"⏱ <b>Backup interval</b>\n\nEnter the interval in <b>minutes</b>:\n\n"
+                 f"Current: {cur} min ({cur // 60}h)\n\n"
+                 f"Examples: 60 = hourly, 360 = every 6h, 1440 = daily, 10080 = weekly",
+            reply_markup=kb_cancel("en"))
+        await callback.answer()
+
+    @router.callback_query(AdminCB.filter(F.action == "set_backup_keep"))
+    async def cb_set_backup_keep(callback: CallbackQuery, state: FSMContext):
+        await state.set_state(AdminStates.setting_edit_value)
+        await state.update_data(edit_type="setting_int", key="backup_keep",
+                                label="Backup keep count")
+        cur = await db.get_setting_int("backup_keep", 3)
+        await show_view(callback.message,
+            text=f"📦 <b>Backup retention</b>\n\nHow many on-disk snapshots to keep?\n\n"
+                 f"Current: {cur}\n\nOlder snapshots are automatically deleted.",
+            reply_markup=kb_cancel("en"))
         await callback.answer()
 
     # ---- Settings Category Pages ----
@@ -7421,7 +9159,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     # settings page; called by both cb_settings_payment and cb_toggle_payment.
     async def _render_settings_payment_view(message: Message):
         pay_en = await db.get_setting_int("payment_enabled", 0)
-        card = await db.get_setting("payment_card_number", "-")
+        card = ltr(await db.get_setting("payment_card_number", "-"))
         holder = await db.get_setting("payment_card_holder", "-")
         min_amt = await db.get_setting_int("payment_min_amount", DEFAULT_PAYMENT_MIN_AMOUNT)
         rich = rich_tables.payment_settings_rich(pay_en, card, holder, min_amt)
@@ -7476,20 +9214,39 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         await show_view(callback.message, rich=rich, reply_markup=kb.as_markup())
         await callback.answer()
 
-    @router.callback_query(SettingsCatCB.filter(F.category == "help_text"))
-    async def cb_settings_help_text(callback: CallbackQuery):
-        en_help = await db.get_setting("help_text_en") or "(default)"
-        fa_help = await db.get_setting("help_text_fa") or "(default)"
+    @router.callback_query(SettingsCatCB.filter(F.category == "guides"))
+    async def cb_settings_guides(callback: CallbackQuery):
+        """GUIDES: dual guides (usage + connection), each editable per language.
+
+        Replaces the old single help_text category. The admin sees a preview
+        of each guide's first line and can edit any of the 4 fields. Empty
+        values fall back to the rich DEFAULT_GUIDE_* constants.
+        """
+        usage_en = await db.get_setting("guide_usage_en", "")
+        usage_fa = await db.get_setting("guide_usage_fa", "")
+        conn_en = await db.get_setting("guide_connection_en", "")
+        conn_fa = await db.get_setting("guide_connection_fa", "")
+
+        def _preview(val: str, fallback: str) -> str:
+            v = (val if val and val.strip() else fallback)
+            v = v.replace("\n", " ").strip()
+            return escape_html(v[:80] + ("…" if len(v) > 80 else ""))
+
         text = (
-            "📚 <b>Help Text Settings</b>\n\n"
-            f"<b>🇬🇧 English:</b>\n<i>{escape_html(en_help[:100])}...</i>\n\n"
-            f"<b>🇮🇷 فارسی:</b>\n<i>{escape_html(fa_help[:100])}...</i>"
+            "📚 <b>Guide Settings</b>\n\n"
+            "Two guides, each editable in English and Farsi. Leave empty to use the built-in default.\n\n"
+            f"📖 <b>Usage — EN:</b>\n<i>{_preview(usage_en, DEFAULT_GUIDE_USAGE_EN)}</i>\n\n"
+            f"📖 <b>Usage — FA:</b>\n<i>{_preview(usage_fa, DEFAULT_GUIDE_USAGE_FA)}</i>\n\n"
+            f"🔌 <b>Connection — EN:</b>\n<i>{_preview(conn_en, DEFAULT_GUIDE_CONNECTION_EN)}</i>\n\n"
+            f"🔌 <b>Connection — FA:</b>\n<i>{_preview(conn_fa, DEFAULT_GUIDE_CONNECTION_FA)}</i>"
         )
         kb = InlineKeyboardBuilder()
-        kb.button(style="primary", text="🇬🇧 Edit English", callback_data=AdminCB(action="edit_help_en").pack())
-        kb.button(style="primary", text="🇮🇷 Edit فارسی", callback_data=AdminCB(action="edit_help_fa").pack())
+        kb.button(style="primary", text="📖 Usage 🇬🇧", callback_data=AdminCB(action="edit_guide_usage_en").pack())
+        kb.button(style="primary", text="📖 Usage 🇮🇷", callback_data=AdminCB(action="edit_guide_usage_fa").pack())
+        kb.button(style="primary", text="🔌 Connection 🇬🇧", callback_data=AdminCB(action="edit_guide_conn_en").pack())
+        kb.button(style="primary", text="🔌 Connection 🇮🇷", callback_data=AdminCB(action="edit_guide_conn_fa").pack())
         kb.button(text="🔙 Settings", callback_data=AdminCB(action="settings").pack(), style="danger")
-        kb.adjust(2, 1)
+        kb.adjust(2, 2, 1)
         await show_view(callback.message, text=text, reply_markup=kb.as_markup())
         await callback.answer()
 
@@ -7641,12 +9398,34 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.callback_query(AdminCB.filter(F.action == "db_backup"))
     async def cb_db_backup(callback: CallbackQuery):
+        # H15 — use the SQLite Online Backup API (same as task_db_backup)
+        # instead of reading the live DB file directly. A raw file copy races
+        # with WAL checkpointing and can produce a corrupt snapshot.
+        import tempfile
+        tmp_path = None
         try:
-            db_file = FSInputFile(DATABASE_PATH)
-            await bot.send_document(callback.from_user.id, db_file, caption="💾 Database backup")
+            ts = datetime.now(TEHRAN_TZ).strftime("%Y%m%dT%H%M%SZ")
+            fd, tmp_path = tempfile.mkstemp(prefix="bot_backup_", suffix=f"_{ts}.db")
+            os.close(fd)
+            async with aiosqlite.connect(tmp_path) as dst:
+                await db._db.backup(dst)
+            size = os.path.getsize(tmp_path)
+            logger.info("manual db_backup: snapshot written to %s (%d bytes)", tmp_path, size)
+            await bot.send_document(callback.from_user.id,
+                                    FSInputFile(tmp_path, filename="bot.db"),
+                                    caption=f"💾 <b>Database backup</b>\n📦 {size:,} bytes\n🕒 {ts}",
+                                    parse_mode="HTML")
             await callback.answer("✅ Sent to your PM", show_alert=True)
         except Exception as e:
+            logger.error("manual db_backup failed: %s", e, exc_info=True)
             await callback.answer(f"❌ {str(e)[:50]}", show_alert=True)
+        finally:
+            if tmp_path:
+                try:
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     # ====================================================== IMPORT FROM PANEL (MIGRATE-1)
     # In-memory cache of the last-fetched panel client list per admin, so
@@ -8069,9 +9848,13 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         for p in payments:
             user = await db.get_user(p["user_tg_id"])
             uname = escape_html(user.get("first_name") or user.get("username") or str(p["user_tg_id"]))
-            text += f"• #{p['id']} — {uname}: {fmt_num(p['unique_amount'], 'fa')} تومان\n"
+            # M13 — use a consistent number format for both the text line and
+            # the button label so the admin doesn't see Persian digits in one
+            # place and Western digits in another for the same amount.
+            amt_en = fmt_num(p['unique_amount'], 'en')
+            text += f"• #{p['id']} — {uname}: {amt_en} Toman\n"
             kb.button(style="primary", 
-                text=f"#{p['id']} {uname[:15]} — {int(p['unique_amount'])}T",
+                text=f"#{p['id']} {uname[:15]} — {amt_en}T",
                 callback_data=PaymentCB(action="view", payment_id=p["id"]).pack(),
             )
         kb.button(text="🔙 Admin", callback_data=AdminCB(action="main").pack(), style="danger")
@@ -8091,7 +9874,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         text += f"👤 User: {uname} ({payment['user_tg_id']})\n"
         text += f"💵 Base amount: {int(payment['amount'])} Toman\n"
         text += f"💵 Unique amount: {int(payment['unique_amount'])} Toman\n"
-        text += f"💳 Card: {escape_html(payment.get('card_number') or '-')}\n"
+        text += f"💳 Card: {ltr(escape_html(payment.get('card_number') or '-'))}\n"
         text += f"📅 Created: {fmt_iso(payment.get('created_at'), '%Y-%m-%d %H:%M:%S') or '-'}\n"
         if payment.get("receipt_text"):
             text += f"📝 Receipt: {escape_html(payment['receipt_text'][:200])}\n"
@@ -8141,33 +9924,88 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         # C1 — atomic approve: only one admin can perform the pending→approved
         # transition. If two admins click simultaneously, the second call to
         # approve_payment returns False and we abort before double-crediting.
-        ok = await db.approve_payment(payment["id"], callback.from_user.id)
-        if not ok:
+        # M1 — wrap approve+credit+log in a single transaction so a failure
+        # mid-flow doesn't leave the payment marked approved but the user
+        # uncredited (an unrecoverable state — the payment can't be re-approved).
+        try:
+            async with db.transaction():
+                ok = await db.approve_payment(payment["id"], callback.from_user.id)
+                if not ok:
+                    raise RuntimeError("already_processed")
+                await db.update_user_balance(payment["user_tg_id"], payment["amount"], add=True)
+                await db.add_transaction(
+                    user_tg_id=payment["user_tg_id"], amount=payment["amount"], type_="deposit",
+                    description=f"Card payment #{payment['id']}", admin_id=callback.from_user.id,
+                )
+        except RuntimeError:
             await callback.answer(t("already_processed", await admin_lang(callback.from_user.id)), show_alert=True)
             return
-        await db.update_user_balance(payment["user_tg_id"], payment["amount"], add=True)
-        await db.add_transaction(
-            user_tg_id=payment["user_tg_id"], amount=payment["amount"], type_="deposit",
-            description=f"Card payment #{payment['id']}", admin_id=callback.from_user.id,
-        )
+        except Exception as e:
+            logger.error("payment approve transaction failed for #%s: %s", payment['id'], e, exc_info=True)
+            await callback.answer(f"❌ Approve failed: {str(e)[:60]}", show_alert=True)
+            return
         # Notify user
         user = await db.get_user(payment["user_tg_id"])
         lang = L((user or {}).get("language", DEFAULT_LANGUAGE))
         currency = await _currency()
         balance = (user or {}).get("balance", 0)
+        # SHORTFALL-REQUEST: if this payment was a shortfall-for-plan, the
+        # user wanted to buy a specific plan but couldn't afford it. Now
+        # that their balance is topped up, send them a one-tap "Buy Now"
+        # button for that plan instead of the generic "payment approved"
+        # message. This is the "redirect to purchase flow" the user asked
+        # for — they don't have to navigate back to the plan list.
+        resume_plan_id = payment.get("resume_plan_id") if isinstance(payment, dict) else None
+        if resume_plan_id:
+            plan = await db.get_plan(resume_plan_id)
+        else:
+            plan = None
         try:
-            await bot.send_message(
-                payment["user_tg_id"],
-                t("payment_approved", lang, amount=fmt_price(payment["amount"], lang, currency), balance=fmt_price(balance, lang, currency)),
-            )
+            if plan:
+                plan_name = escape_html(plan["name"])
+                plan_price = fmt_price(plan["price"], lang, currency)
+                if lang == "fa":
+                    user_msg = (
+                        f"✅ پرداختت تأیید شد و موجودیت شارژ شد!\n\n"
+                        f"💰 موجودی فعلی: <b>{fmt_price(balance, lang, currency)}</b>\n\n"
+                        f"🎯 حالا می‌تونی پلن «<b>{plan_name}</b>» (با قیمت {plan_price}) رو که می‌خواستی بخری. "
+                        f"روی دکمهٔ زیر بزن تا بری به صفحهٔ خرید:"
+                    )
+                else:
+                    user_msg = (
+                        f"✅ Your payment was approved and your balance is topped up!\n\n"
+                        f"💰 Current balance: <b>{fmt_price(balance, lang, currency)}</b>\n\n"
+                        f"🎯 You can now buy the \"<b>{plan_name}</b>\" plan ({plan_price}) you wanted. "
+                        f"Tap the button below to go to the purchase page:"
+                    )
+                resume_kb = InlineKeyboardBuilder()
+                resume_kb.button(style="success",
+                                 text=(f"🛒 خرید {plan['name']}" if lang == "fa" else f"🛒 Buy {plan['name']}"),
+                                 callback_data=BuyCB(action="start", plan_id=plan["id"], step="resume").pack())
+                resume_kb.button(text=(t("back_menu", lang)),
+                                 callback_data=MenuCB(action="main").pack(), style="danger")
+                resume_kb.adjust(1, 1)
+                await bot.send_message(
+                    payment["user_tg_id"], user_msg,
+                    reply_markup=resume_kb.as_markup(),
+                )
+            else:
+                await bot.send_message(
+                    payment["user_tg_id"],
+                    t("payment_approved", lang, amount=fmt_price(payment["amount"], lang, currency), balance=fmt_price(balance, lang, currency)),
+                )
         except TelegramBadRequest:
             pass
         except Exception as e:
             logger.warning("approve notify failed: %s", e)
+        # M14 — show the right menu: full admins see the full admin menu,
+        # payment-only admins see the payment-admin menu (otherwise they see
+        # buttons they can't use → "Access denied" alerts).
+        _admin_menu = kb_admin_menu if await _is_full_admin(callback.from_user.id) else kb_payment_admin_menu
         await show_view(callback.message, text=
             f"✅ <b>Payment #{payment['id']} approved</b>\n"
             f"💰 {int(payment['amount'])} Toman added to user {payment['user_tg_id']}",
-            reply_markup=kb_admin_menu(),
+            reply_markup=_admin_menu(),
         )
         await callback.answer("✅ Approved")
 
@@ -8175,7 +10013,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_payment_reject_ask(callback: CallbackQuery, callback_data: PaymentCB, state: FSMContext):
         await state.set_state(AdminStates.waiting_for_reject_reason)
         await state.update_data(payment_id=callback_data.payment_id)
-        await show_view(callback.message, text=t("enter_reject_reason", "en"), reply_markup=kb_cancel("en"))
+        alang = await admin_lang(callback.from_user.id)
+        await show_view(callback.message, text=t("enter_reject_reason", alang), reply_markup=kb_cancel(alang))
         await callback.answer()
 
     @router.message(AdminStates.waiting_for_reject_reason)
@@ -8207,9 +10046,11 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             pass
         except Exception as e:
             logger.warning("reject notify failed: %s", e)
+        # M14 — branch on admin type for the menu.
+        _admin_menu = kb_admin_menu if await _is_full_admin(message.from_user.id) else kb_payment_admin_menu
         await message.answer(
             f"❌ <b>Payment #{payment['id']} rejected</b>",
-            reply_markup=kb_admin_menu(),
+            reply_markup=_admin_menu(),
         )
 
     # ---- Force join settings handlers ----
@@ -8312,28 +10153,43 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         # handler. Switching to the helper avoids the double-answer.)
         await _render_settings_force_join_view(callback.message)
 
-    # ---- Help text settings handlers ----
-    @router.callback_query(AdminCB.filter(F.action == "edit_help_en"))
-    async def cb_edit_help_en(callback: CallbackQuery, state: FSMContext):
+    # ---- Guide settings handlers (GUIDES) — replaces old edit_help_en/fa.
+    # Four editable fields: guide_usage_en, guide_usage_fa,
+    # guide_connection_en, guide_connection_fa. Sending "-" clears the field
+    # so the default is used again.
+    async def _start_guide_edit(callback: CallbackQuery, state: FSMContext,
+                                 key: str, label: str, fallback: str, lang_name: str):
         await state.set_state(AdminStates.setting_edit_value)
-        await state.update_data(edit_type="setting_str", key="help_text_en", label="Help text (English)")
-        current = await db.get_setting("help_text_en") or t("help_text", "en")
+        await state.update_data(edit_type="setting_str", key=key, label=label)
+        current = await db.get_setting(key, "")
+        preview = current if (current and current.strip()) else fallback
         await show_view(callback.message, text=
-            f"📚 <b>Edit English help text</b>\n\nCurrent:\n<i>{escape_html(current[:200])}...</i>\n\nSend new help text:",
-            reply_markup=kb_cancel("en"),
+            f"📝 <b>Edit {label}</b>\n\n"
+            f"Current (or default):\n<i>{escape_html(preview[:300])}{'…' if len(preview) > 300 else ''}</i>\n\n"
+            f"Send the new text, or <code>-</code> to clear (use built-in default):",
+            reply_markup=kb_cancel(lang_name),
         )
         await callback.answer()
 
-    @router.callback_query(AdminCB.filter(F.action == "edit_help_fa"))
-    async def cb_edit_help_fa(callback: CallbackQuery, state: FSMContext):
-        await state.set_state(AdminStates.setting_edit_value)
-        await state.update_data(edit_type="setting_str", key="help_text_fa", label="Help text (Farsi)")
-        current = await db.get_setting("help_text_fa") or t("help_text", "fa")
-        await show_view(callback.message, text=
-            f"📚 <b>Edit Persian help text</b>\n\nCurrent:\n<i>{escape_html(current[:200])}...</i>\n\nSend new help text:",
-            reply_markup=kb_cancel("fa"),
-        )
-        await callback.answer()
+    @router.callback_query(AdminCB.filter(F.action == "edit_guide_usage_en"))
+    async def cb_edit_guide_usage_en(callback: CallbackQuery, state: FSMContext):
+        await _start_guide_edit(callback, state, "guide_usage_en",
+                                "Usage guide (English)", DEFAULT_GUIDE_USAGE_EN, "en")
+
+    @router.callback_query(AdminCB.filter(F.action == "edit_guide_usage_fa"))
+    async def cb_edit_guide_usage_fa(callback: CallbackQuery, state: FSMContext):
+        await _start_guide_edit(callback, state, "guide_usage_fa",
+                                "Usage guide (Farsi)", DEFAULT_GUIDE_USAGE_FA, "fa")
+
+    @router.callback_query(AdminCB.filter(F.action == "edit_guide_conn_en"))
+    async def cb_edit_guide_conn_en(callback: CallbackQuery, state: FSMContext):
+        await _start_guide_edit(callback, state, "guide_connection_en",
+                                "Connection guide (English)", DEFAULT_GUIDE_CONNECTION_EN, "en")
+
+    @router.callback_query(AdminCB.filter(F.action == "edit_guide_conn_fa"))
+    async def cb_edit_guide_conn_fa(callback: CallbackQuery, state: FSMContext):
+        await _start_guide_edit(callback, state, "guide_connection_fa",
+                                "Connection guide (Farsi)", DEFAULT_GUIDE_CONNECTION_FA, "fa")
 
     # ---- Topup packages settings handler ----
     @router.callback_query(AdminCB.filter(F.action == "set_topup_packages"))
@@ -8370,6 +10226,11 @@ async def task_expiry_checker(bot: Bot, db: Database, api: PanelAPI):
     logger.info("Background task started: expiry_checker")
     while True:
         try:
+            # M15 — batch-fetch all user languages ONCE per cycle instead of
+            # N+1 (one get_user per expiring account). With 1000 expiring
+            # accounts this cut from 1000 SELECTs to 1.
+            all_active = await db.get_all_active_accounts()
+            expiring_tg_ids = {acc["user_tg_id"] for acc in all_active}
             for days in EXPIRY_REMINDER_DAYS:
                 for acc in await db.get_expiring_accounts(days):
                     if await db.has_expiry_reminder(acc["email"], days):
@@ -8403,14 +10264,18 @@ async def task_expiry_checker(bot: Bot, db: Database, api: PanelAPI):
 
             # Auto-disable fully expired accounts
             now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-            for acc in await db.get_all_active_accounts():
+            # M15 — reuse the already-fetched all_active list + batch languages.
+            expired_tg_ids = {acc["user_tg_id"] for acc in all_active
+                              if acc["expiry_time"] > 0 and acc["expiry_time"] < now_ms}
+            if expired_tg_ids:
+                exp_langs = await db.get_user_languages_by_ids(list(expired_tg_ids))
+            for acc in all_active:
                 if acc["expiry_time"] > 0 and acc["expiry_time"] < now_ms:
                     server = await db.get_server(acc["server_id"])
                     if server:
                         await api.disable_client(server["panel_url"], server["api_token"], acc["email"])
                     await db.update_account(acc["email"], is_active=False)
-                    user = await db.get_user(acc["user_tg_id"])
-                    lang = L((user or {}).get("language", DEFAULT_LANGUAGE))
+                    lang = L(exp_langs.get(acc["user_tg_id"], DEFAULT_LANGUAGE))
                     logger.info("Auto-disabled expired: %s", acc["email"])
                     try:
                         kb = InlineKeyboardBuilder()
@@ -8450,10 +10315,12 @@ async def task_traffic_alerts(bot: Bot, db: Database, api: PanelAPI):
     """
     logger.info("Background task started: traffic_alerts")
 
-    async def _check_account(acc: dict, server: dict):
+    async def _check_account(acc: dict, server: dict, lang: str):
         """Per-account traffic check + alert + auto-disable. Bounded by the
         semaphore so panel API calls (get_client_traffic, disable_client)
-        stay under PANEL_API_SEMAPHORE concurrency."""
+        stay under PANEL_API_SEMAPHORE concurrency.
+        M16 — lang is passed in (batch-fetched once per cycle) instead of
+        calling db.get_user per account (N+1 query fix)."""
         async with PANEL_API_SEMAPHORE:
             traffic = await api.get_client_traffic(server["panel_url"], server["api_token"], acc["email"])
             if not traffic:
@@ -8463,8 +10330,6 @@ async def task_traffic_alerts(bot: Bot, db: Database, api: PanelAPI):
             if total <= 0:
                 return
             pct = (used / total) * 100
-            user = await db.get_user(acc["user_tg_id"])
-            lang = L((user or {}).get("language", DEFAULT_LANGUAGE))
             for threshold in (TRAFFIC_ALERT_THRESHOLD_1, TRAFFIC_ALERT_THRESHOLD_2):
                 if pct >= threshold and not await db.has_traffic_alert(acc["email"], threshold):
                     try:
@@ -8514,14 +10379,14 @@ async def task_traffic_alerts(bot: Bot, db: Database, api: PanelAPI):
                 except Exception as e:
                     logger.warning("traffic-depleted notify failed: %s", e, exc_info=True)
 
-    async def _process_server(srv: dict, accounts: List[dict]):
+    async def _process_server(srv: dict, accounts: List[dict], langs: Dict[int, str]):
         """Fan out per-account checks for one server. Per-account coroutines
         acquire PANEL_API_SEMAPHORE individually so a busy server with many
         accounts cannot starve other servers."""
         if not accounts:
             return
         results = await asyncio.gather(
-            *(_check_account(acc, srv) for acc in accounts),
+            *(_check_account(acc, srv, L(langs.get(acc["user_tg_id"], DEFAULT_LANGUAGE))) for acc in accounts),
             return_exceptions=True,
         )
         for r in results:
@@ -8533,13 +10398,17 @@ async def task_traffic_alerts(bot: Bot, db: Database, api: PanelAPI):
         try:
             servers = await db.get_servers(active_only=True)
             accounts = await db.get_all_active_accounts()
+            # M16 — batch-fetch all user languages in ONE query instead of
+            # N+1 (one get_user per account per cycle).
+            tg_ids = list({acc["user_tg_id"] for acc in accounts})
+            langs = await db.get_user_languages_by_ids(tg_ids) if tg_ids else {}
             # Group accounts by server_id so each _process_server coroutine
             # handles only its own accounts (avoids N redundant get_server calls).
             by_srv: Dict[int, List[dict]] = {}
             for acc in accounts:
                 by_srv.setdefault(acc["server_id"], []).append(acc)
             server_results = await asyncio.gather(
-                *(_process_server(srv, by_srv.get(srv["id"], [])) for srv in servers),
+                *(_process_server(srv, by_srv.get(srv["id"], []), langs) for srv in servers),
                 return_exceptions=True,
             )
             for r in server_results:
@@ -8657,84 +10526,121 @@ async def task_data_retention(bot: Bot, db: Database):
 
 
 async def task_db_backup(bot: Bot, db: Database):
-    """Every 24h: take a consistent snapshot of the SQLite DB and ship it to
-    every admin as a Telegram document (L10).
+    """Auto DB backup — cadence configurable from the bot (BACKUP-CFG).
 
-    Why ``VACUUM INTO`` instead of copying the file:
-      SQLite's ``VACUUM INTO`` produces a transactionally-consistent snapshot
-      without taking a write lock on the source DB. The live bot keeps serving
-      requests while the snapshot is taken. File-level ``cp bot.db bot.db.bak``
-      would race with concurrent writes and could yield a corrupt backup.
+    Settings (in the settings table, editable from Settings → Backup):
+      backup_enabled          — 0/1, master toggle
+      backup_interval_minutes — how often to back up (default 1440 = 24h)
+      backup_keep             — on-disk retention count (default 3)
 
-    Retention:
-      Only the latest ``DB_BACKUP_KEEP`` (default 3) on-disk snapshots are
-      kept; older ones are unlinked. Telegram itself stores the full history
-      of sent documents in the admin PMs, so the on-disk rotation does not
-      lose data — it just keeps the working directory small.
+    Why the SQLite Online Backup API instead of VACUUM INTO or a file copy:
+      ``aiosqlite.Connection.backup()`` wraps sqlite3's online backup API,
+      which copies a transactionally-consistent snapshot into a fresh file
+      without taking a write lock on the source DB and without failing when
+      the shared connection has an open transaction. (``VACUUM INTO`` issued
+      on the shared bot connection raises "cannot VACUUM - SQL statements in
+      progress" whenever another handler has an active statement, because
+      VACUUM cannot run alongside any other work on the same connection.)
+      File-level ``cp bot.db bot.db.bak`` would race with concurrent writes
+      and could yield a corrupt backup.
+
+    The sleep interval is re-read from settings each cycle, so the admin can
+    change the cadence (e.g. from 24h to 1h) without restarting the bot. We
+    also poll every 60s so a newly-enabled backup starts within a minute
+    rather than waiting for the full old interval to elapse.
     """
-    keep = int(os.getenv("DB_BACKUP_KEEP", "3"))
-    logger.info("Background task started: db_backup (keep=%d)", keep)
+    logger.info("Background task started: db_backup (configurable)")
     while True:
+        # H11 — initialise these BEFORE the try block so the except handler
+        # can reference them safely even if the first iteration raises before
+        # they're assigned (e.g. DB unavailable at startup).
         backup_path = None
+        interval_sec = 60
         try:
+            enabled = await db.get_setting_int("backup_enabled", 0)
+            interval_min = await db.get_setting_int("backup_interval_minutes", 1440)
+            keep = await db.get_setting_int("backup_keep",
+                                             int(os.getenv("DB_BACKUP_KEEP", "3")))
+            # Clamp interval to a sane range: 1 minute minimum, 30 days max.
+            interval_min = max(1, min(interval_min, 30 * 24 * 60))
+            interval_sec = interval_min * 60
+            if not enabled:
+                # Poll every 60s so we notice when the admin enables it.
+                await asyncio.sleep(60)
+                continue
             ts = datetime.now(TEHRAN_TZ).strftime("%Y%m%dT%H%M%SZ")
+            # The Online Backup API writes to a timestamped path so we never
+            # overwrite the live bot.db. When sending via Telegram we rename
+            # the file to "bot.db" (per user request — they want the original
+            # filename, not the ".bak.<ts>" form).
             backup_path = f"{DATABASE_PATH}.bak.{ts}"
-            # VACUUM INTO writes a fresh DB file with all the live data,
-            # transactionally consistent as of the moment the command runs.
-            # We reuse the live connection so the snapshot reflects a single
-            # point-in-time view.
-            #
-            # NOTE: SQLite's VACUUM INTO does not accept a bound parameter for
-            # the filename — it must be a string literal. We inline the path
-            # with single-quotes doubled to neutralise any quote characters
-            # that might appear in DATABASE_PATH (the path is admin-controlled
-            # via env var, so this is a hardening measure rather than a real
-            # injection vector).
-            safe_path = backup_path.replace("'", "''")
-            await db._db.execute(f"VACUUM INTO '{safe_path}'")
+            # Open a fresh destination connection and copy the live DB into it
+            # via the online backup API. This produces a consistent snapshot
+            # without the "cannot VACUUM - SQL statements in progress" error
+            # that VACUUM INTO hits on the shared bot connection.
+            async with aiosqlite.connect(backup_path) as dst:
+                await db._db.backup(dst)
             size = os.path.getsize(backup_path) if os.path.exists(backup_path) else 0
-            logger.info("db_backup: snapshot written to %s (%d bytes)", backup_path, size)
-            # Ship to every admin via Telegram document.
-            for admin_id in ADMIN_IDS:
-                await safe_notify(
-                    bot.send_document(
-                        admin_id,
-                        FSInputFile(backup_path),
-                        caption=(
-                            f"💾 <b>Scheduled DB backup</b>\n"
-                            f"📁 <code>{escape_html(backup_path)}</code>\n"
-                            f"📦 {size:,} bytes\n"
-                            f"🕒 {ts}"
-                        ),
-                    ),
-                    context="db_backup admin document",
-                )
-            # Retention — keep only the latest `keep` on-disk snapshots.
+            # M18 — verify backup integrity before declaring success.
+            integrity_ok = False
             try:
-                import glob
-                backups = sorted(
-                    glob.glob(f"{DATABASE_PATH}.bak.*"),
-                    key=lambda p: os.path.getmtime(p),
-                )
-                for old in backups[:-keep]:
-                    try:
-                        os.unlink(old)
-                        logger.info("db_backup: pruned old snapshot %s", old)
-                    except OSError as exc:
-                        logger.warning("db_backup: could not prune %s: %s", old, exc)
-            except Exception as exc:
-                logger.warning("db_backup: retention sweep failed: %s", exc, exc_info=True)
+                async with aiosqlite.connect(backup_path) as chk:
+                    async with chk.execute("PRAGMA integrity_check") as cur:
+                        row = await cur.fetchone()
+                        integrity_ok = bool(row and row[0] == "ok")
+            except Exception as chk_err:
+                logger.warning("db_backup: integrity_check raised: %s", chk_err)
+            if not integrity_ok:
+                logger.error("db_backup: integrity_check FAILED for %s — discarding", backup_path)
+                try:
+                    os.unlink(backup_path)
+                except OSError:
+                    pass
+                backup_path = None
+            else:
+                logger.info("db_backup: snapshot written to %s (%d bytes, integrity OK)", backup_path, size)
+                for admin_id in ADMIN_IDS:
+                    await safe_notify(
+                        bot.send_document(
+                            admin_id,
+                            FSInputFile(backup_path, filename="bot.db"),
+                            caption=(
+                                f"💾 <b>Scheduled DB backup</b>\n"
+                                f"📦 {size:,} bytes\n"
+                                f"🕒 {ts}"
+                            ),
+                        ),
+                        context="db_backup admin document",
+                    )
+                # Retention — keep only the latest `keep` on-disk snapshots.
+                try:
+                    import glob
+                    backups = sorted(
+                        glob.glob(f"{DATABASE_PATH}.bak.*"),
+                        key=lambda p: os.path.getmtime(p),
+                    )
+                    for old in backups[:-keep]:
+                        try:
+                            os.unlink(old)
+                            logger.info("db_backup: pruned old snapshot %s", old)
+                        except OSError as exc:
+                            logger.warning("db_backup: could not prune %s: %s", old, exc)
+                except Exception as exc:
+                    logger.warning("db_backup: retention sweep failed: %s", exc, exc_info=True)
         except Exception as e:
             logger.error("db_backup error: %s", e, exc_info=True)
-            # Clean up a half-written snapshot so the next cycle does not see
-            # a stale file lying around.
             if backup_path:
                 try:
                     if os.path.exists(backup_path):
                         os.unlink(backup_path)
                 except OSError:
                     pass
-        await asyncio.sleep(DB_BACKUP_INTERVAL_SECONDS)
+        # Sleep for the configured interval, but poll every 60s so cadence
+        # changes (and disable) take effect within a minute.
+        waited = 0
+        while waited < interval_sec:
+            await asyncio.sleep(60)
+            waited += 60
 
 
 # ============================================================================
@@ -8748,8 +10654,11 @@ async def _health_server(db: Database, api: PanelAPI, port: int = 9090):
     systemd watchdog) can poll it. Returns 200 OK if the DB is reachable and
     the polling loop is alive. Returns 503 if anything is wrong.
 
-    Uses a single aiohttp app with one route — minimal RAM footprint for our
-    1-core/1GB host. If aiohttp is not installed, this is a no-op.
+    H13 — the heartbeat dict is updated by a polling middleware so the
+    staleness check actually works (previously it was set once at startup and
+    never updated, so /health always returned 503 after 60s).
+    H14 — binds to 127.0.0.1 by default (HEALTH_BIND env var overrides) and
+    supports an optional HEALTH_TOKEN bearer auth.
     """
     try:
         from aiohttp import web
@@ -8758,8 +10667,14 @@ async def _health_server(db: Database, api: PanelAPI, port: int = 9090):
         return None
 
     last_poll_heartbeat = {"ts": time.time()}
+    health_token = os.getenv("HEALTH_TOKEN", "")
 
     async def health_handler(request):
+        # H14 — optional bearer-token auth.
+        if health_token:
+            auth = request.headers.get("Authorization", "")
+            if auth != f"Bearer {health_token}":
+                return web.json_response({"error": "unauthorized"}, status=401)
         try:
             # DB reachability check.
             async with db._db.execute("SELECT 1") as cur:
@@ -8783,9 +10698,46 @@ async def _health_server(db: Database, api: PanelAPI, port: int = 9090):
     app.router.add_get("/health", health_handler)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logger.info("/health endpoint listening on port %d", port)
+    # H14 — bind to 127.0.0.1 by default; HEALTH_BIND=0.0.0.0 to expose.
+    bind_addr = os.getenv("HEALTH_BIND", "127.0.0.1")
+    # If the primary port is already in use (typically because a previous
+    # bot instance didn't shut down cleanly), try a few fallback ports so
+    # /health monitoring keeps working instead of just failing silently.
+    primary_port = port
+    tried_ports = [primary_port + i for i in range(6)]  # 9090..9095
+    bound_port = None
+    site = None
+    for p in tried_ports:
+        try:
+            site = web.TCPSite(runner, bind_addr, p)
+            await site.start()
+            bound_port = p
+            break
+        except OSError as be:
+            if "address already in use" in str(be).lower() or be.errno == 98:
+                logger.debug("/health: port %d in use, trying next", p)
+                continue
+            # Different OSError — re-raise so the outer handler logs it.
+            raise
+    if bound_port is None:
+        # All candidate ports are in use — another bot instance is almost
+        # certainly still running. Surface a clear, actionable message.
+        logger.warning(
+            "/health: could not bind %s:%d (or ports %d-%d) — another bot "
+            "instance may still be running. /health disabled for this "
+            "process (non-fatal; bot keeps working).",
+            bind_addr, primary_port, tried_ports[0], tried_ports[-1],
+        )
+        await runner.cleanup()
+        return None
+    if bound_port != primary_port:
+        logger.warning(
+            "/health: primary port %d was busy — using port %d instead. "
+            "If this is unexpected, check for a stale bot process still "
+            "holding port %d.",
+            primary_port, bound_port, primary_port,
+        )
+    logger.info("/health endpoint listening on %s:%d", bind_addr, bound_port)
     return runner, last_poll_heartbeat
 
 
@@ -8837,6 +10789,14 @@ async def main():
             health_runner, health_heartbeat = result
     except Exception as e:
         logger.warning("/health endpoint failed to start (non-fatal): %s", e)
+
+    # H13 — a lightweight outer middleware that bumps the heartbeat timestamp
+    # on every update, so /health's staleness check actually reflects liveness.
+    @dp.update.outer_middleware()
+    async def heartbeat_middleware(handler, update, data):
+        if health_heartbeat is not None:
+            health_heartbeat["ts"] = time.time()
+        return await handler(update, data)
 
     # M6 — graceful shutdown: SIGTERM (systemd) and SIGINT (Ctrl+C) both
     # trigger dp.stop_polling() so the `finally` block can clean up cleanly.
@@ -8895,11 +10855,25 @@ async def main():
             asyncio.gather(*tasks, return_exceptions=True),
             timeout=30,
         )
+        # LOW — shutdown order: wrap each cleanup in its own try/except so a
+        # failure in one doesn't skip the rest.
         if health_runner is not None:
-            await health_runner.cleanup()
-        await api.close()
-        await db.disconnect()
-        await bot.session.close()
+            try:
+                await health_runner.cleanup()
+            except Exception as e:
+                logger.warning("health_runner cleanup failed: %s", e)
+        try:
+            await api.close()
+        except Exception as e:
+            logger.warning("api.close() failed: %s", e)
+        try:
+            await db.disconnect()
+        except Exception as e:
+            logger.warning("db.disconnect() failed: %s", e)
+        try:
+            await bot.session.close()
+        except Exception as e:
+            logger.warning("bot.session.close() failed: %s", e)
         logger.info("Bot shutdown complete")
 
 
