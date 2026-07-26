@@ -1649,7 +1649,7 @@ class Database:
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 name          TEXT NOT NULL,
                 description   TEXT,
-                traffic_gb    INTEGER NOT NULL,
+                traffic_gb    REAL NOT NULL,         -- GB (fractional OK: 0.2 = 200 MB; 0 = unlimited)
                 duration_days INTEGER NOT NULL,
                 price         REAL NOT NULL,
                 limit_ip      INTEGER DEFAULT 0,
@@ -1667,7 +1667,7 @@ class Database:
                 sub_id      TEXT,
                 label       TEXT,
                 plan_id     INTEGER,
-                traffic_gb  INTEGER,
+                traffic_gb  REAL,                    -- GB (fractional OK: 0.2 = 200 MB; 0 = unlimited)
                 expiry_time INTEGER,
                 limit_ip    INTEGER DEFAULT 0,
                 is_active   INTEGER DEFAULT 1,
@@ -2294,7 +2294,7 @@ class Database:
         return out
 
     # -------------------------------------------------------------- plans
-    async def add_plan(self, name: str, description: str, traffic_gb: int,
+    async def add_plan(self, name: str, description: str, traffic_gb: float,
                        duration_days: int, price: float, limit_ip: int = 0,
                        inbound_ids: Optional[List[str]] = None) -> int:
         """Insert a new plan row.
@@ -2353,7 +2353,7 @@ class Database:
 
     # ------------------------------------------------------------ accounts
     async def add_account(self, user_tg_id: int, server_id: int, email: str,
-                          sub_id: str, plan_id: Optional[int], traffic_gb: int,
+                          sub_id: str, plan_id: Optional[int], traffic_gb: float,
                           expiry_time: int, limit_ip: int, inbound_ids: str,
                           is_trial: bool = False, label: str = "") -> int:
         """Insert a new account row.
@@ -2405,7 +2405,7 @@ class Database:
         await self._auto_commit()
 
     async def upsert_account(self, user_tg_id: int, server_id: int, email: str,
-                             sub_id: str, traffic_gb: int, expiry_time: int,
+                             sub_id: str, traffic_gb: float, expiry_time: int,
                              limit_ip: int, inbound_ids: str,
                              is_active: bool = True, is_trial: bool = False,
                              plan_id: Optional[int] = None, label: str = "") -> int:
@@ -3095,6 +3095,26 @@ class Database:
         except (TypeError, ValueError):
             return default
 
+    async def get_setting_float(self, key: str, default: float = 0.0) -> float:
+        """Like :meth:`get_setting_int` but for fractional settings.
+
+        Used for GB quotas (trial_gb, referral_bonus_gb) and per-GB prices
+        which may legitimately be decimal (0.2 GB = 200 MB).  Falls back to
+        ``int()`` parsing first so old integer-stored values still work, then
+        to ``float()`` for fractional values, then to ``default``.
+        """
+        v = await self.get_setting(key)
+        if v is None:
+            return default
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            pass
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
     async def get_setting_json(self, key: str, default: Any = None) -> Any:
         v = await self.get_setting(key)
         if v is None:
@@ -3203,7 +3223,7 @@ class PanelAPI:
 
     # ------------------------------------------------------------- clients
     async def create_client(self, panel_url: str, token: str, email: str,
-                            inbound_ids: List[int], total_gb: int = 0,
+                            inbound_ids: List[int], total_gb: float = 0,
                             expiry_time: int = 0, limit_ip: int = 0,
                             tg_id: int = 0, flow: str = "", sub_id: str = "") -> dict:
         client: Dict[str, Any] = {"email": email, "enable": True}
@@ -3211,7 +3231,9 @@ class PanelAPI:
             # 3x-ui stores the `totalGB` value directly as the traffic `total`
             # (in bytes) — despite the misleading field name. Sending 5 makes
             # the limit 5 bytes; we must send bytes to get N GB.
-            client["totalGB"] = total_gb * GB
+            # int() rounds down so fractional GB (0.2 GB = 214_748_364 bytes)
+            # yields an exact byte count the panel accepts.
+            client["totalGB"] = int(total_gb * GB)
         if expiry_time > 0:
             client["expiryTime"] = expiry_time
         if limit_ip > 0:
@@ -3701,14 +3723,35 @@ def fmt_bytes(num_bytes: int) -> str:
     return f"{n:.1f} EB"
 
 
-def fmt_gb(gb: int, lang: str = "en") -> str:
-    if gb == 0:
+def fmt_gb(gb, lang: str = "en") -> str:
+    """Format a traffic quota (in GB) for display.
+
+    Accepts int OR float — fractional GB values (e.g. 0.2 for 200 MB) are
+    supported because the plan/account tables store traffic as a REAL value
+    and the panel API receives bytes (``total_gb * GB``), so 0.2 GB becomes
+    214_748_364 bytes cleanly.  Integer values render without a decimal
+    point ("5 GB"); fractional values use up to 2 decimals ("0.2 GB").
+    """
+    try:
+        v = float(gb)
+    except (TypeError, ValueError):
+        v = 0.0
+    if v <= 0:
+        # 0 == unlimited; negative shouldn't happen but treat as unlimited.
         return t("unlimited", lang)
-    if gb >= 1024:
-        s = f"{gb/1024:.1f} TB"
+    if v >= 1024:
+        s = f"{v/1024:.1f} TB"
+    elif v == int(v):
+        # whole GB — no decimal point (e.g. "5 GB" not "5.0 GB")
+        s = f"{int(v)} GB"
     else:
-        s = f"{gb} GB"
-    return to_fa_digits(s) if lang == "fa" else s
+        # fractional GB — strip trailing zeros (0.20 → "0.2 GB", 0.25 → "0.25 GB")
+        s = f"{v:.2f}".rstrip("0").rstrip(".") + " GB"
+    if lang == "fa":
+        # Persian uses the Arabic decimal separator ٫ (U+066B) instead of "."
+        s = s.replace(".", "٫")
+        s = to_fa_digits(s)
+    return s
 
 
 def fmt_days(days: int, lang: str = "en") -> str:
@@ -5313,28 +5356,28 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         await callback.answer()
 
     @router.callback_query(PlanCB.filter(F.action == "view"))
-    async def cb_plan_view(callback: CallbackQuery, callback_data: PlanCB, db_user: dict):
+    async def cb_plan_view(callback: CallbackQuery, callback_data: PlanCB,
+                            state: FSMContext, db_user: dict):
         plan = await db.get_plan(callback_data.plan_id)
         if not plan:
             await callback.answer(t("not_found", _lang(db_user)), show_alert=True)
             return
-        lang = _lang(db_user)
-        currency = await _currency()
-        # UI-REDESIGN: plan card + collapsible fair-use warning. The
-        # <blockquote expandable> keeps the message compact by default but
-        # lets curious buyers expand it. Requires Telegram Bot API 7.3+
-        # (aiogram 3.7+), which we already use.
-        text = fmt_plan_card(plan, lang, currency)
-        warning = PURCHASE_WARNING_FA if lang == "fa" else PURCHASE_WARNING_EN
-        text += f"\n\n<blockquote expandable>{warning}</blockquote>"
-        # Show the user's balance here too so they know before tapping Buy.
-        balance = db_user.get("balance", 0)
-        text += f"\n{t('your_balance', lang, balance=fmt_price(balance, lang, currency))}"
-        if balance >= plan["price"]:
-            text += f"\n{t('sufficient', lang)}"
-        else:
-            text += f"\n{t('insufficient', lang, diff=fmt_price(plan['price'] - balance, lang, currency))}"
-        await callback.message.edit_text(text, reply_markup=kb_plan_view(plan["id"], lang))
+        # UX-SKIP-BUY-STEP: selecting a plan from the list used to land on
+        # an intermediate "plan detail" page whose only real action was a
+        # "Buy Service" button that then opened the unified review page.
+        # That extra tap added friction without adding information (the
+        # review page already shows the plan card, balance, and fair-use
+        # warning). Now selecting a plan goes straight to the review page,
+        # performing the same state setup as cb_buy_start so the rest of
+        # the purchase flow (name / promo / confirm) works unchanged.
+        # NOTE: cb_buy_start is still wired up because the post-payment
+        # "resume" button (line ~10077) reuses BuyCB(action="start",
+        # step="resume") to drop the user back on the review page after a
+        # shortfall payment is approved.
+        await state.clear()
+        await state.update_data(plan_id=callback_data.plan_id, account_name="",
+                                promo_code="", final_price=plan["price"])
+        await _render_purchase_review(callback.message, state, db_user, plan)
         await callback.answer()
 
     # ====================================================== PURCHASE REVIEW
@@ -5671,7 +5714,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             ref_enabled = await db.get_setting_int("referral_enabled", 1)
             if won_claim and ref_enabled:
                 bonus_days = await db.get_setting_int("referral_bonus_days", 0)
-                bonus_gb = await db.get_setting_int("referral_bonus_gb", 0)
+                bonus_gb = await db.get_setting_float("referral_bonus_gb", 0)
                 # Notify the referrer they have a claimable reward — don't
                 # apply it yet. They need to visit Referral → Claim Reward.
                 try:
@@ -6006,7 +6049,8 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             add_bytes = 0
         else:
             new_traffic = (account["traffic_gb"] or 0) + (plan["traffic_gb"] or 0)
-            add_bytes = plan["traffic_gb"] * GB if plan["traffic_gb"] and plan["traffic_gb"] > 0 else 0
+            # int() — bulk_adjust's addBytes is an integer byte count.
+            add_bytes = int(plan["traffic_gb"] * GB) if plan["traffic_gb"] and plan["traffic_gb"] > 0 else 0
         result = await api.bulk_adjust(
             server["panel_url"], server["api_token"], [account["email"]],
             add_days=plan["duration_days"], add_bytes=add_bytes,
@@ -6078,7 +6122,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             await callback.answer(t("trial_no_renew", lang), show_alert=True)
             return
         gb = callback_data.gb
-        price_per_gb = await db.get_setting_int("topup_price_per_gb", TOPUP_DEFAULT_PRICE_PER_GB)
+        price_per_gb = await db.get_setting_float("topup_price_per_gb", TOPUP_DEFAULT_PRICE_PER_GB)
         price = gb * price_per_gb
         server = await db.get_server(account["server_id"])
         if not server:
@@ -6096,7 +6140,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             return
         result = await api.bulk_adjust(
             server["panel_url"], server["api_token"], [account["email"]],
-            add_bytes=gb * GB,
+            add_bytes=int(gb * GB),
         )
         if not result.get("success"):
             # C7 — compensation: refund the deducted balance.
@@ -6245,7 +6289,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             await callback.answer()
             return
         days = await db.get_setting_int("trial_days", TRIAL_DEFAULT_DAYS)
-        gb = await db.get_setting_int("trial_gb", TRIAL_DEFAULT_GB)
+        gb = await db.get_setting_float("trial_gb", TRIAL_DEFAULT_GB)
         text = (
             f"{t('trial_offer', lang)}\n\n"
             f"📅 {fmt_days(days, lang)}\n💾 {fmt_gb(gb, lang)}\n💵 {fmt_price(0, lang, await _currency())}\n\n"
@@ -6273,7 +6317,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             return
         await callback.message.edit_text(t("creating_account", lang))
         days = await db.get_setting_int("trial_days", TRIAL_DEFAULT_DAYS)
-        gb = await db.get_setting_int("trial_gb", TRIAL_DEFAULT_GB)
+        gb = await db.get_setting_float("trial_gb", TRIAL_DEFAULT_GB)
         limit_ip = await db.get_setting_int("trial_limit_ip", 1)
         trial_inbounds = await db.get_setting_json("trial_inbounds", [])
         # Restrict to servers referenced by trial_inbounds (if any)
@@ -6638,7 +6682,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             return
         stats = await db.get_referral_stats(callback.from_user.id)
         bonus_days = await db.get_setting_int("referral_bonus_days", 0)
-        bonus_gb = await db.get_setting_int("referral_bonus_gb", 0)
+        bonus_gb = await db.get_setting_float("referral_bonus_gb", 0)
         # REFERRAL-CLAIM: count unclaimed rewards so we can show a Claim button.
         claimable = await db.get_claimable_referral_count(callback.from_user.id)
         me = await bot.get_me()
@@ -6721,7 +6765,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             await callback.answer()
             return
         bonus_days = await db.get_setting_int("referral_bonus_days", 0)
-        bonus_gb = await db.get_setting_int("referral_bonus_gb", 0)
+        bonus_gb = await db.get_setting_float("referral_bonus_gb", 0)
         # If only one active account, apply directly.
         if len(active_paid) == 1:
             acc = active_paid[0]
@@ -6737,7 +6781,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             count = len(claimables)
             total_days = bonus_days * count
             total_gb = bonus_gb * count
-            bonus_bytes = total_gb * GB if total_gb > 0 else 0
+            bonus_bytes = int(total_gb * GB) if total_gb > 0 else 0
             result = await api.bulk_adjust(
                 srv["panel_url"], srv["api_token"],
                 [acc["email"]], add_days=total_days, add_bytes=bonus_bytes,
@@ -6801,13 +6845,13 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             await callback.answer(t("ref_claim_none", lang), show_alert=True)
             return
         bonus_days = await db.get_setting_int("referral_bonus_days", 0)
-        bonus_gb = await db.get_setting_int("referral_bonus_gb", 0)
+        bonus_gb = await db.get_setting_float("referral_bonus_gb", 0)
         # H3 — multiply by the claimable count (see cb_referral_claim).
         claimables = await db.get_claimable_referrals(callback.from_user.id)
         count = len(claimables)
         total_days = bonus_days * count
         total_gb = bonus_gb * count
-        bonus_bytes = total_gb * GB if total_gb > 0 else 0
+        bonus_bytes = int(total_gb * GB) if total_gb > 0 else 0
         result = await api.bulk_adjust(
             srv["panel_url"], srv["api_token"],
             [acc["email"]], add_days=total_days, add_bytes=bonus_bytes,
@@ -7887,14 +7931,20 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             desc = ""
         await state.update_data(description=desc)
         await state.set_state(AdminStates.waiting_for_plan_traffic)
-        await message.answer("💾 Traffic in GB (0 = unlimited):", reply_markup=kb_cancel("en"))
+        await message.answer("💾 Traffic in GB (0 = unlimited).\n💡 Decimal values OK, e.g. <code>0.2</code> for 200 MB, <code>0.5</code> for 500 MB:",
+                             reply_markup=kb_cancel("en"))
 
     @router.message(AdminStates.waiting_for_plan_traffic)
     async def ms_plan_traffic(message: Message, state: FSMContext):
         try:
-            gb = int(message.text.strip())
-        except ValueError:
-            await message.answer("❌ Number please:", reply_markup=kb_cancel("en"))
+            # Accept fractional GB (0.2 = 200 MB) — the panel API receives
+            # bytes (total_gb * GB), so any decimal works.
+            gb = float(message.text.strip())
+        except (ValueError, TypeError):
+            await message.answer("❌ Number please (e.g. 5 or 0.2):", reply_markup=kb_cancel("en"))
+            return
+        if gb < 0:
+            await message.answer("❌ Traffic cannot be negative.", reply_markup=kb_cancel("en"))
             return
         await state.update_data(traffic_gb=gb)
         await state.set_state(AdminStates.waiting_for_plan_duration)
@@ -8135,7 +8185,23 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         # ---- plan field edit ----
         elif edit_type == "plan":
             plan_id = data["plan_id"]
-            if field in ("traffic_gb", "duration_days", "limit_ip"):
+            if field == "traffic_gb":
+                # traffic_gb is a REAL value — fractional GB (e.g. 0.2 for
+                # 200 MB) is supported.
+                try:
+                    val = float(raw)
+                except ValueError:
+                    await state.clear()
+                    await message.answer("❌ Number please (e.g. 5 or 0.2).",
+                                         reply_markup=kb_admin_menu())
+                    return
+                if val < 0:
+                    await state.clear()
+                    await message.answer("❌ Traffic cannot be negative.",
+                                         reply_markup=kb_admin_menu())
+                    return
+                await db.update_plan(plan_id, **{field: val})
+            elif field in ("duration_days", "limit_ip"):
                 try:
                     val = int(raw)
                 except ValueError:
@@ -8160,14 +8226,29 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
         # ---- bot setting (integer) ----
         elif edit_type == "setting_int":
-            try:
-                val = int(raw)
-            except ValueError:
-                await message.answer("❌ Number please:", reply_markup=kb_cancel("en"))
-                return
+            key = data.get("key", "")
+            # Some integer-typed settings legitimately need fractional values:
+            #   - trial_gb / referral_bonus_gb : the panel API receives bytes,
+            #     so 0.2 GB (= 200 MB) is a valid quota.
+            #   - topup_price_per_gb : price could be fractional in some
+            #     currencies (though typically toman is whole).
+            # All other setting_int keys remain strict integers.
+            _FLOAT_KEYS = {"trial_gb", "referral_bonus_gb", "topup_price_per_gb"}
+            if key in _FLOAT_KEYS:
+                try:
+                    val = float(raw)
+                except ValueError:
+                    await message.answer(f"❌ Number please (e.g. 5 or 0.2):",
+                                         reply_markup=kb_cancel("en"))
+                    return
+            else:
+                try:
+                    val = int(raw)
+                except ValueError:
+                    await message.answer("❌ Number please:", reply_markup=kb_cancel("en"))
+                    return
             # M5 — validate known setting keys to prevent misconfiguration
             # (negative prices/days/GB, absurd backup counts, etc.).
-            key = data.get("key", "")
             _INT_RANGES = {
                 "trial_days": (0, 365), "trial_gb": (0, 10000), "trial_limit_ip": (0, 100),
                 "referral_bonus_days": (0, 365), "referral_bonus_gb": (0, 10000),
@@ -8227,10 +8308,18 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         # ---- admin extends a user account (days GB) ----
         elif edit_type == "acc_extend":
             parts = raw.split()
+            # days is always an integer (whole days); GB may be fractional
+            # (e.g. "30 0.2" = 30 days + 200 MB).
             days = int(parts[0]) if len(parts) > 0 and parts[0].lstrip("-").isdigit() else 0
-            gb = int(parts[1]) if len(parts) > 1 and parts[1].lstrip("-").isdigit() else 0
+            gb = 0.0
+            if len(parts) > 1:
+                try:
+                    gb = float(parts[1])
+                except ValueError:
+                    gb = 0.0
             if days == 0 and gb == 0:
-                await message.answer("❌ Send e.g. <code>30 10</code> (days GB):", reply_markup=kb_cancel("en"))
+                await message.answer("❌ Send e.g. <code>30 10</code> (days GB) — GB can be decimal like <code>30 0.2</code>:",
+                                     reply_markup=kb_cancel("en"))
                 return
             await state.clear()
             email = data["email"]
@@ -8247,7 +8336,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
                 add_bytes = 0
             else:
                 new_traffic = (account["traffic_gb"] or 0) + gb
-                add_bytes = gb * GB if gb > 0 else 0
+                add_bytes = int(gb * GB) if gb > 0 else 0
             r = await api.bulk_adjust(server["panel_url"], server["api_token"], [email],
                                       add_days=days, add_bytes=add_bytes)
             if not r.get("success"):
@@ -8260,7 +8349,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             await db.clear_traffic_alerts(email)
             await db.clear_expiry_reminders(email)
             await message.answer(
-                f"✅ Extended <code>{escape_html(email)}</code>\n+{days}d +{gb}GB",
+                f"✅ Extended <code>{escape_html(email)}</code>\n+{days}d +{fmt_gb(gb, 'en')}",
                 reply_markup=kb_admin_menu(),
             )
         else:
@@ -9119,7 +9208,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_settings_trial(callback: CallbackQuery):
         trial_en = await db.get_setting_int("trial_enabled", 0)
         trial_days = await db.get_setting_int("trial_days", TRIAL_DEFAULT_DAYS)
-        trial_gb = await db.get_setting_int("trial_gb", TRIAL_DEFAULT_GB)
+        trial_gb = await db.get_setting_float("trial_gb", TRIAL_DEFAULT_GB)
         rich = rich_tables.trial_settings_rich(trial_en, trial_days, trial_gb)
         kb = InlineKeyboardBuilder()
         kb.button(style="primary", text=f"{'✅' if trial_en else '❌'} Toggle Trial", callback_data=AdminCB(action="toggle_trial").pack())
@@ -9139,7 +9228,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def _render_settings_referral_view(message: Message):
         ref_en = await db.get_setting_int("referral_enabled", 1)
         ref_days = await db.get_setting_int("referral_bonus_days", 5)
-        ref_gb = await db.get_setting_int("referral_bonus_gb", 2)
+        ref_gb = await db.get_setting_float("referral_bonus_gb", 2)
         rich = rich_tables.referral_settings_rich(ref_en, ref_days, ref_gb)
         kb = InlineKeyboardBuilder()
         kb.button(style="primary", text=f"{'✅' if ref_en else '❌'} Toggle Referral",
@@ -9203,7 +9292,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.callback_query(SettingsCatCB.filter(F.category == "topup"))
     async def cb_settings_topup(callback: CallbackQuery):
-        topup_price = await db.get_setting_int("topup_price_per_gb", TOPUP_DEFAULT_PRICE_PER_GB)
+        topup_price = await db.get_setting_float("topup_price_per_gb", TOPUP_DEFAULT_PRICE_PER_GB)
         packages = await db.get_setting_json("topup_packages", [5, 10, 20, 50])
         rich = rich_tables.topup_settings_rich(topup_price, packages)
         kb = InlineKeyboardBuilder()
@@ -9449,7 +9538,9 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             return False, "no Telegram ID set"
         await db.upsert_user_minimal(tg_id)
         total_gb_raw = int(client.get("totalGB") or 0)
-        traffic_gb = total_gb_raw // GB if total_gb_raw > 0 else 0
+        # Use float division so fractional GB (e.g. 200 MB = 0.2 GB) is
+        # preserved instead of being floored to 0 by integer division.
+        traffic_gb = total_gb_raw / GB if total_gb_raw > 0 else 0
         inbound_ids = json.dumps(client.get("inboundIds") or [])
         await db.upsert_account(
             user_tg_id=tg_id,
@@ -9542,7 +9633,9 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             return
         existing = await db.get_account(callback_data.email)
         total_gb_raw = int(client.get("totalGB") or 0)
-        gb_disp = f"{total_gb_raw // GB} GB" if total_gb_raw else "∞"
+        # Use fmt_gb so fractional GB (e.g. 200 MB) renders as "0.2 GB"
+        # instead of being floored to "0 GB" by integer division.
+        gb_disp = fmt_gb(total_gb_raw / GB, "en") if total_gb_raw else "∞"
         rows = [
             ("Email", client.get("email", "—")),
             ("Telegram ID", client.get("tgId") or "— not set —"),
