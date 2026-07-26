@@ -903,7 +903,12 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "your_balance": "💳 Your balance: <b>{balance}</b>",
         "sufficient": "✅ Your balance is enough for this plan.",
         "insufficient": "⚠️ <b>Not enough balance.</b>\nYou still need <b>{diff}</b> to buy this plan.",
-        "review_short_hint": "👇 Top up your wallet below to continue.",
+        "review_short_hint": "👇 Tap the <b>“Pay Exact Shortfall”</b> button below to top up your wallet for this plan. You can also use a <b>gift code</b> if you have one.",
+        # BUG-7 FIX: separate hint for the renew page (which shows a
+        # "Charge Wallet" button, NOT the purchase-review's shortfall
+        # button). The review_short_hint above was wrongly reused here and
+        # pointed at a button that doesn't exist on the renew page.
+        "renew_short_hint": "👇 Tap the <b>“Charge Wallet”</b> button below to top up your wallet, then come back to renew.",
         "ask_account_name": (
             "✏️ <b>Name this config (optional)</b>\n\n"
             "Send a short label like <code>phone</code> or <code>laptop</code> so you can tell your configs apart.\n"
@@ -1014,6 +1019,14 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "gift_used_code": "❌ This code has already been used.",
         "gift_balance_ok": "✅ <b>Gift redeemed!</b>\n💰 <b>{amount}</b> added to your balance.",
         "gift_plan_ok": "✅ <b>Gift redeemed!</b>\n🎁 Plan: <b>{plan}</b>",
+        # Gift code inside the Buy Service review page (purchase context).
+        # Only balance-type codes are accepted here because the purpose is
+        # to top up the wallet so the user can afford the selected plan.
+        "gift_in_purchase_hint": "🎫 <b>Redeem gift code</b>\n\nSend me your code.\n\nℹ️ Only <b>balance-type</b> gift codes are accepted here — they top up your wallet so you can buy this plan.",
+        "gift_plan_not_allowed_in_purchase": "❌ This is a <b>plan-type</b> gift code. Here only <b>balance-type</b> codes are accepted (to top up your wallet). Please send a balance-type code, or redeem this plan code from the main menu → Wallet → Gift Code.",
+        "gift_balance_ok_back_to_purchase": "✅ <b>Gift redeemed!</b>\n💰 <b>{amount}</b> added to your balance.\n\nReturning to your plan…",
+        "payment_disabled_gift_only": "⚠️ Card-to-card payment is currently disabled. The only way to top up your wallet here is by using a <b>gift code</b>.",
+        "gift_btn": "🎫 Gift Code",
         # support
         "support_title": "💬 <b>Support Center</b>",
         "support_desc": "Need a hand? Open a ticket and our team will jump in.\n\n• 🎫 Open a ticket for any issue\n• ⏱ We usually reply within a few hours\n• 🔒 Your conversation is private",
@@ -1192,7 +1205,10 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "your_balance": "💳 موجودی شما: <b>{balance}</b>",
         "sufficient": "✅ موجودیت برای این پلن کافیه.",
         "insufficient": "⚠️ <b>موجودی کافی نیست.</b>\nبرای خرید این پلن <b>{diff}</b> دیگه نیاز داری.",
-        "review_short_hint": "👇 برای ادامه، کیف پولت رو شارژ کن.",
+        "review_short_hint": "👇 برای شارژ موجودی و خرید این پلن، روی دکمه‌ی <b>«پرداخت مبلغ مورد نیاز»</b> زیر کلیک کن. اگه کد هدیه داری می‌تونی از آن هم استفاده کنی.",
+        # BUG-7 FIX: راهنمای مخصوص صفحه‌ی تمدید (که دکمه‌ی «شارژ کیف پول»
+        # رو نشون می‌ده، نه دکمه‌ی «پرداخت مبلغ مورد نیاز» صفحه‌ی خرید).
+        "renew_short_hint": "👇 برای شارژ موجودی روی دکمه‌ی <b>«شارژ کیف پول»</b> زیر کلیک کن، بعد برگرد و تمدید کن.",
         "ask_account_name": (
             "✏️ <b>اسم این کانفیگ (اختیاری)</b>\n\n"
             "یه اسم کوتاه بذار مثل <code>phone</code> یا <code>laptop</code> تا کانفیگ‌هات رو از هم تشخیص بدی.\n"
@@ -1294,6 +1310,13 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "gift_used_code": "❌ این کد قبلاً استفاده شده است.",
         "gift_balance_ok": "✅ <b>کد ثبت شد!</b>\n💰 <b>{amount}</b> به موجودی شما اضافه شد.",
         "gift_plan_ok": "✅ <b>کد ثبت شد!</b>\n🎁 پلن: <b>{plan}</b>",
+        # کد هدیه داخل صفحه‌ی خرید سرویس (بافت purchasing).
+        # فقط کدهای نوع موجودی اینجا پذیرفته می‌شن چون هدف شارژ کیف پوله.
+        "gift_in_purchase_hint": "🎫 <b>کد هدیه</b>\n\nکد خود را بفرستید.\n\nℹ️ در این بخش فقط کدهای هدیه‌ی <b>موجودی</b> پذیرفته می‌شوند — موجودی کیف پولت رو شارژ می‌کنن تا بتونی این پلن رو بخری.",
+        "gift_plan_not_allowed_in_purchase": "❌ این یک کد هدیه‌ی <b>پلن</b> است. در اینجا فقط کدهای <b>موجودی</b> پذیرفته می‌شوند (برای شارژ کیف پول). لطفاً یک کد موجودی بفرستید، یا از مسیر منوی اصلی ← کیف پول ← کد هدیه از این کد استفاده کنید.",
+        "gift_balance_ok_back_to_purchase": "✅ <b>کد ثبت شد!</b>\n💰 <b>{amount}</b> به موجودی شما اضافه شد.\n\nبرگشت به پلن شما…",
+        "payment_disabled_gift_only": "⚠️ در حال حاضر پرداخت کارت‌به‌کارت غیرفعال است. تنها راه شارژ کیف پول در این بخش، استفاده از <b>کد هدیه</b> است.",
+        "gift_btn": "🎫 کد هدیه",
         "support_title": "💬 <b>مرکز پشتیبانی</b>",
         "support_desc": "نیاز به کمکی؟ یه تیکت باز کن تا تیم ما کمکت کنه.\n\n• 🎫 برای هر مشکلی تیکت بزن\n• ⏱ معمولاً ظرف چند ساعت جواب می‌دیم\n• 🔒 گفتگو کاملاً محرمانه‌ست",
         "new_ticket": "🎫 تیکت جدید",
@@ -1911,11 +1934,15 @@ class Database:
         defaults = {
             "trial_enabled": "1",
             "trial_days": str(int(os.getenv("TRIAL_DAYS", "3"))),
-            "trial_gb": str(int(os.getenv("TRIAL_GB", "5"))),
+            # BUG-9 FIX: use float() not int() so fractional env values like
+            # TRIAL_GB=0.2 (200 MB) don't crash startup with ValueError. Task 12
+            # added fractional GB support everywhere else; the seed path was
+            # missed. TRIAL_DAYS / REFERRAL_BONUS_DAYS stay int (whole days).
+            "trial_gb": str(float(os.getenv("TRIAL_GB", "5"))),
             "trial_limit_ip": "1",
             "trial_inbounds": "[]",   # JSON list of "server_id_inbound_id"
             "referral_bonus_days": str(int(os.getenv("REFERRAL_BONUS_DAYS", "5"))),
-            "referral_bonus_gb": str(int(os.getenv("REFERRAL_BONUS_GB", "2"))),
+            "referral_bonus_gb": str(float(os.getenv("REFERRAL_BONUS_GB", "2"))),
             "referral_enabled": "1",   # admin can disable the whole referral program
             "currency": DEFAULT_CURRENCY,
             "default_language": DEFAULT_LANGUAGE,
@@ -4482,7 +4509,7 @@ def kb_plan_view(plan_id: int, lang: str) -> InlineKeyboardMarkup:
 def kb_purchase_review(plan_id: int, lang: str, has_name: bool = False,
                        has_promo: bool = False, can_afford: bool = True,
                        payment_enabled: bool = True) -> InlineKeyboardMarkup:
-    """Single review page keyboard (UI-REDESIGN + PURCHASE-UX-2).
+    """Single review page keyboard (UI-REDESIGN + PURCHASE-UX-2 + UX-SHORTFALL-ONLY).
 
     One unified page where the user can: set/change a name, add a promo code,
     and confirm payment. This replaces the old two-path flow where promo and
@@ -4490,17 +4517,22 @@ def kb_purchase_review(plan_id: int, lang: str, has_name: bool = False,
 
     PURCHASE-UX-2: the "Confirm & Pay" button is **only** shown when the user
     can actually afford the plan.  When they can't, tapping it would just
-    trigger a rejection toast — confusing and frustrating.  Instead, the
-    insufficient-balance state shows actionable top-up buttons:
+    trigger a rejection toast — confusing and frustrating.
 
-      * 💳 Charge Wallet  — go to the wallet/charge flow (any amount).
-      * 🎫 Gift Code      — redeem a gift code for instant balance.
-      * ⚡ Pay Exact Shortfall (only if card payments are enabled) — create a
-        card payment for exactly the missing amount, tagged with this plan so
-        after admin approval the user gets a one-tap "buy this plan" button.
+    UX-SHORTFALL-ONLY (this revision): the insufficient-balance state used to
+    offer three top-up paths — Charge Wallet, Gift Code, and Pay Exact
+    Shortfall.  Per product decision the only path on this page is now
+    **Pay Exact Shortfall** (only when card payments are enabled): it creates
+    a card payment for exactly the missing amount, tagged with this plan so
+    after admin approval the user gets a one-tap "buy this plan" button.
+
+    Wallet charge and gift-code redemption are still reachable from the main
+    menu (Wallet section) — they're just no longer surfaced mid-purchase.
 
     Name + promo buttons remain available in both states (the user can set
-    them while they decide how to top up).
+    them before paying).  If card payments are disabled, the can't-afford
+    state has no payment action on this page (the user must use the main-menu
+    Wallet flow); this matches the admin's choice to turn off card payments.
     """
     kb = InlineKeyboardBuilder()
     name_label = t("set_name_btn", lang) + (" ✏️" if has_name else "")
@@ -4522,16 +4554,26 @@ def kb_purchase_review(plan_id: int, lang: str, has_name: bool = False,
         kb.adjust(1, 2, 1)
     else:
         # Can't afford — NO Confirm & Pay button (would just reject).
-        # Row 1: Charge Wallet | Gift Code (two top-up paths).
-        kb.button(text=t("charge_wallet_btn", lang),
-                  callback_data=MenuCB(action="charge_wallet").pack(), style="primary")
-        kb.button(text=t("gift", lang),
-                  callback_data=MenuCB(action="gift").pack(), style="success")
-        # Row 2: Pay Exact Shortfall (full width, only if card payments on).
+        # UX-SHORTFALL-ONLY + UX-GIFT-IN-PURCHASE + UX-TWO-ROWS: the top-up
+        # paths on this page are (1) Pay Exact Shortfall (card-to-card, only
+        # when payment_enabled) and (2) Gift Code (balance-type only). Charge
+        # Wallet was removed per product decision (still reachable via the
+        # main-menu Wallet section).
+        # UX-TWO-ROWS: each top-up button gets its OWN full-width row, with
+        # Shortfall first (it's the primary path the hint points at when card
+        # payments are on). Stacking them vertically instead of side-by-side
+        # removes ambiguity about which button to tap first.
+        # Row 1: Pay Exact Shortfall (primary action, only if card payments on).
         if payment_enabled:
             kb.button(text=t("request_shortfall_btn", lang),
                       callback_data=BuyCB(action="shortfall", plan_id=plan_id, step="request").pack(),
-                      style="primary")
+                      style="success")
+        # Row 2 (or Row 1 when payments off): Gift Code (always shown — gift
+        # codes are an independent wallet top-up channel that works whether or
+        # not card payments are enabled).
+        kb.button(text=t("gift_btn", lang),
+                  callback_data=BuyCB(action="gift", plan_id=plan_id, step="redeem").pack(),
+                  style="primary")
         # Row 3: Name | Promo (still available).
         kb.button(text=name_label,
                   callback_data=BuyCB(action="set_name", plan_id=plan_id, step="enter").pack(),
@@ -4541,8 +4583,9 @@ def kb_purchase_review(plan_id: int, lang: str, has_name: bool = False,
                   style="primary")
         # Row 4: Back.
         kb.button(text=t("back", lang), callback_data=MenuCB(action="buy").pack(), style="danger")
-        # Layout: 2 (charge, gift) / 1 (shortfall) / 2 (name, promo) / 1 (back)
-        kb.adjust(2, 1, 2, 1) if payment_enabled else kb.adjust(2, 2, 1)
+        # Layout: payments on  -> 1 (shortfall) / 1 (gift) / 2 (name, promo) / 1 (back);
+        #         payments off -> 1 (gift) / 2 (name, promo) / 1 (back).
+        kb.adjust(1, 1, 2, 1) if payment_enabled else kb.adjust(1, 2, 1)
     return kb.as_markup()
 
 
@@ -4880,6 +4923,11 @@ def kb_more_features(lang: str, is_admin: bool = False) -> InlineKeyboardMarkup:
 class UserStates(StatesGroup):
     waiting_for_promo_code = State()
     waiting_for_gift_code = State()
+    # Separate state for gift codes entered from the Buy Service review page.
+    # Keeping it separate from waiting_for_gift_code lets ms_purchase_gift_code
+    # apply purchase-specific rules (balance-type only) and return the user to
+    # the same plan's review page instead of the main menu. (UX-GIFT-IN-PURCHASE)
+    waiting_for_purchase_gift_code = State()
     waiting_for_account_name = State()
     waiting_for_ticket_category = State()
     waiting_for_ticket_subject = State()
@@ -5419,20 +5467,28 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             text += f"{t('final_price_label', lang)}: <b>{fmt_price(final_price, lang, currency)}</b>\n"
         # Balance line
         text += f"{t('your_balance', lang, balance=fmt_price(balance, lang, currency))}\n"
+        # Whether card payments are enabled — controls which top-up button(s)
+        # appear below AND which hint we show. Fetched up-front so the hint
+        # logic can be context-aware instead of showing a contradictory hint.
+        payment_enabled = await db.get_setting_int("payment_enabled", 0)
         if balance >= final_price:
             text += t("sufficient", lang)
         else:
             text += t("insufficient", lang, diff=fmt_price(final_price - balance, lang, currency))
-            # PURCHASE-UX-2: actionable hint pointing the user at the top-up
-            # buttons that appear below (Charge Wallet / Gift / Pay Shortfall).
-            text += f"\n{t('review_short_hint', lang)}"
+            # PURCHASE-UX-2 + UX-HINT-MATCHES-BUTTONS: the hint must match the
+            # buttons that actually appear below. When card payments are ON,
+            # the first/primary button is "Pay Exact Shortfall" — the hint
+            # points at it explicitly (and mentions gift code as an alt).
+            # When card payments are OFF, there's no shortfall button, so we
+            # show the payment_disabled_gift_only notice instead — showing
+            # "pay the shortfall" here would point at a non-existent button.
+            if payment_enabled:
+                text += f"\n{t('review_short_hint', lang)}"
+            else:
+                text += f"\n{t('payment_disabled_gift_only', lang)}"
         # Collapsible warning
         warning = PURCHASE_WARNING_FA if lang == "fa" else PURCHASE_WARNING_EN
         text += f"\n<blockquote expandable>{warning}</blockquote>"
-
-        # Whether card payments are enabled — controls whether the
-        # "Request Shortfall" button appears for users who can't afford.
-        payment_enabled = await db.get_setting_int("payment_enabled", 0)
         kb = kb_purchase_review(plan["id"], lang,
                                 has_name=bool(account_name),
                                 has_promo=bool(promo_code and discount > 0),
@@ -5448,8 +5504,30 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         if not plan:
             await callback.answer(t("not_found", _lang(db_user)), show_alert=True)
             return
-        # Clear any stale purchase state from a previous attempt, then seed
-        # fresh data for this plan.
+        # BUG-13 FIX: the "resume" path (post-shortfall-payment approval)
+        # used to call state.clear() + reset final_price=plan["price"],
+        # discarding any applied promo discount. If the user's post-approval
+        # balance covered the DISCOUNTED price but not the FULL price, they'd
+        # be back to "can't afford" and have to re-apply the promo — and if
+        # the promo had expired / hit max_uses in the meantime, they'd be
+        # stuck having paid the shortfall but unable to buy. Fix: when
+        # step=="resume", preserve any existing promo_code + final_price
+        # (and account_name) from the state instead of wiping them. If the
+        # state is empty/stale (bot restarted, user hit /cancel), fall back
+        # to the fresh-seed behavior.
+        if callback_data.step == "resume":
+            existing = await state.get_data()
+            # Only trust the existing state if it's for the SAME plan and
+            # actually has a final_price (not an empty placeholder).
+            if (existing.get("plan_id") == callback_data.plan_id
+                    and existing.get("final_price") is not None):
+                # State is fresh and matches — keep promo_code, final_price,
+                # account_name as-is. Just re-render.
+                await _render_purchase_review(callback.message, state, db_user, plan)
+                await callback.answer()
+                return
+            # else: state was cleared/stale — fall through to fresh seed.
+        # Fresh seed for a new purchase (or a resume with stale state).
         await state.clear()
         await state.update_data(plan_id=callback_data.plan_id, account_name="",
                                 promo_code="", final_price=plan["price"])
@@ -5516,7 +5594,93 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         await state.update_data(promo_code=code, final_price=final_price)
         await _render_purchase_review(message, state, db_user, plan)
 
-    # Step 2c — SHORTFALL-REQUEST: user can't afford the plan, so they request
+    # Step 2c — GIFT CODE (purchase context). UX-GIFT-IN-PURCHASE: a gift-code
+    # button on the review page lets the user top up their wallet without
+    # leaving the purchase. Only BALANCE-type gift codes are accepted here
+    # (plan-type codes are rejected with a clear message — they're not a
+    # wallet top-up). After a successful balance redemption the user is sent
+    # straight back to the SAME plan's review page so they can continue.
+    @router.callback_query(BuyCB.filter(F.action == "gift"))
+    async def cb_buy_gift(callback: CallbackQuery, state: FSMContext,
+                           callback_data: BuyCB, db_user: dict):
+        lang = _lang(db_user)
+        # Preserve existing state (plan_id, account_name, promo, final_price)
+        # — only switch the FSM state so ms_purchase_gift_code can fire.
+        await state.update_data(plan_id=callback_data.plan_id)
+        await state.set_state(UserStates.waiting_for_purchase_gift_code)
+        await callback.message.edit_text(
+            t("gift_in_purchase_hint", lang), reply_markup=kb_cancel(lang))
+        await callback.answer()
+
+    @router.message(UserStates.waiting_for_purchase_gift_code)
+    async def ms_purchase_gift_code(message: Message, state: FSMContext, db_user: dict):
+        lang = _lang(db_user)
+        code = (message.text or "").strip().upper()
+        gift = await db.get_gift_code(code)
+        if not gift:
+            await message.answer(t("gift_invalid", lang), reply_markup=kb_cancel(lang))
+            return
+        if gift["is_used"]:
+            await message.answer(t("gift_used_code", lang), reply_markup=kb_cancel(lang))
+            return
+        # UX-GIFT-IN-PURCHASE: reject plan-type codes BEFORE claiming. This
+        # section is a wallet top-up channel, so only balance-type codes
+        # make sense. The code stays unused so the owner can redeem it from
+        # the main-menu Wallet → Gift Code flow instead.
+        if gift["type"] != "balance":
+            await message.answer(
+                t("gift_plan_not_allowed_in_purchase", lang),
+                reply_markup=kb_cancel(lang))
+            return
+        # C3 — atomic claim. Try to mark the code as used BEFORE granting the
+        # reward. If two parallel redemptions both pass the is_used check
+        # above, only one wins the UPDATE row and proceeds.
+        if not await db.use_gift_code(code, message.from_user.id):
+            await message.answer(t("gift_used_code", lang), reply_markup=kb_cancel(lang))
+            return
+        # Grant balance. We do NOT call state.clear() here — the plan_id,
+        # account_name, promo_code, final_price must survive so we can drop
+        # the user back on the same review page.
+        amount = float(gift["value"])
+        # BUG-14 FIX: wrap claim + grant in a single transaction. If the grant
+        # fails, the transaction rolls back the use_gift_code UPDATE too — so
+        # the code stays unused and the user can retry. Without this, a
+        # transient DB error would consume the code without crediting balance.
+        try:
+            async with db.transaction():
+                await db.update_user_balance(message.from_user.id, amount, add=True)
+                await db.add_transaction(message.from_user.id, amount, "gift_balance", f"Gift: {code}")
+        except Exception as e:
+            logger.error("purchase gift balance grant failed (%s) — rolled back, code %s remains unused", e, code)
+            await message.answer(
+                t("gift_invalid", lang),  # generic "try again" — code is still valid
+                reply_markup=kb_cancel(lang))
+            return
+        currency = await _currency()
+        # Re-fetch the user so the balance shown on the review page reflects
+        # the top-up (db_user passed in was read at request start, before the
+        # balance changed).
+        fresh_user = await db.get_user(message.from_user.id) or db_user
+        data = await state.get_data()
+        plan = await db.get_plan(data.get("plan_id"))
+        if not plan:
+            # Plan vanished mid-flow — can't return to the review page, so
+            # confirm the redemption and send the user to the main menu.
+            await state.clear()
+            await message.answer(
+                t("gift_balance_ok", lang, amount=fmt_price(amount, lang, currency)),
+                reply_markup=kb_back_to_menu(lang))
+            return
+        # Confirm the top-up, then drop them back on the review page for the
+        # same plan. The review page re-evaluates can_afford with the fresh
+        # balance, so if the gift was enough the "Confirm & Pay" button will
+        # now appear.
+        await message.answer(
+            t("gift_balance_ok_back_to_purchase", lang,
+              amount=fmt_price(amount, lang, currency)))
+        await _render_purchase_review(message, state, fresh_user, plan)
+
+    # Step 2d — SHORTFALL-REQUEST: user can't afford the plan, so they request
     # a payment for exactly the missing amount. After admin approval the user
     # gets a one-tap "Buy Now" button to resume this purchase without having
     # to navigate back to the plan list.
@@ -5995,7 +6159,11 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         text += t("your_balance", lang, balance=fmt_price(balance, lang, currency)) + "\n"
         if balance < plan["price"]:
             text += t("insufficient", lang, diff=fmt_price(plan["price"] - balance, lang, currency))
-            text += f"\n{t('review_short_hint', lang)}"
+            # BUG-7 FIX: use renew_short_hint (not review_short_hint) — this
+            # page shows a "Charge Wallet" button, NOT the purchase-review's
+            # "Pay Exact Shortfall" button. The review_short_hint was a
+            # regression from Task 16 that pointed at a non-existent button.
+            text += f"\n{t('renew_short_hint', lang)}"
         kb = InlineKeyboardBuilder()
         if balance >= plan["price"]:
             kb.button(text=t("renew", lang),
@@ -6320,8 +6488,22 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         gb = await db.get_setting_float("trial_gb", TRIAL_DEFAULT_GB)
         limit_ip = await db.get_setting_int("trial_limit_ip", 1)
         trial_inbounds = await db.get_setting_json("trial_inbounds", [])
-        # Restrict to servers referenced by trial_inbounds (if any)
-        allowed = list({int(x.split("_", 1)[0]) for x in trial_inbounds if "_" in x})
+        # BUG-6 FIX: restrict to servers referenced by trial_inbounds. The OLD
+        # code used `int(x.split("_",1)[0])` with NO isdigit() guard — a
+        # malformed entry like "abc_def" (manual DB edit, migration bug)
+        # would raise ValueError and crash the WHOLE trial activation,
+        # leaving the trial claim consumed with no account created (the
+        # try/except that calls _unmark_trial_used is further down, after
+        # this line). Mirror the H18-fixed LoadBalancer.select_trial_inbounds
+        # pattern: validate sid_s.isdigit() before int().
+        allowed = set()
+        for x in trial_inbounds:
+            if "_" not in x:
+                continue
+            sid_s = x.split("_", 1)[0]
+            if sid_s.isdigit():
+                allowed.add(int(sid_s))
+        allowed = list(allowed)
         server = await lb.select_best_server(allowed or None)
         if not server:
             # C4 — undo the trial claim so the user can retry when a server
@@ -6911,8 +7093,24 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
 
         if gift["type"] == "balance":
             amount = float(gift["value"])
-            await db.update_user_balance(message.from_user.id, amount, add=True)
-            await db.add_transaction(message.from_user.id, amount, "gift_balance", f"Gift: {code}")
+            # BUG-14 FIX: wrap the claim + grant in a single transaction so a
+            # failure between use_gift_code and update_user_balance rolls back
+            # the claim (code stays unused → user can retry). Without this, a
+            # transient DB error would consume the code without crediting the
+            # balance. (use_gift_code's internal _auto_commit detects the
+            # active transaction and skips its own commit, so the rollback
+            # works correctly.)
+            try:
+                async with db.transaction():
+                    await db.update_user_balance(message.from_user.id, amount, add=True)
+                    await db.add_transaction(message.from_user.id, amount, "gift_balance", f"Gift: {code}")
+            except Exception as e:
+                # Transaction rolled back — the gift code is still unused.
+                logger.error("gift balance grant failed (%s) — rolled back, code %s remains unused", e, code)
+                await message.answer(
+                    t("gift_invalid", lang),  # generic "try again" — code is still valid
+                    reply_markup=kb_back_to_menu(lang))
+                return
             await message.answer(
                 t("gift_balance_ok", lang, amount=fmt_price(amount, lang, currency)),
                 reply_markup=kb_back_to_menu(lang),
@@ -7957,6 +8155,14 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         except ValueError:
             await message.answer("❌ Number please:", reply_markup=kb_cancel("en"))
             return
+        # BUG-4 FIX: reject negative duration — the buy/renew flow computes
+        # `expiry_time = (...) if plan["duration_days"] > 0 else 0`, so a
+        # negative value silently becomes 0 (never expires). Admin typo
+        # (-30 instead of 30) would grant unlimited accounts.
+        if days < 0:
+            await message.answer("❌ Duration cannot be negative. Use 0 for never-expires.",
+                                 reply_markup=kb_cancel("en"))
+            return
         await state.update_data(duration_days=days)
         await state.set_state(AdminStates.waiting_for_plan_price)
         cur = await _currency()
@@ -7969,6 +8175,12 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             price = float(message.text.strip())
         except ValueError:
             await message.answer("❌ Number please:", reply_markup=kb_cancel("en"))
+            return
+        # BUG-1 FIX: reject negative prices — a negative price would make
+        # try_deduct_balance add to the user's balance (balance - (-price)),
+        # letting users inflate their wallet by "buying" the plan.
+        if price < 0:
+            await message.answer("❌ Price cannot be negative.", reply_markup=kb_cancel("en"))
             return
         await state.update_data(price=price)
         await state.set_state(AdminStates.waiting_for_plan_limit_ip)
@@ -8216,6 +8428,13 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
                     await state.clear()
                     await message.answer("❌ Number please.", reply_markup=kb_admin_menu())
                     return
+                # BUG-3 FIX: reject negative price (same exploit as BUG-1 but
+                # via plan-edit). Mirrors the negative-check already present in
+                # the traffic_gb branch below.
+                if val < 0:
+                    await state.clear()
+                    await message.answer("❌ Price cannot be negative.", reply_markup=kb_admin_menu())
+                    return
                 await db.update_plan(plan_id, **{field: val})
             else:
                 await db.update_plan(plan_id, **{field: raw if raw != "-" else None})
@@ -8310,13 +8529,27 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             parts = raw.split()
             # days is always an integer (whole days); GB may be fractional
             # (e.g. "30 0.2" = 30 days + 200 MB).
-            days = int(parts[0]) if len(parts) > 0 and parts[0].lstrip("-").isdigit() else 0
+            # BUG-5 FIX: use str.isdigit() (NOT lstrip("-").isdigit()) so
+            # negative numbers like "-30" are rejected at parse time instead
+            # of silently accepted. The old lstrip("-") let "-30" through,
+            # which then sent add_days=-30 to the panel (shortening the
+            # account) while the DB kept the original expiry — inconsistent
+            # state between panel and DB.
+            days = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
             gb = 0.0
             if len(parts) > 1:
                 try:
                     gb = float(parts[1])
                 except ValueError:
                     gb = 0.0
+            # BUG-5 FIX (cont): reject negative GB too — negative GB reduces
+            # the DB traffic_gb while sending add_bytes=0 to the panel (the
+            # `if gb > 0` guard in add_bytes), causing the same panel-vs-DB
+            # inconsistency. Also reject explicit "-N" forms that slipped
+            # past the isdigit() check via the GB float() parse.
+            if gb < 0:
+                await message.answer("❌ GB cannot be negative.", reply_markup=kb_cancel("en"))
+                return
             if days == 0 and gb == 0:
                 await message.answer("❌ Send e.g. <code>30 10</code> (days GB) — GB can be decimal like <code>30 0.2</code>:",
                                      reply_markup=kb_cancel("en"))
@@ -8673,6 +8906,15 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
             return
         server = await db.get_server(account["server_id"])
+        # BUG-10 FIX: server_id can be NULL (ON DELETE SET NULL when an admin
+        # deletes a server that has accounts). Sibling handlers (cb_acc_disable,
+        # cb_acc_enable, cb_acc_delete) all guard with `if server:` — this one
+        # was missing it, so `server["panel_url"]` would crash with
+        # TypeError: 'NoneType' object is not subscriptable and leave the
+        # callback unanswered (endless spinner).
+        if not server:
+            await callback.answer("❌ Server not found", show_alert=True)
+            return
         r = await api.reset_client_traffic(server["panel_url"], server["api_token"], email)
         if r.get("success"):
             # H16 — clear traffic_alerts so the user gets re-warned when they
@@ -8804,6 +9046,15 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         except ValueError:
             await message.answer("❌ Number:", reply_markup=kb_cancel("en"))
             return
+        # BUG-11 FIX: reject negative max_uses. A negative value makes the
+        # promo validate OK (validate_promo_code's `max_uses > 0` check is
+        # False, so it's treated as unlimited) but the atomic increment in
+        # use_promo_code (`used_count < max_uses` = `0 < -5` = False) always
+        # rejects the redemption — creating an unusable promo. 0 = unlimited.
+        if mu < 0:
+            await message.answer("❌ Max uses cannot be negative (0 = unlimited).",
+                                 reply_markup=kb_cancel("en"))
+            return
         data = await state.get_data()
         await state.clear()
         await db.add_promo_code(data["code"], discount_percent=data["disc"], max_uses=mu)
@@ -8845,6 +9096,12 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             amount = float((message.text or "").strip())
         except ValueError:
             await message.answer("❌ Number:", reply_markup=kb_cancel("en"))
+            return
+        # BUG-2 FIX: reject non-positive amounts — a negative balance-type gift
+        # code would DRAIN the redeemer's wallet (update_user_balance with
+        # add=True + negative = subtraction). Zero is meaningless.
+        if amount <= 0:
+            await message.answer("❌ Amount must be positive.", reply_markup=kb_cancel("en"))
             return
         await state.clear()
         code = gen_gift_code()
@@ -10454,8 +10711,18 @@ async def task_traffic_alerts(bot: Bot, db: Database, api: PanelAPI):
                 logger.info("Auto-disabled depleted: %s", acc["email"])
                 try:
                     kb = InlineKeyboardBuilder()
-                    kb.button(text=t("renew", lang),
-                              callback_data=AccountCB(action="renew", email=acc["email"]).pack(), style="success")
+                    # BUG-8 FIX: trial accounts can't be renewed (cb_account_renew
+                    # returns trial_no_renew). Showing a "Renew" button to a trial
+                    # user whose traffic just hit 100% is a dead end — they tap it
+                    # and get a "can't renew trial" alert. Mirror the 80/95% alert
+                    # (line 10550-10557): show "Buy" for trial accounts, "Renew"
+                    # for regular accounts.
+                    if not acc.get("is_trial"):
+                        kb.button(text=t("renew", lang),
+                                  callback_data=AccountCB(action="renew", email=acc["email"]).pack(), style="success")
+                    else:
+                        kb.button(style="success", text=t("buy", lang),
+                                  callback_data=MenuCB(action="buy").pack())
                     kb.adjust(1)
                     await bot.send_message(
                         acc["user_tg_id"],
