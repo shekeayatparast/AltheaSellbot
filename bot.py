@@ -546,7 +546,28 @@ class rich_tables:
             for tx in txs:
                 label = type_labels.get(tx["type"], f"• {tx['type']}")
                 amt = fmt(abs(tx["amount"]), lang, currency)
-                sign = "+" if tx["amount"] >= 0 else "-"
+                # TX-SIGN-FIX: determine the display sign by transaction TYPE,
+                # not by the stored amount.  purchase/renewal/topup store a
+                # POSITIVE amount (so SUM(amount) in get_revenue_stats works),
+                # but they represent money LEAVING the wallet — they must
+                # display as "-".  deposit/gift_balance are always "+".
+                # admin_adjust stores the real sign (+ for add, - for deduct).
+                # Zero-amount rows (trial, gift_plan) show no sign at all.
+                _t = tx["type"]
+                if _t in ("purchase", "renewal", "topup"):
+                    sign = "-"
+                elif _t in ("deposit", "gift_balance"):
+                    sign = "+"
+                elif _t == "admin_adjust":
+                    if tx["amount"] > 0:
+                        sign = "+"
+                    elif tx["amount"] < 0:
+                        sign = "-"
+                    else:
+                        sign = ""
+                else:
+                    # trial, gift_plan, etc. — amount is 0
+                    sign = "+" if tx["amount"] > 0 else ("-" if tx["amount"] < 0 else "")
                 iso = fmt_iso(tx["created_at"])
                 date = iso[5:16] if iso else ""
                 rows.append((date, label, f"{sign}{amt}"))
@@ -1119,6 +1140,11 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "approve_payment": "✅ Approve",
         "reject_payment": "❌ Reject",
         "enter_reject_reason": "❌ Enter rejection reason (or send <code>-</code> for no reason):",
+        # TOPUP-TOGGLE: shown as an alert toast when a user taps a stale top-up
+        # button (sitting in an old message from before the admin disabled
+        # top-ups).
+        "topup_disabled": "❌ Top-ups are currently disabled by the admin. Please try again later.",
+        "topup_unlimited_noop": "❌ This account is unlimited — top-up is not needed. Use Renew to extend the duration.",
         "force_join": (
             "🔒 <b>Please join our channel first!</b>\n\n"
             "You must join the following channel(s) to use this bot:\n\n"
@@ -1127,7 +1153,7 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         ),
         "verify_join": "✅ I Joined",
         "force_join_success": "✅ Membership verified! You can now use the bot.",
-        "force_join_failed": "❌ You haven't joined all required channels yet. Please join first.",
+        "force_join_failed": "❌ You haven't joined all required channels yet.\nPlease join the channels listed above first, then press the ✅ button.",
         "no_inbounds_configured": "❌ This plan has no configured inbounds. Please contact admin.",
         "broadcast_header_en": "📢 <b>Public Announcement</b>\n\n",
         "charge_wallet_btn": "💳 Charge Wallet",
@@ -1151,6 +1177,52 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "toggled": "✅ Toggled",
         "not_pending": "Not pending.",
         "already_processed": "⚠️ Already processed by another admin.",
+        # ---- Payment-admin screens (PA-LANG) ----
+        # Full admins always see English; payment-only admins see their
+        # selected language.  These keys are used by the payment-admin
+        # menu, pending-payments view, payment-history view, payment-detail
+        # view, and approve/reject flows.
+        "pa_menu_title": "💰 Payment Admin Panel",
+        "pa_menu_desc": "You can approve or reject pending payments.",
+        "pa_pending_btn": "💰 Pending Payments",
+        "pa_history_btn": "📋 Payment History",
+        "pa_no_pending": "💰 No pending payments",
+        "pa_no_more_pending": "💰 No more pending payments",
+        "pa_pending_header": "💰 Pending Payments — {i}/{n}",
+        "pa_payment_title": "💰 Payment #{id}",
+        "pa_user": "👤 User: {name} ({id})",
+        "pa_base_amount": "💵 Base amount: {amt} Toman",
+        "pa_unique_amount": "💵 Unique amount: {amt} Toman",
+        "pa_card": "💳 Card: {num}",
+        "pa_created": "📅 Created: {date}",
+        "pa_receipt_text": "{icon} Receipt text: {text}",
+        "pa_receipt_kind": "{icon} Receipt: {kind}",
+        "pa_status": "Status: {status}",
+        "pa_status_pending": "pending",
+        "pa_status_approved": "approved",
+        "pa_status_rejected": "rejected",
+        "pa_approve_btn": "✅ Approve",
+        "pa_reject_btn": "❌ Reject",
+        "pa_next_btn": "⏭ Next pending ({i}/{n})",
+        "pa_full_history_btn": "📋 Full history",
+        "pa_history_btn2": "📋 History",
+        "pa_pending_back_btn": "🔙 Pending",
+        "pa_admin_back_btn": "🔙 Admin",
+        "pa_receipt_caption": "📎 Receipt for payment #{id} — {name}",
+        "pa_reviewed_by": "🛡 {action} by: {admin} ({id})",
+        "pa_action_approved": "Approved",
+        "pa_action_rejected": "Rejected",
+        "pa_reviewed_at": "🕒 Reviewed: {date}",
+        "pa_reject_reason": "❌ Reason: {reason}",
+        "pa_no_payments": "📋 No payments yet",
+        "pa_history_title": "📋 Payment History (latest 20)",
+        "pa_history_header": "ID • User • Amount • Status • Receipt • Approved by",
+        "pa_approve_failed": "❌ Approve failed: {err}",
+        "pa_approved_msg": "✅ Payment #{id} approved\n💰 {amt} Toman added to user {uid}\n\n✅ No more pending payments",
+        "pa_approved_toast": "✅ Approved",
+        "pa_not_found_processed": "Payment not found or already processed.",
+        "pa_already_processed_msg": "⚠️ Payment was already processed by another admin.",
+        "pa_rejected_msg": "❌ Payment #{id} rejected",
     },
     # ------------------------------------------------------------------ Farsi
     "fa": {
@@ -1404,6 +1476,10 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "approve_payment": "✅ تأیید",
         "reject_payment": "❌ رد",
         "enter_reject_reason": "❌ دلیل رد را بنویسید (یا <code>-</code> برای بدون دلیل):",
+        # TOPUP-TOGGLE: alert toast for stale top-up button taps after the
+        # admin disabled top-ups.
+        "topup_disabled": "❌ افزایش حجم در حال حاضر توسط ادمین غیرفعال شده است. لطفاً بعداً دوباره تلاش کنید.",
+        "topup_unlimited_noop": "❌ این اکانت نامحدود است — افزایش حجم لازم ندارد. برای تمدید مدت از دکمهٔ تمدید استفاده کنید.",
         "force_join": (
             "🔒 <b>ابتدا عضو کانال ما شوید!</b>\n\n"
             "برای استفاده از ربات، باید عضو کانال‌های زیر باشید:\n\n"
@@ -1412,7 +1488,7 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         ),
         "verify_join": "✅ عضو شدم",
         "force_join_success": "✅ عضویت تأیید شد! حالا می‌توانید از ربات استفاده کنید.",
-        "force_join_failed": "❌ شما هنوز عضو همهٔ کانال‌های مورد نیاز نشده‌اید. ابتدا عضو شوید.",
+        "force_join_failed": "❌ شما هنوز عضو همهٔ کانال‌های مورد نیاز نشده‌اید.\nابتدا عضو کانال‌های ذکرشده در بالا شوید، سپس دکمهٔ ✅ را بزنید.",
         "no_inbounds_configured": "❌ این پلن اینباند تنظیم‌شده ندارد. با مدیریت تماس بگیرید.",
         "broadcast_header_fa": "📢 <b>اطلاعیه همگانی</b>\n\n",
         "charge_wallet_btn": "💳 شارژ کیف پول",
@@ -1436,6 +1512,50 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "toggled": "✅ تغییر کرد",
         "not_pending": "در انتظار نیست.",
         "already_processed": "⚠️ قبلاً توسط مدیریت دیگری پردازش شده است.",
+        # ---- Payment-admin screens (PA-LANG) ----
+        # ترجمهٔ فارسی بخش ادمین پرداخت. ادمین‌های اصلی همیشه انگلیسی
+        # می‌بینند؛ ادمین‌های پرداخت زبان انتخابی خودشان را می‌بینند.
+        "pa_menu_title": "💰 پنل ادمین پرداخت",
+        "pa_menu_desc": "می‌توانید پرداخت‌های در انتظار را تأیید یا رد کنید.",
+        "pa_pending_btn": "💰 پرداخت‌های در انتظار",
+        "pa_history_btn": "📋 تاریخچه پرداخت‌ها",
+        "pa_no_pending": "💰 پرداخت در انتظاری وجود ندارد",
+        "pa_no_more_pending": "💰 پرداخت در انتظار دیگری وجود ندارد",
+        "pa_pending_header": "💰 پرداخت‌های در انتظار — {i}/{n}",
+        "pa_payment_title": "💰 پرداخت #{id}",
+        "pa_user": "👤 کاربر: {name} ({id})",
+        "pa_base_amount": "💵 مبلغ پایه: {amt} تومان",
+        "pa_unique_amount": "💵 مبلغ یکتا: {amt} تومان",
+        "pa_card": "💳 کارت: {num}",
+        "pa_created": "📅 ایجادشده: {date}",
+        "pa_receipt_text": "{icon} متن رسید: {text}",
+        "pa_receipt_kind": "{icon} رسید: {kind}",
+        "pa_status": "وضعیت: {status}",
+        "pa_status_pending": "در انتظار",
+        "pa_status_approved": "تأییدشده",
+        "pa_status_rejected": "ردشده",
+        "pa_approve_btn": "✅ تأیید",
+        "pa_reject_btn": "❌ رد",
+        "pa_next_btn": "⏭ بعدی ({i}/{n})",
+        "pa_full_history_btn": "📋 کل تاریخچه",
+        "pa_history_btn2": "📋 تاریخچه",
+        "pa_pending_back_btn": "🔙 در انتظار",
+        "pa_admin_back_btn": "🔙 ادمین",
+        "pa_receipt_caption": "📎 رسید پرداخت #{id} — {name}",
+        "pa_reviewed_by": "🛡 {action} توسط: {admin} ({id})",
+        "pa_action_approved": "تأییدشده",
+        "pa_action_rejected": "ردشده",
+        "pa_reviewed_at": "🕒 بررسی‌شده: {date}",
+        "pa_reject_reason": "❌ دلیل: {reason}",
+        "pa_no_payments": "📋 هنوز پرداختی وجود ندارد",
+        "pa_history_title": "📋 تاریخچه پرداخت‌ها (آخرین ۲۰)",
+        "pa_history_header": "شناسه • کاربر • مبلغ • وضعیت • رسید • تأییدکننده",
+        "pa_approve_failed": "❌ تأیید ناموفق: {err}",
+        "pa_approved_msg": "✅ پرداخت #{id} تأیید شد\n💰 {amt} تومان به موجودی کاربر {uid} اضافه شد\n\n✅ پرداخت در انتظار دیگری وجود ندارد",
+        "pa_approved_toast": "✅ تأیید شد",
+        "pa_not_found_processed": "پرداخت یافت نشد یا قبلاً پردازش شده است.",
+        "pa_already_processed_msg": "⚠️ این پرداخت قبلاً توسط ادمین دیگری پردازش شده است.",
+        "pa_rejected_msg": "❌ پرداخت #{id} رد شد",
     },
 }
 
@@ -1862,7 +1982,13 @@ class Database:
             # On approval, the bot asks the user "ready to buy plan X?" and
             # offers a one-tap "Buy Now" button so they don't have to
             # navigate back to the plan list.
-            "payments": [("resume_plan_id", "INTEGER")],
+            "payments": [("resume_plan_id", "INTEGER"),
+                         # RECEIPT-HISTORY: store the approving/rejecting admin's
+                         # username (or first_name fallback) at decision time so
+                         # the history view can show "approved by @admin" without
+                         # an extra JOIN — and survives even if the admin later
+                         # blocks the bot (so they're not in `users` anymore).
+                         ("admin_username", "TEXT")],
         }
         for table, cols in add_cols.items():
             async with self._db.execute(f"PRAGMA table_info({table})") as cur:
@@ -1947,6 +2073,14 @@ class Database:
             "currency": DEFAULT_CURRENCY,
             "default_language": DEFAULT_LANGUAGE,
             "topup_packages": json.dumps([5, 10, 20, 50]),  # GB options
+            # TOPUP-TOGGLE: admin can disable the whole top-up feature so
+            # users can't add traffic to existing accounts (renew still works
+            # — only the standalone "+traffic" path is gated). When disabled,
+            # the topup button is hidden from account-detail / traffic alerts
+            # AND a guard at the top of cb_account_topup / cb_topup_buy
+            # rejects any in-flight callback (in case a stale button is
+            # sitting in a user's old message).
+            "topup_enabled": "1",
             "payment_enabled": "1",
             "payment_card_number": "",
             "payment_card_holder": "",
@@ -3055,6 +3189,16 @@ class Database:
         ) as cur:
             return [dict(r) for r in await cur.fetchall()]
 
+    async def get_recent_payments(self, limit: int = 20) -> List[dict]:
+        """RECEIPT-HISTORY: most-recent payments of any status, for the admin
+        history view. Ordered newest-first so the admin sees the latest
+        approvals/rejects at the top."""
+        async with self._db.execute(
+            "SELECT * FROM payments ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
     async def get_user_payments(self, tg_id: int, limit: int = 10) -> List[dict]:
         async with self._db.execute(
             "SELECT * FROM payments WHERE user_tg_id = ? ORDER BY created_at DESC LIMIT ?",
@@ -3062,28 +3206,34 @@ class Database:
         ) as cur:
             return [dict(r) for r in await cur.fetchall()]
 
-    async def approve_payment(self, payment_id: int, admin_id: int) -> bool:
+    async def approve_payment(self, payment_id: int, admin_id: int,
+                              admin_username: str = "") -> bool:
         """Atomic approve: only succeeds if the payment is still pending.
 
         Returns True if THIS call performed the transition (pending → approved).
         Returns False if the payment was already approved/rejected by another
         admin — prevents double-credit races (C1) when two admins click
         "Approve" simultaneously.
+
+        ``admin_username`` is stored denormalized so the history view can show
+        "approved by @admin" without an extra JOIN — and survives even if the
+        admin later blocks the bot (so they're not in `users` anymore).
         """
         cur = await self._db.execute(
-            "UPDATE payments SET status = 'approved', admin_id = ?, reviewed_at = ? "
+            "UPDATE payments SET status = 'approved', admin_id = ?, admin_username = ?, reviewed_at = ? "
             "WHERE id = ? AND status = 'pending'",
-            (admin_id, datetime.now(timezone.utc).isoformat(), payment_id),
+            (admin_id, admin_username, datetime.now(timezone.utc).isoformat(), payment_id),
         )
         await self._auto_commit()
         return cur.rowcount == 1
 
-    async def reject_payment(self, payment_id: int, admin_id: int, note: str = "") -> bool:
+    async def reject_payment(self, payment_id: int, admin_id: int, note: str = "",
+                             admin_username: str = "") -> bool:
         """Atomic reject: only succeeds if the payment is still pending."""
         cur = await self._db.execute(
-            "UPDATE payments SET status = 'rejected', admin_id = ?, admin_note = ?, reviewed_at = ? "
+            "UPDATE payments SET status = 'rejected', admin_id = ?, admin_username = ?, admin_note = ?, reviewed_at = ? "
             "WHERE id = ? AND status = 'pending'",
-            (admin_id, note, datetime.now(timezone.utc).isoformat(), payment_id),
+            (admin_id, admin_username, note, datetime.now(timezone.utc).isoformat(), payment_id),
         )
         await self._auto_commit()
         return cur.rowcount == 1
@@ -4457,6 +4607,7 @@ def kb_admin_menu(lang: str = "en") -> InlineKeyboardMarkup:
     kb.button(style="primary", text="👥 Users", callback_data=AdminCB(action="users").pack())
     kb.button(style="primary", text="💰 Finance", callback_data=AdminCB(action="finance").pack())
     kb.button(style="primary", text="💰 Pending Pay", callback_data=AdminCB(action="pending_payments").pack())
+    kb.button(style="primary", text="📋 Pay History", callback_data=AdminCB(action="payment_history").pack())
     kb.button(style="primary", text="🎫 Promos", callback_data=AdminCB(action="promos").pack())
     kb.button(style="success", text="🎁 Gift Codes", callback_data=AdminCB(action="gift_codes").pack())
     kb.button(style="primary", text="💬 Tickets", callback_data=AdminCB(action="tickets").pack())
@@ -4464,15 +4615,22 @@ def kb_admin_menu(lang: str = "en") -> InlineKeyboardMarkup:
     kb.button(style="primary", text="🧹 Cleanup", callback_data=AdminCB(action="cleanup").pack())
     kb.button(style="primary", text="⚙️ Settings", callback_data=AdminCB(action="settings").pack())
     kb.button(text=t("back_menu", lang), callback_data=MenuCB(action="main").pack(), style="danger")
-    kb.adjust(2, 2, 2, 2, 2, 2, 1)
+    kb.adjust(2, 2, 2, 2, 1, 2, 2, 2, 1)
     return kb.as_markup()
 
 
 def kb_payment_admin_menu(lang: str = "en") -> InlineKeyboardMarkup:
-    """Limited menu for payment-only admins — just pending payments + back."""
+    """Limited menu for payment-only admins — pending + history + back.
+
+    PA-LANG: buttons are localised via the pa_* i18n keys so payment admins
+    see their selected language.  Full admins see English (the caller passes
+    lang="en" via _pa_lang).
+    """
     kb = InlineKeyboardBuilder()
-    kb.button(style="success", text="💰 Pending Payments",
+    kb.button(style="success", text=t("pa_pending_btn", lang),
               callback_data=AdminCB(action="pending_payments").pack())
+    kb.button(style="primary", text=t("pa_history_btn", lang),
+              callback_data=AdminCB(action="payment_history").pack())
     kb.button(text=t("back_menu", lang), callback_data=MenuCB(action="main").pack(), style="danger")
     kb.adjust(1)
     return kb.as_markup()
@@ -4589,12 +4747,22 @@ def kb_purchase_review(plan_id: int, lang: str, has_name: bool = False,
     return kb.as_markup()
 
 
-def kb_account_details(email: str, is_active: bool, lang: str, is_trial: bool = False) -> InlineKeyboardMarkup:
+def kb_account_details(email: str, is_active: bool, lang: str, is_trial: bool = False,
+                       topup_enabled: bool = True, is_unlimited: bool = False) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     # Trial accounts cannot be renewed or topped up (one-shot free account).
+    # TOPUP-TOGGLE: hide the top-up button entirely when the admin has
+    # disabled top-ups (so the user can't even tap a dead-end button).
+    # UNLIMITED-TOGGLE: also hide top-up for unlimited accounts (traffic_gb=0)
+    # because adding GB to an unlimited account is a no-op — the user would
+    # pay money for nothing.  The panel's add_bytes is ignored by 3x-ui when
+    # total=0 (unlimited), and the DB keeps traffic_gb=0 (see H2 block in
+    # cb_topup_buy).  Renewal is still available for unlimited accounts.
+    show_topup = topup_enabled and not is_unlimited
     if not is_trial:
         kb.button(text=t("renew", lang), callback_data=AccountCB(action="renew", email=email).pack(), style="success")
-        kb.button(text=t("topup_traffic", lang), callback_data=AccountCB(action="topup", email=email).pack(), style="primary")
+        if show_topup:
+            kb.button(text=t("topup_traffic", lang), callback_data=AccountCB(action="topup", email=email).pack(), style="primary")
     kb.button(style="primary", text=t("traffic", lang), callback_data=AccountCB(action="traffic", email=email).pack())
     kb.button(style="primary", text=t("get_link", lang), callback_data=AccountCB(action="links", email=email).pack())
     kb.button(style="primary", text=t("qr", lang), callback_data=AccountCB(action="qr", email=email).pack())
@@ -4608,7 +4776,13 @@ def kb_account_details(email: str, is_active: bool, lang: str, is_trial: bool = 
     if is_trial:
         kb.adjust(2, 2, 2, 1)
     else:
-        kb.adjust(2, 2, 2, 2, 1)
+        # Row layout varies: when top-up is hidden, the first row has only
+        # Renew (1 button) instead of Renew+TopUp (2 buttons). The adjust()
+        # must match so Telegram doesn't auto-pair buttons in ugly ways.
+        if show_topup:
+            kb.adjust(2, 2, 2, 2, 1)
+        else:
+            kb.adjust(1, 2, 2, 2, 1)
     return kb.as_markup()
 
 
@@ -5045,12 +5219,20 @@ class AuthMiddleware:
                                 logger.warning("get_chat_member failed for %s: %s", ch, e, exc_info=True)
                                 not_joined.append(ch)
                     if not_joined:
-                        # Allow language selection callbacks to pass through
+                        # Allow language selection callbacks to pass through.
+                        # LangCB = the user picked a specific language (en/fa).
+                        # MenuCB(action="language") = the user tapped the
+                        # "🌐 Language" button to OPEN the language picker.
+                        # ForceJoinCB = the "✅ I Joined" verify button.
+                        # All three must pass through so the user can change
+                        # their language from within the force-join prompt.
                         if isinstance(event, CallbackQuery):
                             cb_data = data.get("callback_data")
                             if isinstance(cb_data, LangCB):
                                 return await handler(event, data)
                             if isinstance(cb_data, ForceJoinCB):
+                                return await handler(event, data)
+                            if isinstance(cb_data, MenuCB) and cb_data.action == "language":
                                 return await handler(event, data)
                         # Build channels list text
                         channels_text = ""
@@ -5113,6 +5295,45 @@ async def get_payment_admin_ids(db: "Database") -> set:
     return {int(x) for x in raw if x}
 
 
+def _admin_display(user: Optional[dict]) -> str:
+    """Best-effort human-readable label for an admin row (used in receipt
+    history so the admin can see "approved by @username").
+
+    Preference order: @username → first_name+last_name → first_name → tg_id.
+    Returns ``"-"`` if the admin row is missing (e.g. legacy rows approved
+    before this column existed).
+    """
+    if not user:
+        return "-"
+    uname = (user.get("username") or "").strip()
+    if uname:
+        return f"@{uname}"
+    parts = [(user.get("first_name") or "").strip(), (user.get("last_name") or "").strip()]
+    parts = [p for p in parts if p]
+    if parts:
+        return " ".join(parts)
+    return str(user.get("tg_id") or "-")
+
+
+def _admin_handle_from_callback(user) -> str:
+    """Build a human-readable admin handle straight from a Telegram User
+    object (the one aiogram injects on callback handlers).
+
+    Used when we're about to store ``admin_username`` on the payment row at
+    approve/reject time — we capture it before any DB lookup so it survives
+    even if the admin later blocks the bot.
+    """
+    uname = (getattr(user, "username", None) or "").strip()
+    if uname:
+        return f"@{uname}"
+    parts = [(getattr(user, "first_name", None) or "").strip(),
+             (getattr(user, "last_name", None) or "").strip()]
+    parts = [p for p in parts if p]
+    if parts:
+        return " ".join(parts)
+    return str(getattr(user, "id", "-"))
+
+
 class AdminGuard:
     """Enforce admin / payment-admin access on the admin router.
 
@@ -5130,6 +5351,7 @@ class AdminGuard:
     _PAYMENT_ALLOWED_PREFIXES = (
         "admin:main",
         "admin:pending_payments",
+        "admin:payment_history",
         "pay:",
         "menu:main",
     )
@@ -5302,6 +5524,55 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         await db.update_language_selected(callback.from_user.id, True)
         await state.clear()
         me = await bot.get_me()
+
+        # FORCE-JOIN RE-CHECK: after setting the language, verify the user has
+        # joined all required channels.  If force-join is enabled and the user
+        # hasn't joined yet, re-show the force-join prompt (in the newly-
+        # selected language) instead of the main menu — otherwise language
+        # selection would be a force-join bypass.  Admins skip this check.
+        if callback.from_user.id not in ADMIN_IDS:
+            fj_enabled = await db.get_setting_int("force_join_enabled", 0)
+            if fj_enabled:
+                channels = await db.get_setting_json("force_join_channels", [])
+                if channels:
+                    not_joined = []
+                    for ch in channels:
+                        chat_id = ch.get("chat_id")
+                        if chat_id:
+                            try:
+                                member = await bot.get_chat_member(int(chat_id), callback.from_user.id)
+                                if member.status not in ("member", "administrator", "creator"):
+                                    not_joined.append(ch)
+                            except (TelegramBadRequest, TelegramForbiddenError):
+                                not_joined.append(ch)
+                            except Exception as e:
+                                logger.warning("lang-set force_join check failed for %s: %s", ch, e)
+                                not_joined.append(ch)
+                    if not_joined:
+                        channels_text = ""
+                        for ch in not_joined:
+                            username = ch.get("username", "")
+                            title = ch.get("title", "")
+                            if username:
+                                channels_text += f"• @{username}\n"
+                            elif title:
+                                channels_text += f"• {title}\n"
+                        kb = InlineKeyboardBuilder()
+                        for ch in not_joined:
+                            username = ch.get("username", "")
+                            if username:
+                                kb.button(style="primary", text=f"📢 {username}", url=f"https://t.me/{username}")
+                        kb.button(text=t("verify_join", lang), callback_data=ForceJoinCB(action="verify").pack(), style="success")
+                        kb.button(style="primary", text=t("language", lang), callback_data=MenuCB(action="language").pack())
+                        kb.adjust(1, 2)
+                        await callback.message.edit_text(
+                            t("lang_set", lang) + "\n\n" + t("force_join", lang, channels=channels_text),
+                            reply_markup=kb.as_markup(),
+                        )
+                        await callback.answer()
+                        return
+
+        # Normal flow: show welcome + main menu
         await callback.message.edit_text(
             t("lang_set", lang) + "\n\n" + t("welcome", lang, bot_name=f"@{me.username}"),
             reply_markup=kb_main_menu(await _can_access_admin(callback.from_user.id), lang),
@@ -5381,6 +5652,35 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
                         ch, e, exc_info=True,
                     )
         if not_joined:
+            # FORCE-JOIN-RENDER: re-render the force-join prompt with the list
+            # of channels the user STILL hasn't joined, so they can see exactly
+            # what they need to do.  Previously this only showed a brief popup
+            # alert ("❌ You haven't joined...") which disappeared quickly and
+            # didn't list the specific channels — the user had no persistent
+            # reference.  Now we show the full prompt (with channel links +
+            # "✅ I Joined" button + language button) AND the popup alert.
+            channels_text = ""
+            for ch in not_joined:
+                username = ch.get("username", "")
+                title = ch.get("title", "")
+                if username:
+                    channels_text += f"• @{username}\n"
+                elif title:
+                    channels_text += f"• {title}\n"
+            kb = InlineKeyboardBuilder()
+            for ch in not_joined:
+                username = ch.get("username", "")
+                if username:
+                    kb.button(style="primary", text=f"📢 {username}", url=f"https://t.me/{username}")
+            kb.button(text=t("verify_join", lang), callback_data=ForceJoinCB(action="verify").pack(), style="success")
+            kb.button(style="primary", text=t("language", lang), callback_data=MenuCB(action="language").pack())
+            kb.adjust(1, 2)
+            try:
+                await show_view(callback.message,
+                                text=t("force_join", lang, channels=channels_text),
+                                reply_markup=kb.as_markup())
+            except Exception as e:
+                logger.warning("force-join re-render failed: %s", e)
             await callback.answer(t("force_join_failed", lang), show_alert=True)
             return
         # All channels joined
@@ -5957,7 +6257,10 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         # the user is on a QR photo message, edit_text would fail because a
         # photo cannot be turned into text. show_view falls back to delete+send.
         await show_view(callback.message, text=text,
-            reply_markup=kb_account_details(account["email"], account["is_active"], lang, account.get("is_trial", False)))
+            reply_markup=kb_account_details(account["email"], account["is_active"], lang,
+                                            account.get("is_trial", False),
+                                            topup_enabled=bool(await db.get_setting_int("topup_enabled", 1)),
+                                            is_unlimited=(account.get("traffic_gb") == 0)))
         await callback.answer()
 
     @router.callback_query(AccountCB.filter(F.action == "links"))
@@ -6128,14 +6431,20 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         acc = await db.get_account(email)
         is_active = acc["is_active"] if acc else True
         is_trial = bool(acc.get("is_trial", False)) if acc else False
+        is_unlimited = (acc.get("traffic_gb") == 0) if acc else False
+        topup_enabled = bool(await db.get_setting_int("topup_enabled", 1))
         if text == "-":
             await db.update_account(email, label=None)
             await message.answer(t("label_cleared", lang),
-                                 reply_markup=kb_account_details(email, is_active, lang, is_trial))
+                                 reply_markup=kb_account_details(email, is_active, lang, is_trial,
+                                                                 topup_enabled=topup_enabled,
+                                                                 is_unlimited=is_unlimited))
         else:
             await db.update_account(email, label=text)
             await message.answer(t("label_set", lang, label=escape_html(text)),
-                                 reply_markup=kb_account_details(email, is_active, lang, is_trial))
+                                 reply_markup=kb_account_details(email, is_active, lang, is_trial,
+                                                                 topup_enabled=topup_enabled,
+                                                                 is_unlimited=is_unlimited))
 
     # ---- renew ---------------------------------------------------------
     @router.callback_query(AccountCB.filter(F.action == "renew"))
@@ -6265,12 +6574,25 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
     @router.callback_query(AccountCB.filter(F.action == "topup"))
     async def cb_account_topup(callback: CallbackQuery, callback_data: AccountCB, db_user: dict):
         lang = _lang(db_user)
+        # TOPUP-TOGGLE: guard at the entry point so a stale topup button (still
+        # sitting in a user's old message from before the admin disabled it)
+        # can't open the package picker.
+        if not await db.get_setting_int("topup_enabled", 1):
+            await callback.answer(t("topup_disabled", lang), show_alert=True)
+            return
         account = await db.get_account(callback_data.email)
         if not account or account["user_tg_id"] != callback.from_user.id:
             await callback.answer(t("not_found", lang), show_alert=True)
             return
         if account.get("is_trial"):
             await callback.answer(t("trial_no_renew", lang), show_alert=True)
+            return
+        # UNLIMITED-TOGGLE: top-up is meaningless for unlimited accounts
+        # (traffic_gb=0).  The panel ignores add_bytes when total=0, and the
+        # DB keeps traffic_gb=0 (H2 block below).  Reject stale taps from
+        # old messages rendered before the button was hidden.
+        if account.get("traffic_gb") == 0:
+            await callback.answer(t("topup_unlimited_noop", lang), show_alert=True)
             return
         packages = await db.get_setting_json("topup_packages", [5, 10, 20, 50])
         await callback.message.edit_text(
@@ -6282,12 +6604,23 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
     @router.callback_query(TopupCB.filter(F.action == "buy"))
     async def cb_topup_buy(callback: CallbackQuery, callback_data: TopupCB, db_user: dict):
         lang = _lang(db_user)
+        # TOPUP-TOGGLE: double-guard on the actual purchase path too, in case
+        # the user opened the picker before the admin disabled top-ups and is
+        # now tapping a package button.
+        if not await db.get_setting_int("topup_enabled", 1):
+            await callback.answer(t("topup_disabled", lang), show_alert=True)
+            return
         account = await db.get_account(callback_data.email)
         if not account or account["user_tg_id"] != callback.from_user.id:
             await callback.answer(t("not_found", lang), show_alert=True)
             return
         if account.get("is_trial"):
             await callback.answer(t("trial_no_renew", lang), show_alert=True)
+            return
+        # UNLIMITED-TOGGLE: double-guard on the purchase path too (the user
+        # may have opened the picker before the button was hidden).
+        if account.get("traffic_gb") == 0:
+            await callback.answer(t("topup_unlimited_noop", lang), show_alert=True)
             return
         gb = callback_data.gb
         price_per_gb = await db.get_setting_float("topup_price_per_gb", TOPUP_DEFAULT_PRICE_PER_GB)
@@ -6362,7 +6695,9 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             await callback.answer("✅")
             await callback.message.edit_text(
                 t("acc_disabled", lang, email=account["email"]),
-                reply_markup=kb_account_details(account["email"], False, lang),
+                reply_markup=kb_account_details(account["email"], False, lang,
+                                                topup_enabled=bool(await db.get_setting_int("topup_enabled", 1)),
+                                                is_unlimited=(account.get("traffic_gb") == 0)),
             )
         else:
             await callback.answer(f"Failed: {res.get('msg')}", show_alert=True)
@@ -6384,7 +6719,9 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             await callback.answer("✅")
             await callback.message.edit_text(
                 t("acc_enabled", lang, email=account["email"]),
-                reply_markup=kb_account_details(account["email"], True, lang),
+                reply_markup=kb_account_details(account["email"], True, lang,
+                                                topup_enabled=bool(await db.get_setting_int("topup_enabled", 1)),
+                                                is_unlimited=(account.get("traffic_gb") == 0)),
             )
         else:
             await callback.answer(f"Failed: {res.get('msg')}", show_alert=True)
@@ -7762,6 +8099,22 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         user = await db.get_user(tg_id)
         return L((user or {}).get("language", DEFAULT_LANGUAGE)) if user else DEFAULT_LANGUAGE
 
+    async def _pa_lang(tg_id: int) -> str:
+        """PA-LANG: Return the display language for payment-admin screens.
+
+        Full admins (ADMIN_IDS) ALWAYS see English — the main admin panel is
+        English-only per the user's request.  Payment-only admins see their
+        selected language (users.language), defaulting to DEFAULT_LANGUAGE.
+        This is used by every payment-admin handler so the entire payment
+        section (menu, pending list, history, detail view, approve/reject
+        flows, receipt captions) is localised for payment admins while the
+        full-admin experience stays English.
+        """
+        if tg_id in ADMIN_IDS:
+            return "en"
+        user = await db.get_user(tg_id)
+        return L((user or {}).get("language", DEFAULT_LANGUAGE)) if user else DEFAULT_LANGUAGE
+
     async def _is_full_admin(tg_id: int) -> bool:
         return tg_id in ADMIN_IDS
 
@@ -7771,11 +8124,11 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         if await _is_full_admin(message.from_user.id):
             await message.answer("⚙️ <b>Admin Panel</b>", reply_markup=kb_admin_menu())
         else:
-            # Payment-only admin — limited menu.
+            # Payment-only admin — limited menu. PA-LANG: localised.
+            pal = await _pa_lang(message.from_user.id)
             await message.answer(
-                "💰 <b>Payment Admin Panel</b>\n\n"
-                "You can approve or reject pending payments.",
-                reply_markup=kb_payment_admin_menu(),
+                f"{t('pa_menu_title', pal)}\n\n{t('pa_menu_desc', pal)}",
+                reply_markup=kb_payment_admin_menu(pal),
             )
 
     @router.callback_query(AdminCB.filter(F.action == "main"))
@@ -7787,9 +8140,11 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         if await _is_full_admin(callback.from_user.id):
             await show_view(callback.message, text="⚙️ <b>Admin Panel</b>", reply_markup=kb_admin_menu())
         else:
+            # PA-LANG: payment-admin menu is localised.
+            pal = await _pa_lang(callback.from_user.id)
             await show_view(callback.message,
-                text="💰 <b>Payment Admin Panel</b>\n\nYou can approve or reject pending payments.",
-                reply_markup=kb_payment_admin_menu())
+                text=f"{t('pa_menu_title', pal)}\n\n{t('pa_menu_desc', pal)}",
+                reply_markup=kb_payment_admin_menu(pal))
         await callback.answer()
 
     # ------------------------------------------------------- dashboard
@@ -9547,18 +9902,34 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         await _render_settings_force_join_view(callback.message)
         await callback.answer()
 
-    @router.callback_query(SettingsCatCB.filter(F.category == "topup"))
-    async def cb_settings_topup(callback: CallbackQuery):
+    async def _render_settings_topup_view(message: Message):
         topup_price = await db.get_setting_float("topup_price_per_gb", TOPUP_DEFAULT_PRICE_PER_GB)
         packages = await db.get_setting_json("topup_packages", [5, 10, 20, 50])
+        topup_enabled = await db.get_setting_int("topup_enabled", 1)
         rich = rich_tables.topup_settings_rich(topup_price, packages)
         kb = InlineKeyboardBuilder()
+        # TOPUP-TOGGLE: label reflects the NEXT state (what tapping will do).
+        toggle_label = ("❌ Disable Top-Ups" if topup_enabled else "✅ Enable Top-Ups")
+        kb.button(style="primary", text=toggle_label,
+                  callback_data=AdminCB(action="toggle_topup").pack())
         kb.button(style="success", text="➕ Price/GB", callback_data=AdminCB(action="set_topup_price").pack())
         kb.button(style="primary", text="📦 Packages", callback_data=AdminCB(action="set_topup_packages").pack())
         kb.button(text="🔙 Settings", callback_data=AdminCB(action="settings").pack(), style="danger")
-        kb.adjust(2, 1)
-        await show_view(callback.message, rich=rich, reply_markup=kb.as_markup())
+        kb.adjust(1, 2, 1)
+        await show_view(message, rich=rich, reply_markup=kb.as_markup())
+
+    @router.callback_query(SettingsCatCB.filter(F.category == "topup"))
+    async def cb_settings_topup(callback: CallbackQuery):
+        await _render_settings_topup_view(callback.message)
         await callback.answer()
+
+    @router.callback_query(AdminCB.filter(F.action == "toggle_topup"))
+    async def cb_toggle_topup(callback: CallbackQuery):
+        cur = await db.get_setting_int("topup_enabled", 1)
+        await db.set_setting("topup_enabled", "0" if cur else "1")
+        await callback.answer(f"Top-ups {'enabled' if not cur else 'disabled'}", show_alert=True)
+        # Refresh the view so the toggle label updates.
+        await _render_settings_topup_view(callback.message)
 
     @router.callback_query(SettingsCatCB.filter(F.category == "guides"))
     async def cb_settings_guides(callback: CallbackQuery):
@@ -10134,12 +10505,15 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         pa_ids.add(tg_id)
         await db.set_setting("payment_admin_ids", json.dumps(sorted(pa_ids)))
         # Try to notify the new payment admin.
+        # PA-LANG: the notification is sent to the NEW payment admin, so use
+        # their selected language (not the adding admin's language).
         try:
+            new_pa_lang = await _pa_lang(tg_id)
             await bot.send_message(tg_id,
-                "💰 <b>You are now a Payment Admin</b>\n\n"
-                "You can approve or reject pending payments.\n"
-                "Send /admin to open the payment panel.",
-                reply_markup=kb_payment_admin_menu())
+                f"{t('pa_menu_title', new_pa_lang)}\n\n"
+                f"{t('pa_menu_desc', new_pa_lang)}\n"
+                f"{'Send /admin to open the payment panel.' if new_pa_lang == 'en' else 'برای باز کردن پنل، /admin را بفرستید.'}",
+                reply_markup=kb_payment_admin_menu(new_pa_lang))
         except Exception:
             pass  # user hasn't started the bot yet — that's OK
         await message.answer(
@@ -10187,28 +10561,173 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     # ---- Pending payments ----
     @router.callback_query(AdminCB.filter(F.action == "pending_payments"))
     async def cb_pending_payments(callback: CallbackQuery):
+        # RECEIPT-FIRST: the admin complained that entering Pending Payments
+        # showed only the amount/unique-amount text and they couldn't see the
+        # receipt photo or receipt text without an extra tap. Now we jump
+        # straight into the first pending payment's full detail view (which
+        # ALSO sends the receipt photo as a follow-up message). If there are
+        # more pending payments, a "Next pending" button walks through them.
+        # PA-LANG: localised via _pa_lang (full admins → en, payment admins →
+        # their selected language).
+        pal = await _pa_lang(callback.from_user.id)
         payments = await db.get_pending_payments()
         if not payments:
-            menu = kb_admin_menu() if await _is_full_admin(callback.from_user.id) else kb_payment_admin_menu()
-            await show_view(callback.message, text="💰 <b>No pending payments</b>", reply_markup=menu)
+            menu = kb_admin_menu() if await _is_full_admin(callback.from_user.id) else kb_payment_admin_menu(pal)
+            await show_view(callback.message, text=t("pa_no_pending", pal), reply_markup=menu)
             await callback.answer()
             return
-        text = "💰 <b>Pending Payments</b>\n\n"
+        # Pre-build a small index summary so the admin still sees the queue
+        # length (e.g. "3 pending") above the first item's detail card.
+        await _render_pending_view(callback, payments, 0, pal)
+        await callback.answer()
+
+    async def _render_pending_view(callback: CallbackQuery,
+                                   payments: List[dict], index: int,
+                                   pal: str = "en"):
+        """Render ONE pending payment as a full detail card + receipt photo.
+
+        Shared by ``cb_pending_payments`` (initial entry) and the per-item
+        "Next pending" navigation button. ``payments`` is the full pending
+        list (already fetched); ``index`` is the 0-based slot to render.
+        ``pal`` is the payment-admin display language (PA-LANG).
+        """
+        payment = payments[index]
+        user = await db.get_user(payment["user_tg_id"])
+        uname = escape_html((user or {}).get("first_name") or (user or {}).get("username")
+                            or str(payment["user_tg_id"]))
+        amt_en = fmt_num(payment['unique_amount'], 'en')
+        # Header: queue position + total queue length, so the admin knows how
+        # many are left after this one.
+        header = t("pa_pending_header", pal, i=index + 1, n=len(payments)) + "\n\n"
+        text = header + t("pa_payment_title", pal, id=payment['id']) + "\n\n"
+        text += t("pa_user", pal, name=uname, id=payment['user_tg_id']) + "\n"
+        text += t("pa_base_amount", pal, amt=int(payment['amount'])) + "\n"
+        text += t("pa_unique_amount", pal, amt=amt_en) + "\n"
+        text += t("pa_card", pal, num=ltr(escape_html(payment.get('card_number') or '-'))) + "\n"
+        text += t("pa_created", pal, date=fmt_iso(payment.get('created_at'), '%Y-%m-%d %H:%M:%S') or '-') + "\n"
+        receipt_kind = (payment.get("receipt_type") or "").lower()
+        kind_icon = {"photo": "📸", "document": "📎", "text": "📝"}.get(receipt_kind, "—")
+        if payment.get("receipt_text"):
+            text += t("pa_receipt_text", pal, icon=kind_icon, text=escape_html(payment['receipt_text'][:300])) + "\n"
+        else:
+            text += t("pa_receipt_kind", pal, icon=kind_icon, kind=receipt_kind or 'none') + "\n"
+        text += "\n" + t("pa_status", pal, status=t("pa_status_pending", pal))
+
         kb = InlineKeyboardBuilder()
+        kb.button(text=t("pa_approve_btn", pal), callback_data=PaymentCB(action="approve", payment_id=payment["id"]).pack(), style="success")
+        kb.button(text=t("pa_reject_btn", pal), callback_data=PaymentCB(action="reject_ask", payment_id=payment["id"]).pack(), style="danger")
+        # Navigation: only show "Next pending" when there's actually a next
+        # one. The callback carries the index of the NEXT slot to render so
+        # the handler can re-fetch the live queue (in case some got approved
+        # in the meantime) and jump to that slot.
+        if index + 1 < len(payments):
+            kb.button(style="primary", text=t("pa_next_btn", pal, i=index + 2, n=len(payments)),
+                      callback_data=PaymentCB(action="next_pending", payment_id=index + 1).pack())
+        kb.button(style="primary", text=t("pa_full_history_btn", pal),
+                  callback_data=AdminCB(action="payment_history").pack())
+        kb.button(text=t("pa_admin_back_btn", pal), callback_data=AdminCB(action="main").pack(), style="danger")
+        kb.adjust(2, 1, 2)
+
+        file_id = payment.get("receipt_file_id")
+        rtype = receipt_kind
+        user_receipt_note = (payment.get("receipt_text") or "").strip()
+        await show_view(callback.message, text=text, reply_markup=kb.as_markup())
+        # Send the receipt photo as a SEPARATE follow-up message so the admin
+        # sees both the detail card and the receipt image side by side — and
+        # includes the user's own caption (the "combination of photo + caption"
+        # the admin needs to verify the payment).
+        if file_id:
+            cap_lines = [t("pa_receipt_caption", pal, id=payment['id'], name=uname)]
+            if user_receipt_note:
+                cap_lines.append("")
+                cap_lines.append(escape_html(user_receipt_note[:900]))
+            photo_caption = "\n".join(cap_lines)[:1024]
+            try:
+                if rtype == "document":
+                    await bot.send_document(callback.from_user.id, file_id, caption=photo_caption)
+                else:
+                    await bot.send_photo(callback.from_user.id, file_id, caption=photo_caption)
+            except Exception as e:
+                logger.warning("pending-view receipt media send failed: %s", e, exc_info=True)
+
+    @router.callback_query(PaymentCB.filter(F.action == "next_pending"))
+    async def cb_next_pending(callback: CallbackQuery, callback_data: PaymentCB):
+        # Re-fetch the live queue — some items may have been approved/rejected
+        # since the user first entered Pending Payments. Jump to the requested
+        # index, clamped to the new queue length.
+        pal = await _pa_lang(callback.from_user.id)
+        payments = await db.get_pending_payments()
+        if not payments:
+            menu = kb_admin_menu() if await _is_full_admin(callback.from_user.id) else kb_payment_admin_menu(pal)
+            await show_view(callback.message, text=t("pa_no_more_pending", pal), reply_markup=menu)
+            await callback.answer()
+            return
+        index = max(0, min(callback_data.payment_id, len(payments) - 1))
+        await _render_pending_view(callback, payments, index, pal)
+        await callback.answer()
+
+    @router.callback_query(AdminCB.filter(F.action == "payment_history"))
+    async def cb_payment_history(callback: CallbackQuery):
+        """RECEIPT-HISTORY: list of recent payments (any status) with their
+        receipt kind, status, and the admin who acted on them. Tapping a row
+        opens ``cb_payment_view`` which shows the full detail card + receipt
+        photo (so the admin can re-read the screenshot and see who approved
+        it, when, and with what note).
+        PA-LANG: localised via _pa_lang.
+        """
+        pal = await _pa_lang(callback.from_user.id)
+        payments = await db.get_recent_payments(limit=20)
+        if not payments:
+            menu = kb_admin_menu() if await _is_full_admin(callback.from_user.id) else kb_payment_admin_menu(pal)
+            await show_view(callback.message, text=t("pa_no_payments", pal), reply_markup=menu)
+            await callback.answer()
+            return
+        text = t("pa_history_title", pal) + "\n\n"
+        text += t("pa_history_header", pal) + "\n"
+        text += "──────────────────────────────\n"
+        kb = InlineKeyboardBuilder()
+        # Cache admin lookups so we don't N+1 the same admin row when several
+        # payments were approved by the same person.
+        admin_cache: dict = {}
+        # Status label map (localised).
+        _status_label = {
+            "approved": t("pa_status_approved", pal),
+            "rejected": t("pa_status_rejected", pal),
+            "pending": t("pa_status_pending", pal),
+        }
         for p in payments:
             user = await db.get_user(p["user_tg_id"])
-            uname = escape_html(user.get("first_name") or user.get("username") or str(p["user_tg_id"]))
-            # M13 — use a consistent number format for both the text line and
-            # the button label so the admin doesn't see Persian digits in one
-            # place and Western digits in another for the same amount.
+            uname_raw = (user or {}).get("first_name") or (user or {}).get("username") or str(p["user_tg_id"])
+            uname = escape_html(uname_raw[:18])
             amt_en = fmt_num(p['unique_amount'], 'en')
-            text += f"• #{p['id']} — {uname}: {amt_en} Toman\n"
-            kb.button(style="primary", 
-                text=f"#{p['id']} {uname[:15]} — {amt_en}T",
+            status = p.get('status', 'pending')
+            status_emoji = {"approved": "✅", "rejected": "❌", "pending": "⏳"}.get(status, "•")
+            rtype = (p.get("receipt_type") or "").lower()
+            receipt_icon = {"photo": "📸", "document": "📎", "text": "📝"}.get(rtype, "—")
+            # Approved-by label: prefer denormalized column, fall back to
+            # users-lookup cache.
+            admin_label = p.get("admin_username") or ""
+            admin_id = p.get("admin_id")
+            if not admin_label and admin_id:
+                if admin_id not in admin_cache:
+                    admin_cache[admin_id] = await db.get_user(admin_id)
+                admin_label = _admin_display(admin_cache[admin_id]) if admin_cache[admin_id] else ""
+            if admin_label and status != "pending":
+                approver = escape_html(admin_label)
+            else:
+                approver = "—"
+            status_word = _status_label.get(status, status)
+            text += (f"{status_emoji} <b>#{p['id']}</b> • {uname} • {amt_en}T • "
+                     f"{status_word} • {receipt_icon} • {approver}\n")
+            kb.button(style="primary",
+                text=f"#{p['id']} {uname_raw[:12]} — {amt_en}T {status_emoji}",
                 callback_data=PaymentCB(action="view", payment_id=p["id"]).pack(),
             )
-        kb.button(text="🔙 Admin", callback_data=AdminCB(action="main").pack(), style="danger")
-        kb.adjust(1, 1)
+        kb.button(style="primary", text=t("pa_pending_btn", pal),
+                  callback_data=AdminCB(action="pending_payments").pack())
+        kb.button(text=t("pa_admin_back_btn", pal), callback_data=AdminCB(action="main").pack(), style="danger")
+        # adjust: 1 per row for payment buttons, then 2 for the bottom pair.
+        kb.adjust(*[1 for _ in payments], 2)
         await show_view(callback.message, text=text, reply_markup=kb.as_markup())
         await callback.answer()
 
@@ -10216,25 +10735,57 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_payment_view(callback: CallbackQuery, callback_data: PaymentCB):
         payment = await db.get_payment(callback_data.payment_id)
         if not payment:
-            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
+            await callback.answer(t("not_found", await _pa_lang(callback.from_user.id)), show_alert=True)
             return
+        # PA-LANG: localise the entire detail card.
+        pal = await _pa_lang(callback.from_user.id)
         user = await db.get_user(payment["user_tg_id"])
-        uname = escape_html(user.get("first_name") or user.get("username") or str(payment["user_tg_id"]))
-        text = f"💰 <b>Payment #{payment['id']}</b>\n\n"
-        text += f"👤 User: {uname} ({payment['user_tg_id']})\n"
-        text += f"💵 Base amount: {int(payment['amount'])} Toman\n"
-        text += f"💵 Unique amount: {int(payment['unique_amount'])} Toman\n"
-        text += f"💳 Card: {ltr(escape_html(payment.get('card_number') or '-'))}\n"
-        text += f"📅 Created: {fmt_iso(payment.get('created_at'), '%Y-%m-%d %H:%M:%S') or '-'}\n"
+        uname = escape_html((user or {}).get("first_name") or (user or {}).get("username") or str(payment["user_tg_id"]))
+        text = t("pa_payment_title", pal, id=payment['id']) + "\n\n"
+        text += t("pa_user", pal, name=uname, id=payment['user_tg_id']) + "\n"
+        text += t("pa_base_amount", pal, amt=int(payment['amount'])) + "\n"
+        text += t("pa_unique_amount", pal, amt=int(payment['unique_amount'])) + "\n"
+        text += t("pa_card", pal, num=ltr(escape_html(payment.get('card_number') or '-'))) + "\n"
+        text += t("pa_created", pal, date=fmt_iso(payment.get('created_at'), '%Y-%m-%d %H:%M:%S') or '-') + "\n"
         if payment.get("receipt_text"):
-            text += f"📝 Receipt: {escape_html(payment['receipt_text'][:200])}\n"
-        text += f"\nStatus: {payment.get('status', 'pending')}"
+            text += t("pa_receipt_text", pal, icon="📝", text=escape_html(payment['receipt_text'][:300])) + "\n"
+        # RECEIPT-HISTORY: show which admin acted on this payment. We prefer
+        # the denormalized admin_username column (set at action time, survives
+        # even if the admin later blocks the bot). If missing (legacy rows
+        # approved before the column existed), fall back to looking the admin
+        # up in `users` by tg_id.
+        status = payment.get('status', 'pending')
+        admin_id = payment.get('admin_id')
+        admin_label = payment.get('admin_username') or ""
+        if not admin_label and admin_id:
+            admin_row = await db.get_user(admin_id)
+            admin_label = _admin_display(admin_row) if admin_row else ""
+        if status != "pending" and admin_label:
+            reviewed_at = fmt_iso(payment.get('reviewed_at'), '%Y-%m-%d %H:%M:%S') or '-'
+            action_word = t("pa_action_approved", pal) if status == "approved" else t("pa_action_rejected", pal)
+            text += t("pa_reviewed_by", pal, action=action_word, admin=escape_html(admin_label), id=admin_id) + "\n"
+            text += t("pa_reviewed_at", pal, date=reviewed_at) + "\n"
+            if status == "rejected" and payment.get("admin_note"):
+                text += t("pa_reject_reason", pal, reason=escape_html(payment['admin_note'])) + "\n"
+        status_word = {"approved": t("pa_status_approved", pal),
+                       "rejected": t("pa_status_rejected", pal),
+                       "pending": t("pa_status_pending", pal)}.get(status, status)
+        text += "\n" + t("pa_status", pal, status=status_word)
 
         kb = InlineKeyboardBuilder()
-        kb.button(text="✅ Approve", callback_data=PaymentCB(action="approve", payment_id=payment["id"]).pack(), style="success")
-        kb.button(text="❌ Reject", callback_data=PaymentCB(action="reject_ask", payment_id=payment["id"]).pack(), style="danger")
-        kb.button(style="danger", text="🔙 Pending", callback_data=AdminCB(action="pending_payments").pack())
-        kb.adjust(2, 1)
+        # Only show approve/reject for still-pending payments — once acted
+        # upon, those buttons would just toast "already processed".
+        if status == "pending":
+            kb.button(text=t("pa_approve_btn", pal), callback_data=PaymentCB(action="approve", payment_id=payment["id"]).pack(), style="success")
+            kb.button(text=t("pa_reject_btn", pal), callback_data=PaymentCB(action="reject_ask", payment_id=payment["id"]).pack(), style="danger")
+        kb.button(style="primary", text=t("pa_history_btn2", pal), callback_data=AdminCB(action="payment_history").pack())
+        kb.button(style="danger", text=t("pa_pending_back_btn", pal), callback_data=AdminCB(action="pending_payments").pack())
+        # adjust: when pending → 2 (Approve/Reject) + 2 (History/Pending);
+        # when not pending → 2 (History/Pending) only.
+        if status == "pending":
+            kb.adjust(2, 2)
+        else:
+            kb.adjust(2)
 
         # L9 — preserve admin context. Previously this handler DELETED the
         # pending-payments list message and sent the receipt photo with the
@@ -10246,20 +10797,37 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         #   2. Send the receipt photo as a SEPARATE follow-up message so the
         #      admin sees both the detail card and the receipt image side by
         #      side without losing context.
+        #
+        # RECEIPT-INLINE-CAPTION: the receipt photo's caption now carries the
+        # user's own receipt_text (the note the user attached when sending
+        # the screenshot). This is the "combination of photo + caption" the
+        # admin needs to verify — previously the caption was a generic
+        # "📎 Receipt for payment #X" and the user's note was only visible in
+        # the detail card above (which the admin might miss when scrolling
+        # down to look at the photo).
         file_id = payment.get("receipt_file_id")
         rtype = (payment.get("receipt_type") or "").lower()
+        user_receipt_note = (payment.get("receipt_text") or "").strip()
         await show_view(callback.message, text=text, reply_markup=kb.as_markup())
         if file_id:
+            # Caption = identifier line + the user's own caption (if any).
+            # Cap at 900 chars so we stay under Telegram's 1024-char caption
+            # limit for photos.
+            cap_lines = [t("pa_receipt_caption", pal, id=payment['id'], name=uname)]
+            if user_receipt_note:
+                cap_lines.append("")
+                cap_lines.append(escape_html(user_receipt_note[:900]))
+            photo_caption = "\n".join(cap_lines)[:1024]
             try:
                 if rtype == "document":
                     await bot.send_document(
                         callback.from_user.id, file_id,
-                        caption=f"📎 Receipt for payment #{payment['id']}",
+                        caption=photo_caption,
                     )
                 else:
                     await bot.send_photo(
                         callback.from_user.id, file_id,
-                        caption=f"📎 Receipt for payment #{payment['id']}",
+                        caption=photo_caption,
                     )
             except Exception as e:
                 logger.warning("payment-view receipt media send failed: %s", e, exc_info=True)
@@ -10269,7 +10837,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_payment_approve(callback: CallbackQuery, callback_data: PaymentCB):
         payment = await db.get_payment(callback_data.payment_id)
         if not payment or payment["status"] != "pending":
-            await callback.answer(t("not_pending", await admin_lang(callback.from_user.id)), show_alert=True)
+            await callback.answer(t("not_pending", await _pa_lang(callback.from_user.id)), show_alert=True)
             return
         # C1 — atomic approve: only one admin can perform the pending→approved
         # transition. If two admins click simultaneously, the second call to
@@ -10279,7 +10847,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         # uncredited (an unrecoverable state — the payment can't be re-approved).
         try:
             async with db.transaction():
-                ok = await db.approve_payment(payment["id"], callback.from_user.id)
+                ok = await db.approve_payment(payment["id"], callback.from_user.id,
+                                              admin_username=_admin_handle_from_callback(callback.from_user))
                 if not ok:
                     raise RuntimeError("already_processed")
                 await db.update_user_balance(payment["user_tg_id"], payment["amount"], add=True)
@@ -10288,11 +10857,12 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
                     description=f"Card payment #{payment['id']}", admin_id=callback.from_user.id,
                 )
         except RuntimeError:
-            await callback.answer(t("already_processed", await admin_lang(callback.from_user.id)), show_alert=True)
+            await callback.answer(t("already_processed", await _pa_lang(callback.from_user.id)), show_alert=True)
             return
         except Exception as e:
             logger.error("payment approve transaction failed for #%s: %s", payment['id'], e, exc_info=True)
-            await callback.answer(f"❌ Approve failed: {str(e)[:60]}", show_alert=True)
+            pal_err = await _pa_lang(callback.from_user.id)
+            await callback.answer(t("pa_approve_failed", pal_err, err=str(e)[:60]), show_alert=True)
             return
         # Notify user
         user = await db.get_user(payment["user_tg_id"])
@@ -10348,22 +10918,35 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             pass
         except Exception as e:
             logger.warning("approve notify failed: %s", e)
-        # M14 — show the right menu: full admins see the full admin menu,
-        # payment-only admins see the payment-admin menu (otherwise they see
-        # buttons they can't use → "Access denied" alerts).
-        _admin_menu = kb_admin_menu if await _is_full_admin(callback.from_user.id) else kb_payment_admin_menu
-        await show_view(callback.message, text=
-            f"✅ <b>Payment #{payment['id']} approved</b>\n"
-            f"💰 {int(payment['amount'])} Toman added to user {payment['user_tg_id']}",
-            reply_markup=_admin_menu(),
-        )
-        await callback.answer("✅ Approved")
+        # RECEIPT-FIRST: after approving one payment, jump straight back into
+        # the pending queue (which now shows the NEXT pending payment with its
+        # full receipt) instead of dumping the admin back to the menu. This
+        # saves a tap when there are multiple pending payments to review.
+        # If the queue is now empty, get_pending_payments returns [] and
+        # cb_pending_payments shows the "no pending" empty state.
+        # PA-LANG: localise the admin-facing confirmation.
+        pal = await _pa_lang(callback.from_user.id)
+        payments = await db.get_pending_payments()
+        if payments:
+            await _render_pending_view(callback, payments, 0, pal)
+        else:
+            # M14 — show the right menu: full admins see the full admin menu,
+            # payment-only admins see the payment-admin menu (otherwise they
+            # see buttons they can't use → "Access denied" alerts).
+            _admin_menu = kb_admin_menu if await _is_full_admin(callback.from_user.id) else kb_payment_admin_menu
+            await show_view(callback.message, text=
+                t("pa_approved_msg", pal, id=payment['id'], amt=int(payment['amount']), uid=payment['user_tg_id']),
+                reply_markup=_admin_menu(pal),
+            )
+        await callback.answer(t("pa_approved_toast", pal))
 
     @router.callback_query(PaymentCB.filter(F.action == "reject_ask"))
     async def cb_payment_reject_ask(callback: CallbackQuery, callback_data: PaymentCB, state: FSMContext):
         await state.set_state(AdminStates.waiting_for_reject_reason)
         await state.update_data(payment_id=callback_data.payment_id)
-        alang = await admin_lang(callback.from_user.id)
+        # PA-LANG: use _pa_lang so payment admins see the prompt in their
+        # selected language.
+        alang = await _pa_lang(callback.from_user.id)
         await show_view(callback.message, text=t("enter_reject_reason", alang), reply_markup=kb_cancel(alang))
         await callback.answer()
 
@@ -10375,14 +10958,19 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         data = await state.get_data()
         await state.clear()
         payment = await db.get_payment(data.get("payment_id"))
+        # PA-LANG: localise the admin-facing messages.
+        pal = await _pa_lang(message.from_user.id)
         if not payment or payment["status"] != "pending":
-            await message.answer("Payment not found or already processed.", reply_markup=kb_admin_menu())
+            _admin_menu = kb_admin_menu if await _is_full_admin(message.from_user.id) else kb_payment_admin_menu
+            await message.answer(t("pa_not_found_processed", pal), reply_markup=_admin_menu(pal))
             return
         # C1 — atomic reject: only one admin can transition pending→rejected.
-        ok = await db.reject_payment(payment["id"], message.from_user.id, reason)
+        ok = await db.reject_payment(payment["id"], message.from_user.id, reason,
+                                     admin_username=_admin_handle_from_callback(message.from_user))
         if not ok:
-            await message.answer("⚠️ Payment was already processed by another admin.",
-                                 reply_markup=kb_admin_menu())
+            _admin_menu = kb_admin_menu if await _is_full_admin(message.from_user.id) else kb_payment_admin_menu
+            await message.answer(t("pa_already_processed_msg", pal),
+                                 reply_markup=_admin_menu(pal))
             return
         # Notify user
         user = await db.get_user(payment["user_tg_id"])
@@ -10399,8 +10987,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         # M14 — branch on admin type for the menu.
         _admin_menu = kb_admin_menu if await _is_full_admin(message.from_user.id) else kb_payment_admin_menu
         await message.answer(
-            f"❌ <b>Payment #{payment['id']} rejected</b>",
-            reply_markup=_admin_menu(),
+            t("pa_rejected_msg", pal, id=payment['id']),
+            reply_markup=_admin_menu(pal),
         )
 
     # ---- Force join settings handlers ----
@@ -10685,15 +11273,22 @@ async def task_traffic_alerts(bot: Bot, db: Database, api: PanelAPI):
                     try:
                         emoji = "⚠️" if threshold < 90 else "🚨"
                         kb = InlineKeyboardBuilder()
+                        # TOPUP-TOGGLE: only fetch topup_enabled when we're
+                        # actually about to send an alert (rare event), so we
+                        # don't add a query to the hot path of every check.
+                        topup_on = bool(await db.get_setting_int("topup_enabled", 1))
                         # Trial accounts can't be topped up or renewed.
                         if not acc.get("is_trial"):
-                            kb.button(text=t("topup_traffic", lang),
-                                      callback_data=AccountCB(action="topup", email=acc["email"]).pack(), style="primary")
+                            if topup_on:
+                                kb.button(text=t("topup_traffic", lang),
+                                          callback_data=AccountCB(action="topup", email=acc["email"]).pack(), style="primary")
                             kb.button(text=t("renew", lang),
                                       callback_data=AccountCB(action="renew", email=acc["email"]).pack(), style="success")
+                            # 2 buttons when both shown, 1 when top-up hidden.
+                            kb.adjust(2 if topup_on else 1)
                         else:
                             kb.button(style="success", text=t("buy", lang), callback_data=MenuCB(action="buy").pack())
-                        kb.adjust(2 if not acc.get("is_trial") else 1)
+                            kb.adjust(1)
                         await bot.send_message(
                             acc["user_tg_id"],
                             f"{emoji} <b>Traffic {threshold}%</b>\n"
