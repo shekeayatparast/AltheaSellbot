@@ -1013,6 +1013,15 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "online": "Online",
         "offline": "Offline",
         "active_ips": "Active IPs",
+        # account-card labels — clearer for the user (was just bare values)
+        "card_plan": "Plan",
+        "card_remaining_traffic": "Remaining traffic",
+        "card_remaining_time": "Time remaining",
+        "card_used": "Used",
+        "card_total": "Total quota",
+        "card_account_status": "Account status",
+        "card_uploaded": "Uploaded",
+        "card_downloaded": "Downloaded",
         "unlimited": "Unlimited",
         # top-up
         "topup_title": "➕ <b>Traffic Top-up</b>\n\nChoose a package to add traffic without changing your expiry date:",
@@ -1044,6 +1053,7 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "referral_how": "📤 <b>How it works</b>\n1️⃣ Share your referral link with friends\n2️⃣ They sign up and buy their first plan\n3️⃣ You get +{days} days and +{gb} GB — claim it on your account anytime",
         "your_link": "📤 <b>Your referral link</b>",
         "share_link": "📤 Share Link",
+        "referral_share_text": "🚀 Hey! I've been using this VPN bot and it's awesome — fast, cheap, and super easy. Sign up with my link and we BOTH get a bonus 🎁 (+{days} days & +{gb} GB for me!). Tap and let's get you connected 👇",
         "referral_stats": "📊 <b>Your Stats</b>",
         "referral_history": "📋 <b>Recent referrals</b>",
         "referral_no_history": "No referrals yet — share your link to start earning!",
@@ -1438,6 +1448,15 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "online": "آنلاین",
         "offline": "آفلاین",
         "active_ips": "IP های فعال",
+        # برچسب‌های کارت اکانت — برای درک بهتر کاربر (قبلاً فقط مقدار خالی بود)
+        "card_plan": "پلن",
+        "card_remaining_traffic": "حجم باقی‌مانده",
+        "card_remaining_time": "مدت باقی‌مانده",
+        "card_used": "حجم مصرفی",
+        "card_total": "حجم کل",
+        "card_account_status": "وضعیت اکانت",
+        "card_uploaded": "حجم آپلود شده",
+        "card_downloaded": "حجم دانلود شده",
         "unlimited": "نامحدود",
         "topup_title": "➕ <b>افزایش حجم</b>\n\nیک بسته انتخاب کنید تا بدون تغییر تاریخ انقضا، حجم اکانت افزایش یابد:",
         "topup_success": "✅ <b>حجم اضافه شد!</b>\n+{gb} گیگابایت به <code>{email}</code> اضافه شد.",
@@ -1465,6 +1484,7 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "referral_how": "📤 <b>نحوه کار</b>\n۱️⃣ لینک دعوت خودت رو برای دوستات بفرست\n۲️⃣ اونا ثبت‌نام می‌کنن و اولین پلن رو می‌خرن\n۳️⃣ تو +{days} روز و +{gb} گیگابایت می‌گیری — هر وقت خواستی روی اکانتت دریافتش کن",
         "your_link": "📤 <b>لینک دعوت شما</b>",
         "share_link": "📤 اشتراک‌گذاری",
+        "referral_share_text": "🚀 سلام! من دارم از این ربات VPN استفاده می‌کنم و واقعاً راضی‌ام — سریع، ارزون و به‌دردبخور. با لینک دعوت من ثبت‌نام کن تا هر دومون پاداش بگیریم 🎁 (برای من +{days} روز و +{gb} گیگابایت هدیه‌ست!). بزن تا وصل بشی 👇",
         "referral_stats": "📊 <b>آمار شما</b>",
         "referral_history": "📋 <b>دعوت‌های اخیر</b>",
         "referral_no_history": "هنوز دعوتی ندارید — لینک خود را اشتراک بگذارید تا پاداش بگیرید!",
@@ -4221,6 +4241,41 @@ def fmt_days(days: int, lang: str = "en") -> str:
     return f"{days} day{'s' if days != 1 else ''}"
 
 
+def fmt_reward_days(days: int, lang: str = "en") -> str:
+    """Format a SUM of reward days.
+
+    Unlike :func:`fmt_days`, ``0`` means "0 days" (nothing earned yet), NOT
+    "unlimited".  ``fmt_days`` treats 0 as unlimited because for a traffic /
+    time QUOTA, 0 means "no limit" — but for an EARNED-BONUS total, 0 means
+    "you haven't earned any bonus yet", which must not display as "Unlimited".
+
+    Used by the referral stats line so a new user with no referrals sees
+    "+0 days / +0 GB" instead of the misleading "+Unlimited / +Unlimited".
+    """
+    try:
+        d = int(days)
+    except (TypeError, ValueError):
+        d = 0
+    if d <= 0:
+        return to_fa_digits("۰ روز") if lang == "fa" else "0 days"
+    return fmt_days(d, lang)
+
+
+def fmt_reward_gb(gb, lang: str = "en") -> str:
+    """Format a SUM of reward GB.
+
+    Unlike :func:`fmt_gb`, ``0`` means "0 GB" (nothing earned yet), NOT
+    "unlimited".  See :func:`fmt_reward_days` for the rationale.
+    """
+    try:
+        v = float(gb)
+    except (TypeError, ValueError):
+        v = 0.0
+    if v <= 0:
+        return to_fa_digits("۰ گیگابایت") if lang == "fa" else "0 GB"
+    return fmt_gb(v, lang)
+
+
 def fmt_iso(iso_str, fmt: str = "%Y-%m-%d %H:%M") -> str:
     """Render a stored ISO-8601 timestamp (kept in UTC) in Iran time.
 
@@ -4563,7 +4618,15 @@ def _ticket_status_badge(ticket: dict, lang: str) -> str:
 def fmt_account_card(account: dict, lang: str = "en", traffic_data: Optional[dict] = None,
                      server_alias: str = "", plan_name: str = "",
                      currency: str = "toman") -> str:
-    """Render an account status card.  Soft format — works in LTR & RTL."""
+    """Render an account status card.  Soft format — works in LTR & RTL.
+
+    CLEAR-LABELS: every value now carries a human-readable label (Plan,
+    Remaining traffic, Time remaining, Used, Total quota) so the user can
+    tell at a glance what each number means.  Previously the card showed
+    bare values like "۵ گیگابایت / ۶ روز و ۲۳ ساعت / ۰ B / ۵.۰ GB" stacked
+    on top of each other — confusing because two of them are GB figures and
+    the user couldn't tell which was total vs. used vs. remaining.
+    """
     is_active = account.get("is_active", False)
     is_trial = account.get("is_trial", False)
     label = account.get("label") or ""
@@ -4577,9 +4640,10 @@ def fmt_account_card(account: dict, lang: str = "en", traffic_data: Optional[dic
     if server_alias:
         lines.append(f"🖥 {escape_html(server_alias)}")
     if plan_name:
-        lines.append(f"📦 {escape_html(plan_name)}")
-    lines.append(f"💾 {fmt_gb(account.get('traffic_gb',0), lang)}")
-    lines.append(f"📅 {fmt_remaining(account.get('expiry_time',0), lang)}")
+        lines.append(f"📦 {t('card_plan', lang)} : {escape_html(plan_name)}")
+
+    # Remaining TIME — always available from the account row.
+    lines.append(f"📅 {t('card_remaining_time', lang)} : {fmt_remaining(account.get('expiry_time',0), lang)}")
 
     if traffic_data:
         up = traffic_data.get("up", 0)
@@ -4589,11 +4653,26 @@ def fmt_account_card(account: dict, lang: str = "en", traffic_data: Optional[dic
         if total > 0:
             remaining = max(0, total - used)
             pct = (used / total) * 100
-            lines.append(f"📈 {fmt_bytes(used, lang)} / {fmt_bytes(total, lang)}")
+            # Remaining TRAFFIC (live from panel: total − used).  Use fmt_gb
+            # (bytes→GB) so the Persian UI reads "۵ گیگابایت" instead of the
+            # Latin "5.0 GB" — consistent with the L10N work in task 24-g.
+            lines.append(f"💾 {t('card_remaining_traffic', lang)} : {fmt_gb(remaining / GB, lang)}")
+            # Used traffic — keep fmt_bytes here for byte-precise "۰ B / ۵.۰ GB"
+            # since usage can be sub-GB and the B/KB/MB granularity is useful.
+            lines.append(f"{t('card_used', lang)} : 📈 {fmt_bytes(used, lang)} / {fmt_bytes(total, lang)}")
             lines.append(f"<code>{fmt_progress_bar(pct, lang=lang)}</code>")
-            lines.append(f"✅ {fmt_bytes(remaining, lang)}")
+            # Total quota — fmt_gb for the friendly "گیگابایت" wording.
+            lines.append(f"{t('card_total', lang)} ✅ {fmt_gb(total / GB, lang)}")
         else:
-            lines.append(f"📈 {fmt_bytes(used, lang)} ({t('unlimited', lang)})")
+            # Unlimited traffic plan — total == 0 in the panel.
+            lines.append(f"💾 {t('card_remaining_traffic', lang)} : {t('unlimited', lang)}")
+            lines.append(f"{t('card_used', lang)} : 📈 {fmt_bytes(used, lang)} ({t('unlimited', lang)})")
+    else:
+        # No live traffic data (e.g. right after purchase, before the first
+        # panel poll).  Fall back to the plan's total GB as the best
+        # available "remaining" estimate — for a fresh account used≈0 so
+        # remaining ≈ total.  fmt_gb already handles the 0→"Unlimited" case.
+        lines.append(f"💾 {t('card_remaining_traffic', lang)} : {fmt_gb(account.get('traffic_gb',0), lang)}")
     return "\n".join(lines)
 
 
@@ -5757,7 +5836,8 @@ def _admin_handle_from_callback(user) -> str:
 
 
 async def _mark_payment_notifs_processed(payment: dict, status: str,
-                                          admin_label: str, bot) -> None:
+                                          admin_label: str, bot,
+                                          db: "Optional[Database]" = None) -> None:
     """Edit (or delete) every admin's "new payment" notification once any
     admin approves or rejects the payment.
 
@@ -5768,17 +5848,24 @@ async def _mark_payment_notifs_processed(payment: dict, status: str,
     processed the receipt.  They'd tap 👁 Review, see "already approved", and
     wonder why the notification is still there.
 
-    This helper iterates the ``notif_msg_ids`` JSON map stored on the payment
-    row (populated by ``ms_receipt`` when the notifications were sent) and,
-    for each admin's notification message:
+    ROLE-AWARE BEHAVIOUR (per user request): the cleanup now distinguishes
+    between the two admin tiers:
 
-    1. Tries to EDIT the message caption/text to "✅ Approved by @admin"
-       (or "❌ Rejected by @admin") and replaces the action keyboard with a
-       single disabled "✅ Approved"/"❌ Rejected" button — so the admin can
-       SEE the outcome at a glance and canNOT tap Approve again.
-    2. If editing fails (e.g. the message is older than 48h, or it's a photo
-       and Telegram rejects the caption edit), falls back to DELETING the
-       message — better a clean chat than a stale actionable prompt.
+    * **Main admins** (``ADMIN_IDS`` env) — the notification is EDITED to
+      "✅ Approved by @admin" / "❌ Rejected by @admin" with a single
+      disabled button.  They keep a visible audit trail of every receipt's
+      outcome (the "edit mode" the user asked to retain for main admins).
+
+    * **Payment-verifier admins** (``payment_admin_ids`` DB setting) — the
+      notification is DELETED outright.  These admins only exist to approve
+      pending receipts; once a receipt is resolved it's noise in their chat,
+      so removing it keeps their workspace clean.  (The user explicitly
+      asked: "برای ادمین های تایید کننده ی پرداخت حذف کن رسید Reject یا
+      Approve شده رو".)
+
+    For a main admin, if editing fails (e.g. the message is older than 48h,
+    or it's a photo and Telegram rejects the caption edit), it falls back to
+    DELETING the message — better a clean chat than a stale actionable prompt.
 
     All operations are best-effort and logged at WARNING level — a failure
     here (e.g. admin blocked the bot) must never break the approve/reject
@@ -5789,6 +5876,11 @@ async def _mark_payment_notifs_processed(payment: dict, status: str,
         status: "approved" or "rejected".
         admin_label: human-readable label of the acting admin (e.g. "@alice").
         bot: the aiogram Bot instance (for edit/delete API calls).
+        db: the Database instance — needed to look up which admins are
+            payment-verifier-only (so we can delete their notifications
+            instead of editing them).  When ``None`` (legacy callers), every
+            admin is treated as a main admin and the old edit-everyone
+            behaviour is preserved.
     """
     raw = payment.get("notif_msg_ids") if isinstance(payment, dict) else None
     if not raw:
@@ -5799,6 +5891,16 @@ async def _mark_payment_notifs_processed(payment: dict, status: str,
         return
     if not isinstance(notif_map, dict) or not notif_map:
         return
+
+    # Resolve the payment-verifier admin set ONCE (one DB round-trip) so we
+    # can branch per-recipient below.  Falls back to an empty set when no db
+    # is available — in that case everyone is treated as a main admin.
+    verifier_ids: set = set()
+    if db is not None:
+        try:
+            verifier_ids = await get_payment_admin_ids(db)
+        except Exception as e:
+            logger.warning("get_payment_admin_ids failed in notif cleanup: %s", e)
 
     icon = "✅" if status == "approved" else "❌"
     word_en = "Approved" if status == "approved" else "Rejected"
@@ -5819,6 +5921,29 @@ async def _mark_payment_notifs_processed(payment: dict, status: str,
         msg_type = info.get("type") or "text"
         if not chat_id or not message_id:
             continue
+
+        # ---- ROLE BRANCH ------------------------------------------------
+        # Payment-verifier admins: DELETE the notification outright (their
+        # job is done once any admin resolves the receipt; the resolved
+        # receipt is just clutter in their chat).
+        try:
+            admin_id_int = int(admin_id_str)
+        except (TypeError, ValueError):
+            admin_id_int = -1
+        is_verifier_only = (
+            admin_id_int != -1
+            and admin_id_int not in ADMIN_IDS
+            and admin_id_int in verifier_ids
+        )
+        if is_verifier_only:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=message_id)
+            except Exception as e:
+                logger.debug("verifier notif delete failed for admin %s msg %s: %s",
+                             admin_id_str, message_id, e)
+            continue
+
+        # ---- MAIN-ADMIN PATH: edit the notification to show the outcome --
         new_caption = (
             f"{icon} <b>Payment {word_en}</b>\n\n"
             f"👤 By: <b>{escape_html(admin_label)}</b>\n"
@@ -6910,15 +7035,25 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         total = traffic.get("total", 0)
         used = up + down
         text = f"{t('traffic_title', lang)}\n<code>{escape_html(account['email'])}</code>\n\n"
-        text += f"⬆️ {fmt_bytes(up, lang)}\n⬇️ {fmt_bytes(down, lang)}\n📊 {fmt_bytes(used, lang)}"
+        # CLEAR-LABELS: each line now says what it is (uploaded / downloaded /
+        # used / total) instead of bare emoji+number.  Mirrors the account
+        # card so the two screens read consistently.
+        text += f"{t('card_uploaded', lang)} ⬆️ {fmt_bytes(up, lang)}\n"
+        text += f"{t('card_downloaded', lang)} ⬇️ {fmt_bytes(down, lang)}\n"
         if total > 0:
-            text += f" / {fmt_bytes(total, lang)}\n<code>{fmt_progress_bar((used/total)*100, lang=lang)}</code>\n"
-            text += f"✅ {fmt_bytes(total-used, lang)}"
+            remaining = max(0, total - used)
+            text += f"{t('card_used', lang)} 📊 {fmt_bytes(used, lang)} / {fmt_bytes(total, lang)}\n"
+            text += f"<code>{fmt_progress_bar((used/total)*100, lang=lang)}</code>\n"
+            # Remaining — fmt_gb for the friendly "گیگابایت" wording (matches
+            # the account card).
+            text += f"{t('card_remaining_traffic', lang)} ✅ {fmt_gb(remaining / GB, lang)}"
         else:
-            text += f" ({t('unlimited', lang)})"
+            text += f"{t('card_used', lang)} 📊 {fmt_bytes(used, lang)} ({t('unlimited', lang)})"
         online = await api.get_online_clients(server["panel_url"], server["api_token"])
         is_online = account["email"] in online if isinstance(online, list) else False
-        text += f"\n🔵 {t('online', lang) if is_online else t('offline', lang)}"
+        # Account status line — labelled so the user knows what 🔵 refers to.
+        status_word = t('online', lang) if is_online else t('offline', lang)
+        text += f"\n{t('card_account_status', lang)} : 🔵 {status_word}"
         try:
             ips = await api.get_client_ips(server["panel_url"], server["api_token"], account["email"])
             text += f"\n🌐 {t('active_ips', lang)}: {fmt_num(len(ips), lang)}"
@@ -7870,7 +8005,12 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             f"• {fmt_num(stats['total_referrals'], lang)} — {'Total invited' if lang == 'en' else 'کل دعوت‌شدگان'}\n"
             f"• {fmt_num(stats['completed_referrals'], lang)} — {'Bought (rewarded)' if lang == 'en' else 'خرید کرده (پاداش‌دار)'}\n"
             f"• {fmt_num(stats['pending_referrals'], lang)} — {'Pending (not bought yet)' if lang == 'en' else 'در انتظار (هنوز خرید نکرده)'}\n"
-            f"• +{fmt_days(stats['bonus_days_total'], lang)} / +{fmt_gb(stats['bonus_gb_total'], lang)} — {'Total bonus earned' if lang == 'en' else 'کل پاداش کسب‌شده'}\n\n"
+            # REWARD-TOTAL-FIX: use fmt_reward_days / fmt_reward_gb (NOT
+            # fmt_days / fmt_gb) because the quota formatters treat 0 as
+            # "Unlimited" — wrong for a SUM of earned bonuses where 0 means
+            # "you haven't earned any bonus yet".  Previously a new user with
+            # zero referrals saw "+نامحدود / +نامحدود" (Unlimited), misleading.
+            f"• +{fmt_reward_days(stats['bonus_days_total'], lang)} / +{fmt_reward_gb(stats['bonus_gb_total'], lang)} — {'Total bonus earned' if lang == 'en' else 'کل پاداش کسب‌شده'}\n\n"
         )
         if claimable > 0:
             text += f"{t('ref_claimable', lang, count=claimable)}\n\n"
@@ -7893,8 +8033,13 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         if claimable > 0:
             kb.button(style="success", text=t("ref_claim_btn", lang),
                       callback_data=MenuCB(action="referral_claim").pack())
-        # t.me/share/url lets the user pick a chat to forward the link to.
-        share_url = f"https://t.me/share/url?url={ref_link}"
+        # SHARE-WITH-TEXT: t.me/share/url accepts a `text` param so the
+        # forwarded message includes a persuasive, localised pitch instead of
+        # a bare link.  The text is built from the admin-configured bonus
+        # amounts (bonus_days / bonus_gb) so it always reflects the real
+        # reward.  Persian users get a Persian pitch, English users English.
+        share_pitch = t('referral_share_text', lang, days=bonus_days, gb=bonus_gb)
+        share_url = f"https://t.me/share/url?url={quote(ref_link, safe='')}&text={quote(share_pitch, safe='')}"
         kb.button(style="primary", text=t("share_link", lang), url=share_url)
         # REFERRAL-INVITEES: button that opens the full invitees list
         # (tg_id + name + status + join date) so the customer can see exactly
@@ -12046,6 +12191,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             await _mark_payment_notifs_processed(
                 payment, "approved",
                 _admin_handle_from_callback(callback.from_user), bot,
+                db=db,
             )
         except Exception as e:
             logger.warning("cross-admin notif cleanup failed for approve #%s: %s",
@@ -12177,6 +12323,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             await _mark_payment_notifs_processed(
                 payment, "rejected",
                 _admin_handle_from_callback(message.from_user), bot,
+                db=db,
             )
         except Exception as e:
             logger.warning("cross-admin notif cleanup failed for reject #%s: %s",
