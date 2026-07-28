@@ -1223,6 +1223,36 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "pa_not_found_processed": "Payment not found or already processed.",
         "pa_already_processed_msg": "⚠️ Payment was already processed by another admin.",
         "pa_rejected_msg": "❌ Payment #{id} rejected",
+        # PAY-HISTORY-REWORK: table view, per-admin history, payment-admin picker.
+        "pa_history_my_title": "📋 My Approval History",
+        "pa_history_all_title": "📋 Payment History (latest 30)",
+        "pa_history_admins_title": "📋 Approvals by Payment Admin",
+        "pa_history_admin_title": "📋 Approvals by {admin}",
+        "pa_history_admins_header": "Admin • Approved • Rejected • Total",
+        "pa_history_admins_pick": "👇 Tap an admin to review their approvals",
+        "pa_history_admins_none": "📋 No payment admins yet — add one from the main admin panel.",
+        "pa_history_admin_none": "📋 This admin hasn't approved any payments yet.",
+        "pa_no_own_approvals": "📋 You haven't approved any payments yet.",
+        "pa_my_history_btn": "📋 My Approvals",
+        "pa_all_history_btn": "📋 All Receipts",
+        "pa_admins_history_btn": "👥 By Admin",
+        "pa_view_user_finance": "💼 View User Finance",
+        "pa_view_user_payments": "🧾 User Receipts",
+        # User-finance view (admin → user detail financial history).
+        "uf_title": "💼 Financial History — {name}",
+        "uf_no_data": "No financial records for this user.",
+        "uf_tx_header": "ID • Type • Amount • Date • Description",
+        "uf_pay_header": "ID • Amount • Status • Receipt • Date",
+        "uf_balance": "Balance: {amt}",
+        "uf_spent": "Total Spent: {amt}",
+        "uf_orders": "Total Orders: {n}",
+        "uf_back_user": "🔙 User",
+        # Referral invitee list.
+        "ref_invitees_title": "📋 Your Invitees",
+        "ref_invitees_header": "ID • Name • Status • Joined",
+        "ref_invitees_none": "No invitees yet.",
+        "ref_invitees_btn": "👥 Show Invitees",
+        "admin_ref_invitees_btn": "👥 View Invitees",
     },
     # ------------------------------------------------------------------ Farsi
     "fa": {
@@ -1556,6 +1586,36 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "pa_not_found_processed": "پرداخت یافت نشد یا قبلاً پردازش شده است.",
         "pa_already_processed_msg": "⚠️ این پرداخت قبلاً توسط ادمین دیگری پردازش شده است.",
         "pa_rejected_msg": "❌ پرداخت #{id} رد شد",
+        # PAY-HISTORY-REWORK: نمایش جدولی، تاریخچهٔ هر ادمین، انتخاب ادمین پرداخت.
+        "pa_history_my_title": "📋 تاریخچهٔ تأییدهای من",
+        "pa_history_all_title": "📋 تاریخچهٔ پرداخت‌ها (آخرین ۳۰)",
+        "pa_history_admins_title": "📋 تأییدها بر اساس ادمین پرداخت",
+        "pa_history_admin_title": "📋 تأییدهای {admin}",
+        "pa_history_admins_header": "ادمین • تأییدشده • ردشده • کل",
+        "pa_history_admins_pick": "👇 برای بررسی تأییدهای هر ادمین روی آن بزنید",
+        "pa_history_admins_none": "📋 هنوز ادمین پرداختی اضافه نشده — از پنل ادمین اصلی اضافه کنید.",
+        "pa_history_admin_none": "📋 این ادمین هنوز پرداختی را تأیید نکرده است.",
+        "pa_no_own_approvals": "📋 شما هنوز پرداختی را تأیید نکرده‌اید.",
+        "pa_my_history_btn": "📋 تأییدهای من",
+        "pa_all_history_btn": "📋 همهٔ رسیدها",
+        "pa_admins_history_btn": "👥 بر اساس ادمین",
+        "pa_view_user_finance": "💼 سوابق مالی کاربر",
+        "pa_view_user_payments": "🧾 رسیدهای کاربر",
+        # User-finance view (admin → user detail financial history).
+        "uf_title": "💼 سوابق مالی — {name}",
+        "uf_no_data": "سابقهٔ مالی برای این کاربر وجود ندارد.",
+        "uf_tx_header": "شناسه • نوع • مبلغ • تاریخ • توضیحات",
+        "uf_pay_header": "شناسه • مبلغ • وضعیت • رسید • تاریخ",
+        "uf_balance": "موجودی: {amt}",
+        "uf_spent": "کل خرید: {amt}",
+        "uf_orders": "کل سفارش‌ها: {n}",
+        "uf_back_user": "🔙 کاربر",
+        # Referral invitee list.
+        "ref_invitees_title": "📋 دعوت‌شدگان شما",
+        "ref_invitees_header": "شناسه • نام • وضعیت • تاریخ عضویت",
+        "ref_invitees_none": "هنوز دعوت‌شده‌ای وجود ندارد.",
+        "ref_invitees_btn": "👥 نمایش دعوت‌شدگان",
+        "admin_ref_invitees_btn": "👥 دعوت‌شدگان",
     },
 }
 
@@ -3123,6 +3183,19 @@ class Database:
         ) as cur:
             return [dict(r) for r in await cur.fetchall()]
 
+    async def get_referral_invitees(self, tg_id: int, limit: int = 50) -> List[dict]:
+        """REFERRAL-INVITEES: full list of users invited by ``tg_id`` — every
+        referred user's tg_id, username, first_name, reward status, and join
+        date.  Shown to BOTH the customer (their own invitees) and the admin
+        (any user's invitees) per the user's request."""
+        async with self._db.execute(
+            """SELECT tg_id, username, first_name, referral_rewarded, created_at
+               FROM users WHERE referred_by = ?
+               ORDER BY created_at DESC LIMIT ?""",
+            (tg_id, limit),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
     async def get_claimable_referral_count(self, tg_id: int) -> int:
         """Count referred users who bought (referral_rewarded=1) but whose
         reward hasn't been claimed yet (no row in referral_rewards).
@@ -3205,6 +3278,43 @@ class Database:
             (tg_id, limit),
         ) as cur:
             return [dict(r) for r in await cur.fetchall()]
+
+    # PAY-HISTORY-REWORK: payment-admin filtering helpers.
+    async def get_payments_by_admin(self, admin_id: int, limit: int = 30) -> List[dict]:
+        """All payments (any status) reviewed by the given admin — newest first.
+        Used by the per-admin history view (full admin reviewing a payment
+        admin's approvals) and by payment admins viewing their own history."""
+        async with self._db.execute(
+            "SELECT * FROM payments WHERE admin_id = ? AND status IN ('approved','rejected') "
+            "ORDER BY reviewed_at DESC LIMIT ?",
+            (admin_id, limit),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def get_payment_admins_with_counts(self, pa_ids: set) -> List[dict]:
+        """For each payment-admin tg_id, return {tg_id, approved, rejected, total}.
+        Used by the 'Approvals by Payment Admin' picker so the main admin can
+        see at a glance who's approving what."""
+        result: List[dict] = []
+        for aid in pa_ids:
+            async with self._db.execute(
+                "SELECT "
+                "SUM(CASE WHEN status='approved' THEN 1 ELSE 0 END) AS approved, "
+                "SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END) AS rejected, "
+                "COUNT(*) AS total "
+                "FROM payments WHERE admin_id = ? AND status IN ('approved','rejected')",
+                (aid,),
+            ) as cur:
+                row = await cur.fetchone()
+                result.append({
+                    "tg_id": aid,
+                    "approved": row["approved"] if row else 0,
+                    "rejected": row["rejected"] if row else 0,
+                    "total": row["total"] if row else 0,
+                })
+        # Sort by total desc so the most-active admins appear first.
+        result.sort(key=lambda r: (r["total"], r["approved"]), reverse=True)
+        return result
 
     async def approve_payment(self, payment_id: int, admin_id: int,
                               admin_username: str = "") -> bool:
@@ -4608,6 +4718,7 @@ def kb_admin_menu(lang: str = "en") -> InlineKeyboardMarkup:
     kb.button(style="primary", text="💰 Finance", callback_data=AdminCB(action="finance").pack())
     kb.button(style="primary", text="💰 Pending Pay", callback_data=AdminCB(action="pending_payments").pack())
     kb.button(style="primary", text="📋 Pay History", callback_data=AdminCB(action="payment_history").pack())
+    kb.button(style="primary", text="👥 By Admin", callback_data=AdminCB(action="admin_payments").pack())
     kb.button(style="primary", text="🎫 Promos", callback_data=AdminCB(action="promos").pack())
     kb.button(style="success", text="🎁 Gift Codes", callback_data=AdminCB(action="gift_codes").pack())
     kb.button(style="primary", text="💬 Tickets", callback_data=AdminCB(action="tickets").pack())
@@ -4615,22 +4726,28 @@ def kb_admin_menu(lang: str = "en") -> InlineKeyboardMarkup:
     kb.button(style="primary", text="🧹 Cleanup", callback_data=AdminCB(action="cleanup").pack())
     kb.button(style="primary", text="⚙️ Settings", callback_data=AdminCB(action="settings").pack())
     kb.button(text=t("back_menu", lang), callback_data=MenuCB(action="main").pack(), style="danger")
-    kb.adjust(2, 2, 2, 2, 1, 2, 2, 2, 1)
+    kb.adjust(2, 2, 2, 2, 2, 1, 2, 2, 2, 1)
     return kb.as_markup()
 
 
 def kb_payment_admin_menu(lang: str = "en") -> InlineKeyboardMarkup:
-    """Limited menu for payment-only admins — pending + history + back.
+    """Limited menu for payment-only admins — pending + my-approvals + history + back.
 
     PA-LANG: buttons are localised via the pa_* i18n keys so payment admins
     see their selected language.  Full admins see English (the caller passes
     lang="en" via _pa_lang).
+
+    PAY-HISTORY-REWORK: split the old single "Payment History" button into
+    two — "My Approvals" (their own reviewed receipts) and "All Receipts"
+    (which redirects to my-approvals for payment admins, or shows the full
+    list for full admins).  This makes the per-admin isolation explicit in
+    the UI.
     """
     kb = InlineKeyboardBuilder()
     kb.button(style="success", text=t("pa_pending_btn", lang),
               callback_data=AdminCB(action="pending_payments").pack())
-    kb.button(style="primary", text=t("pa_history_btn", lang),
-              callback_data=AdminCB(action="payment_history").pack())
+    kb.button(style="primary", text=t("pa_my_history_btn", lang),
+              callback_data=AdminCB(action="my_history").pack())
     kb.button(text=t("back_menu", lang), callback_data=MenuCB(action="main").pack(), style="danger")
     kb.adjust(1)
     return kb.as_markup()
@@ -5348,10 +5465,17 @@ class AdminGuard:
     # Callback-data prefixes (raw event.data strings) that payment admins may
     # invoke. AdminCB packs as "admin:<action>:...", PaymentCB as "pay:...",
     # MenuCB as "menu:<action>".
+    # PAY-HISTORY-REWORK: payment admins may now view their own approval
+    # history (admin:my_history). The per-admin picker (admin:admin_payments)
+    # and the all-receipts view (admin:payment_history) are FULL-admin-only —
+    # they're stripped out at the handler level even if a payment admin
+    # somehow crafts the callback data, because the handler re-checks
+    # _is_full_admin before rendering.
     _PAYMENT_ALLOWED_PREFIXES = (
         "admin:main",
         "admin:pending_payments",
         "admin:payment_history",
+        "admin:my_history",
         "pay:",
         "menu:main",
     )
@@ -7248,9 +7372,49 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         # t.me/share/url lets the user pick a chat to forward the link to.
         share_url = f"https://t.me/share/url?url={ref_link}"
         kb.button(style="primary", text=t("share_link", lang), url=share_url)
+        # REFERRAL-INVITEES: button that opens the full invitees list
+        # (tg_id + name + status + join date) so the customer can see exactly
+        # who they've invited.  Always shown — even with zero invitees the
+        # list view says "No invitees yet" which is informative.
+        kb.button(style="primary", text=t("ref_invitees_btn", lang),
+                  callback_data=MenuCB(action="referral_invitees").pack())
         kb.button(text=t("back", lang), callback_data=MenuCB(action="main").pack(), style="danger")
-        kb.adjust(1, 1, 1)
+        kb.adjust(1, 1, 1, 1)
         await callback.message.edit_text(text, reply_markup=kb.as_markup(), disable_web_page_preview=True)
+        await callback.answer()
+
+    @router.callback_query(MenuCB.filter(F.action == "referral_invitees"))
+    async def cb_referral_invitees(callback: CallbackQuery, db_user: dict):
+        """REFERRAL-INVITEES: full list of users invited by this customer.
+
+        Shows each invitee's tg_id, display name, reward status (bought /
+        pending), and join date as a grid_table.  The user explicitly asked
+        for the customer to see the IDs of everyone they've invited.
+        """
+        lang = _lang(db_user)
+        invitees = await db.get_referral_invitees(callback.from_user.id, limit=50)
+        blocks: list = [rich_tables.heading(t("ref_invitees_title", lang))]
+        if invitees:
+            rows = []
+            for inv in invitees:
+                status = t("ref_status_bought", lang) if inv.get("referral_rewarded") else t("ref_status_pending", lang)
+                status_emoji = "✅" if inv.get("referral_rewarded") else "⏳"
+                name = (inv.get("first_name") or inv.get("username") or str(inv["tg_id"]))[:16]
+                disp_date = fmt_iso(inv.get("created_at"), "%Y-%m-%d") or "-"
+                rows.append((inv["tg_id"], name, f"{status_emoji} {status}", disp_date))
+            blocks.append(rich_tables.grid_table(
+                t("ref_invitees_header", lang).split(" • "), rows,
+                aligns=["right", "left", "center", "center"],
+            ))
+        else:
+            blocks.append(rich_tables.paragraph(t("ref_invitees_none", lang)))
+        rich = rich_tables.rich_message(*blocks, is_rtl=(lang == "fa"))
+        kb = InlineKeyboardBuilder()
+        kb.button(text=t("back", lang), callback_data=MenuCB(action="referral").pack(), style="danger")
+        kb.adjust(1)
+        # Rich messages can't be edited in place (aiogram 3.30 has no
+        # edit_rich).  show_view handles delete + answer_rich for us.
+        await show_view(callback.message, rich=rich, reply_markup=kb.as_markup())
         await callback.answer()
 
     @router.callback_query(MenuCB.filter(F.action == "referral_claim"))
@@ -8985,6 +9149,9 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             return
         accounts = await db.get_user_accounts(tg_id)
         cur = await _currency()
+        # REFERRAL-INVITEES: show this user's invitee count in the user-detail
+        # card so the admin can see at a glance how many they've referred.
+        invitees = await db.get_referral_invitees(tg_id, limit=50)
         blocks = [rich_tables.heading("👤 User"),
                   rich_tables.kv_table([
                       ("TG ID", user["tg_id"]),
@@ -8994,6 +9161,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
                       ("Spent", fmt_price(user.get("total_spent", 0), "en", cur)),
                       ("Banned", "Yes" if user.get("is_banned") else "No"),
                       ("Joined", fmt_iso(user.get("created_at"), "%Y-%m-%d %H:%M:%S")),
+                      ("Referred by", user.get("referred_by") or "-"),
+                      ("Invitees", len(invitees)),
                   ])]
         if accounts:
             rows = [("🟢" if a["is_active"] else "🔴",
@@ -9012,13 +9181,19 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         kb.button(text="💰 Add Balance", callback_data=AdminCB(action="add_balance", data=str(tg_id)).pack(), style="primary")
         kb.button(text="➖ Deduct", callback_data=AdminCB(action="deduct_balance", data=str(tg_id)).pack(), style="danger")
         kb.button(text="➕ Create Account", callback_data=AdminCB(action="create_account", data=str(tg_id)).pack(), style="success")
+        # PAY-HISTORY-REWORK / REFERRAL-INVITEES: financial history + receipts
+        # + invitees views.  These give the admin full visibility into a
+        # user's money flow and referral activity per the user's request.
+        kb.button(text="💼 Finance", callback_data=AdminCB(action="user_finance", data=str(tg_id)).pack(), style="primary")
+        kb.button(text="🧾 Receipts", callback_data=AdminCB(action="user_receipts", data=str(tg_id)).pack(), style="primary")
+        kb.button(text=t("admin_ref_invitees_btn", "en"), callback_data=AdminCB(action="user_invitees", data=str(tg_id)).pack(), style="primary")
         # per-account actions
         for a in accounts[:6]:
             label_acc = a.get("label") or a["email"][:16]
             kb.button(style="primary", text=f"⚙️ {label_acc}",
                       callback_data=AdminCB(action="user_account", data=f"{tg_id}_{a['email']}").pack())
         kb.button(text="🔙 Search", callback_data=AdminCB(action="users").pack(), style="danger")
-        kb.adjust(2, 2, 1, 1, 1)
+        kb.adjust(2, 2, 1, 3, 1, 1)
         await show_view(callback.message, rich=rich, reply_markup=kb.as_markup())
         await callback.answer()
 
@@ -9031,6 +9206,159 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_unban(callback: CallbackQuery, callback_data: AdminCB):
         await db.ban_user(int(callback_data.data), False)
         await callback.answer("✅ Unbanned", show_alert=True)
+
+    # ---- USER-FINANCE: full per-user financial history ----------------
+    # PAY-HISTORY-REWORK / USER-FINANCE: full-admin-only views showing a
+    # user's complete money flow.  ``cb_user_finance`` shows every
+    # transaction (purchases, renewals, top-ups, deposits, gift balances,
+    # admin adjustments) as a grid_table.  ``cb_user_receipts`` shows every
+    # payment receipt (photo/document/text) the user ever submitted, with
+    # status + approver — tapping a row opens the full receipt detail.
+    @router.callback_query(AdminCB.filter(F.action == "user_finance"))
+    async def cb_user_finance(callback: CallbackQuery, callback_data: AdminCB):
+        tg_id = int(callback_data.data)
+        user = await db.get_user(tg_id)
+        if not user:
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
+            return
+        cur = await _currency()
+        txs = await db.get_user_transactions(tg_id, limit=30)
+        uname = (user.get("first_name") or user.get("username") or str(tg_id))
+        blocks: list = [
+            rich_tables.heading(f"💼 Finance — {uname}"),
+            rich_tables.kv_table([
+                ("TG ID", user["tg_id"]),
+                ("Balance", fmt_price(user.get("balance", 0), "en", cur)),
+                ("Total Spent", fmt_price(user.get("total_spent", 0), "en", cur)),
+                ("Total Orders", user.get("total_orders", 0)),
+            ]),
+        ]
+        if txs:
+            blocks.append(rich_tables.divider())
+            blocks.append(rich_tables.heading(f"📜 Transactions ({len(txs)})", size=4))
+            # TX-SIGN-FIX (mirror of wallet_rich): display sign is type-based so
+            # purchases/renewals/topups show as "-" (money leaving wallet) even
+            # though they're stored as positive amounts.
+            _DEBIT = {"purchase", "renewal", "topup"}
+            _CREDIT = {"deposit", "gift_balance"}
+            rows = []
+            for tx in txs:
+                ttype = tx.get("type", "")
+                amt = float(tx.get("amount", 0) or 0)
+                if ttype in _DEBIT:
+                    sign = "-"
+                elif ttype in _CREDIT:
+                    sign = "+"
+                elif ttype == "admin_adjust":
+                    sign = "+" if amt >= 0 else "-"
+                    amt = abs(amt)
+                else:
+                    # trial / gift_plan / unknown → no sign, just amount.
+                    sign = ""
+                disp_amt = f"{sign}{fmt_num(amt, 'en')}"
+                disp_desc = (tx.get("description") or "")[:22]
+                disp_date = fmt_iso(tx.get("created_at"), "%m-%d %H:%M") or "-"
+                rows.append((f"#{tx['id']}", ttype, disp_amt, disp_date, disp_desc))
+            blocks.append(rich_tables.grid_table(
+                ["ID", "Type", "Amount", "Date", "Description"], rows,
+                aligns=["center", "left", "right", "center", "left"],
+            ))
+        else:
+            blocks.append(rich_tables.paragraph("No transactions."))
+        rich = rich_tables.rich_message(*blocks)
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🧾 Receipts", callback_data=AdminCB(action="user_receipts", data=str(tg_id)).pack(), style="primary")
+        kb.button(text=t("admin_ref_invitees_btn", "en"), callback_data=AdminCB(action="user_invitees", data=str(tg_id)).pack(), style="primary")
+        kb.button(text="🔙 User", callback_data=AdminCB(action="user_view", data=str(tg_id)).pack(), style="danger")
+        kb.adjust(2, 1)
+        await show_view(callback.message, rich=rich, reply_markup=kb.as_markup())
+        await callback.answer()
+
+    @router.callback_query(AdminCB.filter(F.action == "user_receipts"))
+    async def cb_user_receipts(callback: CallbackQuery, callback_data: AdminCB):
+        """All payment receipts the user ever submitted (any status)."""
+        tg_id = int(callback_data.data)
+        user = await db.get_user(tg_id)
+        if not user:
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
+            return
+        payments = await db.get_user_payments(tg_id, limit=30)
+        uname = (user.get("first_name") or user.get("username") or str(tg_id))
+        blocks: list = [rich_tables.heading(f"🧾 Receipts — {uname}")]
+        if payments:
+            rows = []
+            admin_cache: dict = {}
+            for p in payments:
+                status = p.get("status", "pending")
+                status_emoji = {"approved": "✅", "rejected": "❌", "pending": "⏳"}.get(status, "•")
+                rtype = (p.get("receipt_type") or "").lower()
+                receipt_icon = {"photo": "📸", "document": "📎", "text": "📝"}.get(rtype, "—")
+                # Approver label.
+                admin_label = p.get("admin_username") or ""
+                admin_id = p.get("admin_id")
+                if not admin_label and admin_id:
+                    if admin_id not in admin_cache:
+                        admin_cache[admin_id] = await db.get_user(admin_id)
+                    admin_label = _admin_display(admin_cache[admin_id]) if admin_cache[admin_id] else ""
+                approver = admin_label[:14] if admin_label and status != "pending" else "—"
+                disp_date = fmt_iso(p.get("created_at"), "%m-%d %H:%M") or "-"
+                rows.append((f"#{p['id']}", fmt_num(p["unique_amount"], "en"),
+                             f"{status_emoji} {status}", receipt_icon, disp_date, approver))
+            blocks.append(rich_tables.grid_table(
+                ["ID", "Amount", "Status", "Receipt", "Date", "Approver"], rows,
+                aligns=["center", "right", "center", "center", "center", "left"],
+            ))
+        else:
+            blocks.append(rich_tables.paragraph("No receipts."))
+        rich = rich_tables.rich_message(*blocks)
+        kb = InlineKeyboardBuilder()
+        # Each payment gets a button so the admin can open the full detail
+        # card + receipt photo.
+        for p in payments:
+            status = p.get("status", "pending")
+            status_emoji = {"approved": "✅", "rejected": "❌", "pending": "⏳"}.get(status, "•")
+            kb.button(style="primary",
+                text=f"#{p['id']} — {fmt_num(p['unique_amount'], 'en')}T {status_emoji}",
+                callback_data=PaymentCB(action="view", payment_id=p["id"]).pack())
+        kb.button(text="💼 Finance", callback_data=AdminCB(action="user_finance", data=str(tg_id)).pack(), style="primary")
+        kb.button(text=t("admin_ref_invitees_btn", "en"), callback_data=AdminCB(action="user_invitees", data=str(tg_id)).pack(), style="primary")
+        kb.button(text="🔙 User", callback_data=AdminCB(action="user_view", data=str(tg_id)).pack(), style="danger")
+        kb.adjust(*[1 for _ in payments], 2, 1)
+        await show_view(callback.message, rich=rich, reply_markup=kb.as_markup())
+        await callback.answer()
+
+    @router.callback_query(AdminCB.filter(F.action == "user_invitees"))
+    async def cb_user_invitees(callback: CallbackQuery, callback_data: AdminCB):
+        """REFERRAL-INVITEES (admin view): every user this person invited."""
+        tg_id = int(callback_data.data)
+        user = await db.get_user(tg_id)
+        if not user:
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
+            return
+        invitees = await db.get_referral_invitees(tg_id, limit=50)
+        uname = (user.get("first_name") or user.get("username") or str(tg_id))
+        blocks: list = [rich_tables.heading(f"👥 Invitees — {uname}")]
+        if invitees:
+            rows = []
+            for inv in invitees:
+                status = "✅" if inv.get("referral_rewarded") else "⏳"
+                name = (inv.get("first_name") or inv.get("username") or str(inv["tg_id"]))[:16]
+                disp_date = fmt_iso(inv.get("created_at"), "%Y-%m-%d") or "-"
+                rows.append((inv["tg_id"], name, status, disp_date))
+            blocks.append(rich_tables.grid_table(
+                ["TG ID", "Name", "Status", "Joined"], rows,
+                aligns=["right", "left", "center", "center"],
+            ))
+        else:
+            blocks.append(rich_tables.paragraph("No invitees."))
+        rich = rich_tables.rich_message(*blocks)
+        kb = InlineKeyboardBuilder()
+        kb.button(text="💼 Finance", callback_data=AdminCB(action="user_finance", data=str(tg_id)).pack(), style="primary")
+        kb.button(text="🧾 Receipts", callback_data=AdminCB(action="user_receipts", data=str(tg_id)).pack(), style="primary")
+        kb.button(text="🔙 User", callback_data=AdminCB(action="user_view", data=str(tg_id)).pack(), style="danger")
+        kb.adjust(2, 1)
+        await show_view(callback.message, rich=rich, reply_markup=kb.as_markup())
+        await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "add_balance"))
     async def cb_add_balance(callback: CallbackQuery, callback_data: AdminCB, state: FSMContext):
@@ -10668,68 +10996,229 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.callback_query(AdminCB.filter(F.action == "payment_history"))
     async def cb_payment_history(callback: CallbackQuery):
-        """RECEIPT-HISTORY: list of recent payments (any status) with their
-        receipt kind, status, and the admin who acted on them. Tapping a row
-        opens ``cb_payment_view`` which shows the full detail card + receipt
-        photo (so the admin can re-read the screenshot and see who approved
-        it, when, and with what note).
+        """PAY-HISTORY-REWORK: receipt history.
+
+        * Payment admins are REDIRECTED to ``cb_my_history`` (their own
+          approvals only) — they must not see other admins' or un-reviewed
+          receipts.  This keeps the menu button simple ("Payment History")
+          while enforcing the per-admin isolation at the handler level.
+        * Full admins see ALL receipts (any status, any approver) as a
+          grid_table, plus a "👥 By Admin" button that opens the per-admin
+          picker so they can review each payment admin's approvals in turn.
+
+        The view is rendered via ``_render_history_table`` (shared with the
+        per-admin view) so the column layout stays consistent.
         PA-LANG: localised via _pa_lang.
         """
         pal = await _pa_lang(callback.from_user.id)
-        payments = await db.get_recent_payments(limit=20)
+        # Payment admins: force-redirect to their own approvals.
+        if not await _is_full_admin(callback.from_user.id):
+            await cb_my_history(callback)
+            return
+        # Full admin: show ALL receipts.
+        payments = await db.get_recent_payments(limit=30)
+        is_full = True
         if not payments:
-            menu = kb_admin_menu() if await _is_full_admin(callback.from_user.id) else kb_payment_admin_menu(pal)
+            menu = kb_admin_menu() if is_full else kb_payment_admin_menu(pal)
             await show_view(callback.message, text=t("pa_no_payments", pal), reply_markup=menu)
             await callback.answer()
             return
-        text = t("pa_history_title", pal) + "\n\n"
-        text += t("pa_history_header", pal) + "\n"
-        text += "──────────────────────────────\n"
+        await _render_history_table(callback, payments, pal,
+                                    title=t("pa_history_all_title", pal),
+                                    is_full=is_full)
+        await callback.answer()
+
+    @router.callback_query(AdminCB.filter(F.action == "my_history"))
+    async def cb_my_history(callback: CallbackQuery):
+        """PAY-HISTORY-REWORK: payment admin's OWN approval history.
+
+        Shows only receipts THIS admin reviewed (approved or rejected).
+        Full admins tapping this also see their own approvals — useful for
+        the main admin to audit their own actions too.
+        PA-LANG: localised via _pa_lang.
+        """
+        pal = await _pa_lang(callback.from_user.id)
+        payments = await db.get_payments_by_admin(callback.from_user.id, limit=30)
+        is_full = await _is_full_admin(callback.from_user.id)
+        if not payments:
+            menu = kb_admin_menu() if is_full else kb_payment_admin_menu(pal)
+            await show_view(callback.message, text=t("pa_no_own_approvals", pal), reply_markup=menu)
+            await callback.answer()
+            return
+        await _render_history_table(callback, payments, pal,
+                                    title=t("pa_history_my_title", pal),
+                                    is_full=is_full)
+        await callback.answer()
+
+    @router.callback_query(AdminCB.filter(F.action == "admin_payments"))
+    async def cb_admin_payments_picker(callback: CallbackQuery):
+        """PAY-HISTORY-REWORK: full-admin-only picker listing every payment
+        admin with their approval/rejection counts. Tapping one opens
+        ``cb_admin_payments_view`` for that admin's approvals.
+
+        Full-admin-only: payment admins never see this — the callback is not
+        in AdminGuard._PAYMENT_ALLOWED_PREFIXES, and even if reached, the
+        _is_full_admin check below bounces them back to the menu.
+        """
+        pal = await _pa_lang(callback.from_user.id)
+        if not await _is_full_admin(callback.from_user.id):
+            # Payment admin shouldn't be here — bounce to menu.
+            await show_view(callback.message,
+                text=f"{t('pa_menu_title', pal)}\n\n{t('pa_menu_desc', pal)}",
+                reply_markup=kb_payment_admin_menu(pal))
+            await callback.answer()
+            return
+        pa_ids = await get_payment_admin_ids(db)
+        # Include full admins (ADMIN_IDS) too — they may have approved
+        # payments and the user wants to be able to audit EVERY approver,
+        # not just payment-only admins.
+        all_admin_ids = set(ADMIN_IDS) | pa_ids
+        if not all_admin_ids:
+            await show_view(callback.message, text=t("pa_history_admins_none", pal),
+                            reply_markup=kb_admin_menu())
+            await callback.answer()
+            return
+        rows_data = await db.get_payment_admins_with_counts(all_admin_ids)
+        # Filter out admins with zero activity (cleaner picker).
+        active = [r for r in rows_data if r["total"] > 0]
+        if not active:
+            await show_view(callback.message, text=t("pa_history_admins_none", pal),
+                            reply_markup=kb_admin_menu())
+            await callback.answer()
+            return
+        # Build grid_table: Admin • Approved • Rejected • Total
+        table_rows = []
+        for r in active:
+            admin_row = await db.get_user(r["tg_id"])
+            label = _admin_display(admin_row) if admin_row else f"#{r['tg_id']}"
+            role_tag = "🛡" if r["tg_id"] in ADMIN_IDS else "💰"
+            table_rows.append((f"{role_tag} {label}", r["approved"], r["rejected"], r["total"]))
+        rich = rich_tables.rich_message(
+            rich_tables.heading(t("pa_history_admins_title", pal)),
+            rich_tables.grid_table(
+                t("pa_history_admins_header", pal).split(" • "),
+                table_rows,
+                aligns=["left", "center", "center", "center"],
+            ),
+            rich_tables.paragraph(t("pa_history_admins_pick", pal)),
+        )
         kb = InlineKeyboardBuilder()
+        for r in active:
+            admin_row = await db.get_user(r["tg_id"])
+            label = _admin_display(admin_row) if admin_row else f"#{r['tg_id']}"
+            role_tag = "🛡" if r["tg_id"] in ADMIN_IDS else "💰"
+            kb.button(style="primary",
+                text=f"{role_tag} {label[:20]} — ✅{r['approved']} ❌{r['rejected']}",
+                callback_data=AdminCB(action="admin_payments_view", data=str(r["tg_id"])).pack())
+        kb.button(style="primary", text=t("pa_history_btn", pal),
+                  callback_data=AdminCB(action="payment_history").pack())
+        kb.button(style="danger", text=t("pa_admin_back_btn", pal),
+                  callback_data=AdminCB(action="main").pack())
+        kb.adjust(*[1 for _ in active], 2)
+        await show_view(callback.message, rich=rich, reply_markup=kb.as_markup())
+        await callback.answer()
+
+    @router.callback_query(AdminCB.filter(F.action == "admin_payments_view"))
+    async def cb_admin_payments_view(callback: CallbackQuery, callback_data: AdminCB):
+        """PAY-HISTORY-REWORK: full-admin-only view of a specific admin's
+        approvals.  Callback data carries the target admin's tg_id."""
+        pal = await _pa_lang(callback.from_user.id)
+        if not await _is_full_admin(callback.from_user.id):
+            await show_view(callback.message,
+                text=f"{t('pa_menu_title', pal)}\n\n{t('pa_menu_desc', pal)}",
+                reply_markup=kb_payment_admin_menu(pal))
+            await callback.answer()
+            return
+        target_id = int(callback_data.data)
+        target_row = await db.get_user(target_id)
+        target_label = _admin_display(target_row) if target_row else f"#{target_id}"
+        payments = await db.get_payments_by_admin(target_id, limit=30)
+        if not payments:
+            await show_view(callback.message,
+                text=t("pa_history_admin_none", pal),
+                reply_markup=kb_admin_menu())
+            await callback.answer()
+            return
+        await _render_history_table(callback, payments, pal,
+                                    title=t("pa_history_admin_title", pal, admin=target_label),
+                                    is_full=True,
+                                    back_to=("admin_payments", ""))
+        await callback.answer()
+
+    async def _render_history_table(callback: CallbackQuery, payments: list,
+                                    pal: str, title: str, is_full: bool,
+                                    back_to: Optional[tuple] = None):
+        """PAY-HISTORY-REWORK: shared renderer for the payment-history grid_table.
+
+        Renders a 5-column table (ID • User • Amount • Status • Approver) and
+        a row of per-payment buttons (so the admin can still open the full
+        detail card + receipt photo).  ``back_to`` is an optional
+        ``(action, data)`` tuple for the back button — defaults to the
+        payment-history list for full admins or the payment-admin menu for
+        payment admins.
+        """
         # Cache admin lookups so we don't N+1 the same admin row when several
         # payments were approved by the same person.
         admin_cache: dict = {}
-        # Status label map (localised).
         _status_label = {
             "approved": t("pa_status_approved", pal),
             "rejected": t("pa_status_rejected", pal),
             "pending": t("pa_status_pending", pal),
         }
+        table_rows = []
         for p in payments:
             user = await db.get_user(p["user_tg_id"])
             uname_raw = (user or {}).get("first_name") or (user or {}).get("username") or str(p["user_tg_id"])
-            uname = escape_html(uname_raw[:18])
+            uname = uname_raw[:16]
             amt_en = fmt_num(p['unique_amount'], 'en')
             status = p.get('status', 'pending')
             status_emoji = {"approved": "✅", "rejected": "❌", "pending": "⏳"}.get(status, "•")
-            rtype = (p.get("receipt_type") or "").lower()
-            receipt_icon = {"photo": "📸", "document": "📎", "text": "📝"}.get(rtype, "—")
-            # Approved-by label: prefer denormalized column, fall back to
-            # users-lookup cache.
+            status_word = _status_label.get(status, status)
+            # Approver label: prefer denormalized column, fall back to cache.
             admin_label = p.get("admin_username") or ""
             admin_id = p.get("admin_id")
             if not admin_label and admin_id:
                 if admin_id not in admin_cache:
                     admin_cache[admin_id] = await db.get_user(admin_id)
                 admin_label = _admin_display(admin_cache[admin_id]) if admin_cache[admin_id] else ""
-            if admin_label and status != "pending":
-                approver = escape_html(admin_label)
-            else:
-                approver = "—"
-            status_word = _status_label.get(status, status)
-            text += (f"{status_emoji} <b>#{p['id']}</b> • {uname} • {amt_en}T • "
-                     f"{status_word} • {receipt_icon} • {approver}\n")
+            approver = admin_label if admin_label and status != "pending" else "—"
+            table_rows.append((f"#{p['id']}", uname[:14], amt_en, f"{status_emoji} {status_word}", approver[:18]))
+        rich = rich_tables.rich_message(
+            rich_tables.heading(title),
+            rich_tables.grid_table(
+                ["ID", "User", "Amount", "Status", "Approver"],
+                table_rows,
+                aligns=["center", "left", "right", "center", "left"],
+            ),
+        )
+        kb = InlineKeyboardBuilder()
+        for p in payments:
+            user = await db.get_user(p["user_tg_id"])
+            uname_raw = (user or {}).get("first_name") or (user or {}).get("username") or str(p["user_tg_id"])
+            amt_en = fmt_num(p['unique_amount'], 'en')
+            status = p.get('status', 'pending')
+            status_emoji = {"approved": "✅", "rejected": "❌", "pending": "⏳"}.get(status, "•")
             kb.button(style="primary",
                 text=f"#{p['id']} {uname_raw[:12]} — {amt_en}T {status_emoji}",
-                callback_data=PaymentCB(action="view", payment_id=p["id"]).pack(),
-            )
+                callback_data=PaymentCB(action="view", payment_id=p["id"]).pack())
+        # Bottom nav: Pending, [By Admin if full], Back.
         kb.button(style="primary", text=t("pa_pending_btn", pal),
                   callback_data=AdminCB(action="pending_payments").pack())
-        kb.button(text=t("pa_admin_back_btn", pal), callback_data=AdminCB(action="main").pack(), style="danger")
-        # adjust: 1 per row for payment buttons, then 2 for the bottom pair.
-        kb.adjust(*[1 for _ in payments], 2)
-        await show_view(callback.message, text=text, reply_markup=kb.as_markup())
-        await callback.answer()
+        if is_full:
+            kb.button(style="primary", text=t("pa_admins_history_btn", pal),
+                      callback_data=AdminCB(action="admin_payments").pack())
+        if back_to:
+            kb.button(style="danger", text=t("pa_admin_back_btn", pal),
+                      callback_data=AdminCB(action=back_to[0], data=back_to[1]).pack())
+        else:
+            kb.button(style="danger", text=t("pa_admin_back_btn", pal),
+                      callback_data=AdminCB(action="main").pack())
+        # 1 button per row for payment rows, then the nav row(s):
+        # full admin → 2 (Pending + By Admin) then 1 (Back);
+        # payment admin → 1 (Pending) then 1 (Back).
+        kb.adjust(*[1 for _ in payments], 2 if is_full else 1, 1)
+        await show_view(callback.message, rich=rich, reply_markup=kb.as_markup())
+
 
     @router.callback_query(PaymentCB.filter(F.action == "view"))
     async def cb_payment_view(callback: CallbackQuery, callback_data: PaymentCB):
@@ -10739,6 +11228,19 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             return
         # PA-LANG: localise the entire detail card.
         pal = await _pa_lang(callback.from_user.id)
+        # PAY-HISTORY-REWORK: payment admins may only view (a) pending
+        # payments (so they can approve/reject) and (b) payments they
+        # themselves reviewed.  They must NOT see other admins' reviewed
+        # receipts — that data is full-admin-only.  Full admins see everything.
+        if not await _is_full_admin(callback.from_user.id):
+            status = payment.get("status", "pending")
+            admin_id = payment.get("admin_id")
+            if status != "pending" and admin_id != callback.from_user.id:
+                await callback.answer(
+                    t("admin_only", "en") if pal == "en" else "⛔ دسترسی ندارید.",
+                    show_alert=True,
+                )
+                return
         user = await db.get_user(payment["user_tg_id"])
         uname = escape_html((user or {}).get("first_name") or (user or {}).get("username") or str(payment["user_tg_id"]))
         text = t("pa_payment_title", pal, id=payment['id']) + "\n\n"
