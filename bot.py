@@ -1025,6 +1025,14 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "trial_created": "🎉 <b>Trial account created!</b>",
         "trial_failed": "❌ Failed to create trial: {msg}",
         "trial_no_renew": "🎁 Trial accounts cannot be renewed or topped up.\nBuy a paid plan to continue.",
+        # L10N-GAPS: user-facing strings that were previously hardcoded English.
+        "plan_not_found": "❌ Plan not found.",
+        "plan_not_found_buy": "❌ Plan not found — buy a new plan.",
+        "qr_caption_sub": "📡 Subscription",
+        "qr_caption_link": "🔗 Connection link",
+        "action_failed": "❌ Failed: {msg}",
+        "gift_plan_create_failed": "❌ {msg}\n\n⚠️ Your gift code was claimed but the account could not be created. Please contact support with code <code>{code}</code>.",
+        "gift_plan_db_failed": "❌ Internal error. Please contact support with code <code>{code}</code>.",
         # balance
         "balance_title": "💳 <b>Your Balance</b>",
         "recent_tx": "📋 <b>Recent transactions</b>",
@@ -1440,6 +1448,14 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "trial_created": "🎉 <b>اکانت آزمایشی ساخته شد!</b>",
         "trial_failed": "❌ ساخت اکانت آزمایشی ناموفق بود: {msg}",
         "trial_no_renew": "🎁 اکانت‌های آزمایشی قابل تمدید یا افزایش حجم نیستند.\nبرای ادامه، یک پلن خریداری کنید.",
+        # L10N-GAPS: رشته‌های کاربر-رو که قبلاً انگلیسی هاردکد شده بودند.
+        "plan_not_found": "❌ پلن یافت نشد.",
+        "plan_not_found_buy": "❌ پلن یافت نشد — یک پلن جدید بخرید.",
+        "qr_caption_sub": "📡 اشتراک",
+        "qr_caption_link": "🔗 لینک اتصال",
+        "action_failed": "❌ ناموفق: {msg}",
+        "gift_plan_create_failed": "❌ {msg}\n\n⚠️ کد هدیه شما استفاده شد اما اکانت ایجاد نشد. لطفاً با کد <code>{code}</code> با پشتیبانی تماس بگیرید.",
+        "gift_plan_db_failed": "❌ خطای داخلی. لطفاً با کد <code>{code}</code> با پشتیبانی تماس بگیرید.",
         "balance_title": "💳 <b>موجودی شما</b>",
         "recent_tx": "📋 <b>تراکنش‌های اخیر</b>",
         "topup_hint": "💡 از شارژ کیف پول برای افزایش موجودی استفاده کنید یا کد هدیه دریافت کنید.",
@@ -2521,7 +2537,7 @@ class Database:
     _PLAN_FIELDS = {"name", "description", "traffic_gb", "duration_days", "price",
                     "limit_ip", "inbound_ids", "is_active", "sort_order"}
     _ACCOUNT_FIELDS = {"label", "plan_id", "traffic_gb", "expiry_time", "limit_ip",
-                       "inbound_ids", "is_active", "is_trial", "server_id"}
+                       "inbound_ids", "is_active", "is_trial", "server_id", "renewed_at"}
 
     async def update_server(self, server_id: int, **kwargs):
         """Update a server row. Column names are validated against a strict
@@ -4612,6 +4628,21 @@ async def show_view(message: Message,
                                 disable_web_page_preview=disable_web_page_preview)
 
 
+async def del_inbound(message: Message):
+    """Delete the admin's inbound text message to keep the chat clean.
+
+    FSM input handlers (``@router.message(AdminStates.…``) receive the admin's
+    TYPED query as ``message``.  If not deleted, every search query, every
+    "enter amount", every "enter label" the admin types piles up in the chat
+    and clutters the admin panel.  This helper deletes that typed message
+    silently (best-effort — in groups the bot may lack delete rights).
+    """
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
 def make_qr_png(data: str) -> Optional[bytes]:
     """Generate a PNG QR code for ``data``.  Returns None if qrcode is missing."""
     if not _HAS_QR:
@@ -5073,10 +5104,14 @@ def kb_server_view(server_id: int) -> InlineKeyboardMarkup:
     kb.button(style="primary", text="📶 Test", callback_data=ServerCB(action="test", server_id=server_id).pack())
     kb.button(style="primary", text="💾 Backup", callback_data=ServerCB(action="backup", server_id=server_id).pack())
     kb.button(style="primary", text="📥 Import", callback_data=ImportCB(action="server", server_id=server_id, page=1).pack())
-    kb.button(text="🔄 Restart", callback_data=ServerCB(action="restart", server_id=server_id).pack(), style="danger")
+    kb.button(text="🔄 Restart", callback_data=ServerCB(action="restart_ask", server_id=server_id).pack(), style="danger")
     kb.button(text="🗑 Delete", callback_data=ServerCB(action="delete_ask", server_id=server_id).pack(), style="danger")
     kb.button(text="🔙 Servers", callback_data=AdminCB(action="servers").pack(), style="danger")
-    kb.adjust(2, 2, 2, 1, 2, 1)
+    # SERVER-RESTART-CONFIRM: Restart and Delete are both destructive — never
+    # share a row. Restart on its own row, Delete on its own row, Back pairs
+    # with nothing (own row). Old layout (2,2,2,1,2,1) put Restart+Delete
+    # side-by-side, inviting a wrong-tap.
+    kb.adjust(2, 2, 2, 1, 1, 1, 1)
     return kb.as_markup()
 
 
@@ -5090,7 +5125,7 @@ def kb_import_server_picker(servers: List[dict]) -> InlineKeyboardMarkup:
         kb.button(style="primary",
             text=f"{status} {srv['alias']}",
             callback_data=ImportCB(action="server", server_id=srv["id"], page=1).pack())
-    kb.button(text="🔙 Admin", callback_data=AdminCB(action="main").pack(), style="danger")
+    kb.button(text="🔙 Servers", callback_data=AdminCB(action="servers").pack(), style="danger")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -5213,7 +5248,7 @@ def kb_inbound_picker(server_alias: str, inbounds: List[dict], selected: set,
     return kb.as_markup()
 
 
-def kb_tickets(tickets: List[dict], back_cb: str = "admin") -> InlineKeyboardMarkup:
+def kb_tickets(tickets: List[dict], back_cb: str = "support_menu") -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for tk in tickets:
         status = "🟢" if tk["status"] == "open" else "🔴"
@@ -5754,7 +5789,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         if is_admin and callback.from_user.id in ADMIN_IDS:
             open_count = await db.count_open_tickets()
             badge = f" ({open_count})" if open_count else ""
-            kb.button(style="danger", text=f"🛡 Tickets{badge}", callback_data=AdminCB(action="tickets").pack())
+            kb.button(style="primary", text=f"🛡 Tickets{badge}", callback_data=AdminCB(action="tickets").pack())
         kb.button(text=t("back_menu", lang), callback_data=MenuCB(action="main").pack(), style="primary")
         kb.adjust(2, 2, 1)
         await show_view(callback.message, text=text, reply_markup=kb.as_markup())
@@ -6305,8 +6340,8 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(style="success", text=t("send_receipt", lang),
                                       callback_data=PaymentCB(action="send_receipt", amount=0).pack())],
-                [InlineKeyboardButton(style="danger", text=t("back_menu", lang),
-                                      callback_data=MenuCB(action="main").pack())],
+                [InlineKeyboardButton(style="danger", text=t("back", lang),
+                                      callback_data=BuyCB(action="start", plan_id=plan["id"], step="review").pack())],
             ]),
         )
         await callback.answer()
@@ -6648,7 +6683,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             await callback.message.answer_photo(
                 BufferedInputFile(png, filename="qr.png"),
                 caption=f"📱 QR — <code>{escape_html(account['email'])}</code>\n"
-                        f"{'📡 Subscription' if sub_url else '🔗 Connection link'}",
+                        f"{t('qr_caption_sub', lang) if sub_url else t('qr_caption_link', lang)}",
                 reply_markup=kb.as_markup(),
             )
             try:
@@ -6721,7 +6756,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             return
         plan = await db.get_plan(account["plan_id"]) if account.get("plan_id") else None
         if not plan:
-            await callback.answer("Plan not found — buy a new plan.", show_alert=True)
+            await callback.answer(t("plan_not_found_buy", lang), show_alert=True)
             return
         currency = await _currency()
         balance = db_user.get("balance", 0)
@@ -6804,7 +6839,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             return
         plan = await db.get_plan(account["plan_id"]) if account.get("plan_id") else None
         if not plan:
-            await callback.answer("Plan not found.", show_alert=True)
+            await callback.answer(t("plan_not_found", lang), show_alert=True)
             return
         if account.get("is_trial"):
             await callback.answer(t("trial_no_renew", lang), show_alert=True)
@@ -6953,7 +6988,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         if not result.get("success"):
             # C7 — compensation: refund the deducted balance.
             await db.update_user_balance(callback.from_user.id, price, add=True)
-            await callback.answer(f"Failed: {result.get('msg')}", show_alert=True)
+            await callback.answer(t("action_failed", lang, msg=result.get('msg', '')), show_alert=True)
             return
         # H2 — preserve unlimited accounts on top-up too. traffic_gb=0
         # means UNLIMITED; adding GB would cap it. Keep it unlimited.
@@ -7310,7 +7345,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
               amount_block=_amount_block(unique_amount, currency, lang)),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(style="success", text=t("send_receipt", lang), callback_data=PaymentCB(action="send_receipt", amount=0).pack())],
-                [InlineKeyboardButton(style="danger", text=t("back_menu", lang), callback_data=MenuCB(action="main").pack())],
+                [InlineKeyboardButton(style="danger", text=t("back_menu", lang), callback_data=MenuCB(action="charge_wallet").pack())],
             ]),
         )
         await callback.answer()
@@ -7365,7 +7400,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
               amount_block=_amount_block(unique_amount, currency, lang)),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(style="success", text=t("send_receipt", lang), callback_data=PaymentCB(action="send_receipt", amount=0).pack())],
-                [InlineKeyboardButton(style="danger", text=t("back_menu", lang), callback_data=MenuCB(action="main").pack())],
+                [InlineKeyboardButton(style="danger", text=t("back_menu", lang), callback_data=MenuCB(action="charge_wallet").pack())],
             ]),
         )
 
@@ -7802,7 +7837,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         elif gift["type"] == "plan":
             plan = await db.get_plan(int(gift["value"]))
             if not plan:
-                await message.answer("Plan not found.", reply_markup=kb_back_to_menu(lang))
+                await message.answer(t("plan_not_found", lang), reply_markup=kb_back_to_menu(lang))
                 return
             server = await lb.select_best_server(lb.plan_server_ids(plan) or None)
             if not server:
@@ -7829,8 +7864,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
                 logger.error("gift plan panel create failed for code %s user %s: %s",
                              code, message.from_user.id, res.get("msg"))
                 await message.answer(
-                    f"❌ {res.get('msg')}\n\n⚠️ Your gift code was claimed but the account "
-                    f"could not be created. Please contact support with code <code>{code}</code>.",
+                    t("gift_plan_create_failed", lang, msg=res.get('msg', ''), code=code),
                     reply_markup=kb_back_to_menu(lang),
                 )
                 return
@@ -7853,8 +7887,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
                 except Exception as del_err:
                     logger.error("compensation delete_client failed: %s", del_err)
                 await message.answer(
-                    "❌ Internal error. Please contact support with code "
-                    f"<code>{code}</code>.",
+                    t("gift_plan_db_failed", lang, code=code),
                     reply_markup=kb_back_to_menu(lang),
                 )
                 return
@@ -7876,25 +7909,6 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             await message.answer(text, reply_markup=kb.as_markup(), disable_web_page_preview=True)
 
     # ====================================================== SUPPORT
-    @router.callback_query(MenuCB.filter(F.action == "support"))
-    async def cb_support(callback: CallbackQuery, db_user: dict):
-        lang = _lang(db_user)
-        open_count = await db.count_open_tickets() if callback.from_user.id in ADMIN_IDS else 0
-        kb = InlineKeyboardBuilder()
-        kb.button(text=t("new_ticket", lang), callback_data=MenuCB(action="new_ticket").pack(), style="success")
-        kb.button(style="primary", text=t("my_tickets", lang), callback_data=MenuCB(action="my_tickets").pack())
-        if callback.from_user.id in ADMIN_IDS:
-            badge = f" ({open_count})" if open_count else ""
-            kb.button(style="primary", text=f"🛡 Tickets{badge}", callback_data=AdminCB(action="tickets").pack())
-        kb.button(text=t("back", lang), callback_data=MenuCB(action="main").pack(), style="danger")
-        kb.adjust(2, 2 if callback.from_user.id in ADMIN_IDS else 1)
-        # TICKET-MEDIA-1: use show_view so this works even when the current
-        # message is a photo (ticket-reply notification with a screenshot).
-        await show_view(callback.message,
-                        text=f"{t('support_title', lang)}\n\n{t('support_desc', lang)}",
-                        reply_markup=kb.as_markup())
-        await callback.answer()
-
     @router.callback_query(MenuCB.filter(F.action == "new_ticket"))
     async def cb_new_ticket(callback: CallbackQuery, state: FSMContext, db_user: dict):
         lang = _lang(db_user)
@@ -8572,6 +8586,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.message(AdminStates.waiting_for_server_alias)
     async def ms_srv_alias(message: Message, state: FSMContext):
+        await del_inbound(message)
         await state.update_data(alias=message.text.strip())
         await state.set_state(AdminStates.waiting_for_server_url)
         await message.answer("🔗 Enter panel URL (e.g. <code>https://1.2.3.4:2053</code>):",
@@ -8579,6 +8594,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.message(AdminStates.waiting_for_server_url)
     async def ms_srv_url(message: Message, state: FSMContext):
+        await del_inbound(message)
         url = (message.text or "").strip().rstrip("/")
         if not url.startswith("http"):
             await message.answer("❌ URL must start with http:// or https://", reply_markup=kb_cancel("en"))
@@ -8589,6 +8605,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.message(AdminStates.waiting_for_server_token)
     async def ms_srv_token(message: Message, state: FSMContext):
+        await del_inbound(message)
         token = (message.text or "").strip()
         data = await state.get_data()
         await state.set_state(AdminStates.waiting_for_server_capacity)
@@ -8600,6 +8617,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.message(AdminStates.waiting_for_server_capacity)
     async def ms_srv_capacity(message: Message, state: FSMContext):
+        await del_inbound(message)
         try:
             cap = int((message.text or "0").strip())
         except ValueError:
@@ -8612,6 +8630,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.message(AdminStates.waiting_for_server_priority)
     async def ms_srv_priority(message: Message, state: FSMContext):
+        await del_inbound(message)
         try:
             pri = int((message.text or "10").strip())
         except ValueError:
@@ -8624,6 +8643,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.message(AdminStates.waiting_for_server_location)
     async def ms_srv_location(message: Message, state: FSMContext):
+        await del_inbound(message)
         loc = (message.text or "").strip()
         if loc == "-":
             loc = ""
@@ -8698,6 +8718,25 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         ok, msg = await api.test_panel_connection(srv["panel_url"], srv["api_token"])
         await db.update_server_health(srv["id"], ok, "" if ok else msg)
         await callback.answer("✅ OK" if ok else f"❌ {msg}", show_alert=True)
+
+    @router.callback_query(ServerCB.filter(F.action == "restart_ask"))
+    async def cb_srv_restart_ask(callback: CallbackQuery, callback_data: ServerCB):
+        # SERVER-RESTART-CONFIRM: Restart kicks every client off the server
+        # (brief disconnect for all users). Require explicit confirmation so
+        # a misclick doesn't cause a mass-disconnect.
+        srv = await db.get_server(callback_data.server_id)
+        if not srv:
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
+            return
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🔄 Confirm Restart", callback_data=ServerCB(action="restart", server_id=srv["id"]).pack(), style="danger")
+        kb.button(text="🔙 Back", callback_data=ServerCB(action="view", server_id=srv["id"]).pack(), style="primary")
+        await show_view(callback.message, text=
+            f"🔄 <b>Restart server {escape_html(srv['alias'])}?</b>\n\n"
+            f"⚠️ This will restart the 3x-ui panel process. All connected clients will be briefly disconnected.",
+            reply_markup=kb.as_markup(),
+        )
+        await callback.answer()
 
     @router.callback_query(ServerCB.filter(F.action == "restart"))
     async def cb_srv_restart(callback: CallbackQuery, callback_data: ServerCB):
@@ -8850,12 +8889,14 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.message(AdminStates.waiting_for_plan_name)
     async def ms_plan_name(message: Message, state: FSMContext):
+        await del_inbound(message)
         await state.update_data(name=message.text.strip())
         await state.set_state(AdminStates.waiting_for_plan_desc)
         await message.answer("📝 Description (or <code>-</code> for none):", reply_markup=kb_cancel("en"))
 
     @router.message(AdminStates.waiting_for_plan_desc)
     async def ms_plan_desc(message: Message, state: FSMContext):
+        await del_inbound(message)
         desc = message.text.strip()
         if desc == "-":
             desc = ""
@@ -8866,6 +8907,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.message(AdminStates.waiting_for_plan_traffic)
     async def ms_plan_traffic(message: Message, state: FSMContext):
+        await del_inbound(message)
         try:
             # Accept fractional GB (0.2 = 200 MB) — the panel API receives
             # bytes (total_gb * GB), so any decimal works.
@@ -8882,6 +8924,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.message(AdminStates.waiting_for_plan_duration)
     async def ms_plan_duration(message: Message, state: FSMContext):
+        await del_inbound(message)
         try:
             days = int(message.text.strip())
         except ValueError:
@@ -8903,6 +8946,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.message(AdminStates.waiting_for_plan_price)
     async def ms_plan_price(message: Message, state: FSMContext):
+        await del_inbound(message)
         try:
             price = float(message.text.strip())
         except ValueError:
@@ -8920,6 +8964,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.message(AdminStates.waiting_for_plan_limit_ip)
     async def ms_plan_limit_ip(message: Message, state: FSMContext):
+        await del_inbound(message)
         try:
             limit_ip = int(message.text.strip())
         except ValueError:
@@ -9102,6 +9147,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     # Generic value handler for ALL admin FSM edits (server / plan / setting_int / acc_extend)
     @router.message(AdminStates.setting_edit_value)
     async def ms_setting_edit(message: Message, state: FSMContext):
+        await del_inbound(message)
         data = await state.get_data()
         raw = (message.text or "").strip()
         edit_type = data.get("edit_type")
@@ -9334,6 +9380,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.message(AdminStates.waiting_for_user_search)
     async def ms_user_search(message: Message, state: FSMContext):
+        await del_inbound(message)
         await state.clear()
         query = (message.text or "").strip()
         if query.lower() == "all":
@@ -9391,7 +9438,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         else:
             kb.button(text="🚫 Ban", callback_data=AdminCB(action="ban", data=str(tg_id)).pack(), style="danger")
         kb.button(text="💰 Add Balance", callback_data=AdminCB(action="add_balance", data=str(tg_id)).pack(), style="primary")
-        kb.button(text="➖ Deduct", callback_data=AdminCB(action="deduct_balance", data=str(tg_id)).pack(), style="danger")
+        kb.button(text="➖ Deduct Balance", callback_data=AdminCB(action="deduct_balance", data=str(tg_id)).pack(), style="danger")
         kb.button(text="➕ Create Account", callback_data=AdminCB(action="create_account", data=str(tg_id)).pack(), style="success")
         # USER-ACCOUNTS-REWORK: dedicated Accounts sub-section (replaces the
         # old inline accounts table + scattered per-account buttons).
@@ -9422,7 +9469,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             return
         accounts = await db.get_user_accounts(tg_id)
         uname = (user.get("first_name") or user.get("username") or str(tg_id))
-        blocks: list = [rich_tables.heading(f"📱 Accounts — {uname}")]
+        blocks: list = [rich_tables.heading(f"📱 Accounts — {uname} ({len(accounts)})")]
         if accounts:
             rows = [("🟢" if a["is_active"] else "🔴",
                      ("🎁 " if a.get("is_trial") else "") + a["email"],
@@ -9624,6 +9671,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.message(AdminStates.waiting_for_add_balance)
     async def ms_add_balance(message: Message, state: FSMContext):
+        await del_inbound(message)
         try:
             amount = float((message.text or "").strip())
         except ValueError:
@@ -9669,6 +9717,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.message(AdminStates.waiting_for_deduct_balance)
     async def ms_deduct_balance(message: Message, state: FSMContext):
+        await del_inbound(message)
         try:
             amount = float((message.text or "").strip())
         except ValueError:
@@ -9738,6 +9787,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.message(AdminStates.waiting_for_admin_account_create)
     async def ms_admin_account_create(message: Message, state: FSMContext):
+        await del_inbound(message)
         data = await state.get_data()
         await state.clear()
         tg_id = data["tg_id"]
@@ -9909,10 +9959,12 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
                 return
         await db.delete_account(email)
         await callback.answer("✅ Deleted", show_alert=True)
-        # refresh user view
+        # USER-ACCOUNTS-REWORK: return to the Accounts list (not user_view)
+        # so the admin stays in the accounts context — consistent with the
+        # other per-account actions (extend/reset/enable/disable).
         await show_view(callback.message, text="✅ Account deleted.",
                                          reply_markup=InlineKeyboardBuilder()
-                                         .button(text="🔙 User", callback_data=AdminCB(action="user_view", data=str(tg_id)).pack(), style="primary")
+                                         .button(text="🔙 Accounts", callback_data=AdminCB(action="user_accounts", data=str(tg_id)).pack(), style="primary")
                                          .as_markup())
 
     # ====================================================== FINANCE
@@ -9954,6 +10006,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.message(AdminStates.waiting_for_promo_code_str)
     async def ms_promo_code(message: Message, state: FSMContext):
+        await del_inbound(message)
         code = (message.text or "").strip().upper()
         if code == "-":
             code = gen_gift_code().replace("-", "")[:10]
@@ -9963,6 +10016,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.message(AdminStates.waiting_for_promo_discount)
     async def ms_promo_disc(message: Message, state: FSMContext):
+        await del_inbound(message)
         try:
             d = int((message.text or "").strip())
         except ValueError:
@@ -9979,6 +10033,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.message(AdminStates.waiting_for_promo_max_uses)
     async def ms_promo_max(message: Message, state: FSMContext):
+        await del_inbound(message)
         try:
             mu = int((message.text or "").strip())
         except ValueError:
@@ -10031,6 +10086,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.message(AdminStates.waiting_for_gift_amount)
     async def ms_gift_amount(message: Message, state: FSMContext):
+        await del_inbound(message)
         try:
             amount = float((message.text or "").strip())
         except ValueError:
@@ -10192,6 +10248,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.message(AdminStates.waiting_for_broadcast_message)
     async def ms_broadcast(message: Message, state: FSMContext):
+        await del_inbound(message)
         text = (message.text or "").strip()[:BROADCAST_MAX_TEXT_CHARS]
         # BROADCAST-EMPTY-GUARD: if the admin sent a photo / sticker / voice /
         # animation (or genuinely empty text), message.text is None → text="".
@@ -10886,6 +10943,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.message(AdminStates.waiting_for_import_tg_id)
     async def ms_import_tg_id(message: Message, state: FSMContext):
+        await del_inbound(message)
         raw = (message.text or "").strip()
         data = await state.get_data()
         await state.clear()
@@ -11071,6 +11129,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.message(AdminStates.waiting_for_payment_admin_id)
     async def ms_payment_admin_id(message: Message, state: FSMContext):
+        await del_inbound(message)
         raw = (message.text or "").strip()
         await state.clear()
         try:
@@ -11738,6 +11797,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.message(AdminStates.waiting_for_reject_reason)
     async def ms_reject_reason(message: Message, state: FSMContext):
+        await del_inbound(message)
         reason = (message.text or "").strip()
         if reason == "-":
             reason = ""
@@ -11810,6 +11870,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
 
     @router.message(AdminStates.waiting_for_force_join_channel)
     async def ms_force_join_channel(message: Message, state: FSMContext):
+        await del_inbound(message)
         input_text = (message.text or "").strip()
         chat_id = None
         username = ""
