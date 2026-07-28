@@ -1440,7 +1440,7 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "active_ips": "IP های فعال",
         "unlimited": "نامحدود",
         "topup_title": "➕ <b>افزایش حجم</b>\n\nیک بسته انتخاب کنید تا بدون تغییر تاریخ انقضا، حجم اکانت افزایش یابد:",
-        "topup_success": "✅ <b>حجم اضافه شد!</b>\n+{gb} GB به <code>{email}</code> اضافه شد.",
+        "topup_success": "✅ <b>حجم اضافه شد!</b>\n+{gb} گیگابایت به <code>{email}</code> اضافه شد.",
         "trial_disabled": "😔 در حال حاضر اکانت رایگان غیرفعال است.\n\nبعداً دوباره تلاش کنید.",
         "trial_used": "🎁 <b>اکانت رایگان</b>\n\nشما قبلاً اکانت رایگان دریافت کرده‌اید.\nهر کاربر فقط یک‌بار می‌تواند استفاده کند — حتی اگر اکانت تریال حذف شده باشد.\n\n🛒 پلن‌های مقرون‌به‌صرفه ما را ببینید!",
         "trial_offer": "🎁 <b>پیشنهاد اکانت رایگان</b>",
@@ -2142,7 +2142,18 @@ class Database:
                          # the history view can show "approved by @admin" without
                          # an extra JOIN — and survives even if the admin later
                          # blocks the bot (so they're not in `users` anymore).
-                         ("admin_username", "TEXT")],
+                         ("admin_username", "TEXT"),
+                         # RECEIPT-CROSS-ADMIN-CLEANUP: JSON map of
+                         # {admin_id_str: {"chat_id": int, "message_id": int,
+                         #                 "type": "photo"|"document"|"text"}}
+                         # populated when the "new payment" notification is
+                         # broadcast to all admins.  When any admin
+                         # approves/rejects, we iterate this map and edit each
+                         # notification to "✅ Approved by …" (or ❌ Rejected)
+                         # with no action buttons — so the other admins see the
+                         # outcome and can't tap Approve on an already-processed
+                         # receipt.  Falls back to delete if the edit fails.
+                         ("notif_msg_ids", "TEXT")],
         }
         for table, cols in add_cols.items():
             async with self._db.execute(f"PRAGMA table_info({table})") as cur:
@@ -3442,6 +3453,21 @@ class Database:
         await self._auto_commit()
         return cur.rowcount == 1
 
+    async def update_payment_notif_ids(self, payment_id: int, notif_json: str) -> None:
+        """Persist the JSON map of admin→notification-message IDs for a payment.
+
+        Called right after the "new payment" notifications are broadcast to
+        all admins (in ``ms_receipt``).  The map is later read by
+        :func:`_mark_payment_notifs_processed` to edit/delete each admin's
+        notification once ANY admin approves or rejects the payment — so the
+        other admins don't see stale "awaiting your review" prompts.
+        """
+        await self._db.execute(
+            "UPDATE payments SET notif_msg_ids = ? WHERE id = ?",
+            (notif_json, payment_id),
+        )
+        await self._auto_commit()
+
     async def update_language_selected(self, tg_id: int, selected: bool = True):
         await self._db.execute(
             "UPDATE users SET language_selected = ? WHERE tg_id = ?",
@@ -4093,15 +4119,25 @@ class LoadBalancer:
 # SECTION 5: FORMATTERS & UTILITIES
 # ============================================================================
 
-def fmt_bytes(num_bytes: int) -> str:
+def fmt_bytes(num_bytes: int, lang: str = "en") -> str:
+    """Format a byte count with the appropriate SI unit (B/KB/MB/GB/TB/PB).
+
+    LOCALIZATION: the unit abbreviations (KB, MB, GB, …) are standard
+    technical notation used as-is even in Persian text, but the DIGITS are
+    converted to Persian numerals when ``lang == "fa"`` so they're consistent
+    with the rest of an otherwise-FA screen.
+    """
     if num_bytes <= 0:
-        return "0 B"
+        s = "0 B"
+        return to_fa_digits(s) if lang == "fa" else s
     n = float(num_bytes)
     for unit in ["B", "KB", "MB", "GB", "TB", "PB"]:
         if abs(n) < 1024.0:
-            return f"{n:.1f} {unit}"
+            s = f"{n:.1f} {unit}"
+            return to_fa_digits(s) if lang == "fa" else s
         n /= 1024.0
-    return f"{n:.1f} EB"
+    s = f"{n:.1f} EB"
+    return to_fa_digits(s) if lang == "fa" else s
 
 
 def fmt_gb(gb, lang: str = "en") -> str:
@@ -4112,6 +4148,11 @@ def fmt_gb(gb, lang: str = "en") -> str:
     and the panel API receives bytes (``total_gb * GB``), so 0.2 GB becomes
     214_748_364 bytes cleanly.  Integer values render without a decimal
     point ("5 GB"); fractional values use up to 2 decimals ("0.2 GB").
+
+    LOCALIZATION: for Persian the unit words are translated ("گیگابایت" /
+    "ترابایت") so users don't see Latin "GB" in an otherwise-FA screen.
+    The number itself is also converted to Persian digits + Persian decimal
+    separator (٫).
     """
     try:
         v = float(gb)
@@ -4121,13 +4162,23 @@ def fmt_gb(gb, lang: str = "en") -> str:
         # 0 == unlimited; negative shouldn't happen but treat as unlimited.
         return t("unlimited", lang)
     if v >= 1024:
-        s = f"{v/1024:.1f} TB"
+        if lang == "fa":
+            s = f"{v/1024:.1f} ترابایت"
+        else:
+            s = f"{v/1024:.1f} TB"
     elif v == int(v):
         # whole GB — no decimal point (e.g. "5 GB" not "5.0 GB")
-        s = f"{int(v)} GB"
+        if lang == "fa":
+            s = f"{int(v)} گیگابایت"
+        else:
+            s = f"{int(v)} GB"
     else:
         # fractional GB — strip trailing zeros (0.20 → "0.2 GB", 0.25 → "0.25 GB")
-        s = f"{v:.2f}".rstrip("0").rstrip(".") + " GB"
+        num = f"{v:.2f}".rstrip("0").rstrip(".")
+        if lang == "fa":
+            s = f"{num} گیگابایت"
+        else:
+            s = f"{num} GB"
     if lang == "fa":
         # Persian uses the Arabic decimal separator ٫ (U+066B) instead of "."
         s = s.replace(".", "٫")
@@ -4207,6 +4258,25 @@ def fmt_remaining(expiry_ms: int, lang: str = "en") -> str:
         return "Expired" if lang == "en" else "منقضی"
     days = diff // MS_PER_DAY
     hours = (diff % MS_PER_DAY) // 3_600_000
+    if lang == "fa":
+        # LOCALIZATION: use full Persian words ("روز"/"ساعت"/"دقیقه") instead
+        # of the Latin "d"/"h"/"m" shorthand — the shorthand looks out of place
+        # in an otherwise-Persian screen.  Digits are converted to Persian.
+        if days > 0:
+            s = f"{days} روز"
+            if hours > 0:
+                s += f" و {hours} ساعت"
+        elif hours > 0:
+            minutes = (diff % 3_600_000) // 60_000
+            s = f"{hours} ساعت"
+            if minutes > 0:
+                s += f" و {minutes} دقیقه"
+        else:
+            # LOW — sub-hour durations showed "0h Nm" which looks odd.
+            # Show just the minutes when there are no hours.
+            minutes = (diff % 3_600_000) // 60_000
+            s = f"{minutes} دقیقه"
+        return to_fa_digits(s)
     if days > 0:
         s = f"{days}d {hours}h"
     elif hours > 0:
@@ -4217,13 +4287,14 @@ def fmt_remaining(expiry_ms: int, lang: str = "en") -> str:
         # Show just the minutes when there are no hours.
         minutes = (diff % 3_600_000) // 60_000
         s = f"{minutes}m"
-    return to_fa_digits(s) if lang == "fa" else s
+    return s
 
 
-def fmt_progress_bar(pct: float, width: int = 10) -> str:
+def fmt_progress_bar(pct: float, width: int = 10, lang: str = "en") -> str:
     pct = max(0.0, min(100.0, pct))
     filled = int(width * pct / 100)
-    return "█" * filled + "░" * (width - filled) + f" {pct:.0f}%"
+    s = "█" * filled + "░" * (width - filled) + f" {pct:.0f}%"
+    return to_fa_digits(s) if lang == "fa" else s
 
 
 def sanitize_name(name: str) -> Optional[str]:
@@ -4518,11 +4589,11 @@ def fmt_account_card(account: dict, lang: str = "en", traffic_data: Optional[dic
         if total > 0:
             remaining = max(0, total - used)
             pct = (used / total) * 100
-            lines.append(f"📈 {fmt_bytes(used)} / {fmt_bytes(total)}")
-            lines.append(f"<code>{fmt_progress_bar(pct)}</code>")
-            lines.append(f"✅ {fmt_bytes(remaining)}")
+            lines.append(f"📈 {fmt_bytes(used, lang)} / {fmt_bytes(total, lang)}")
+            lines.append(f"<code>{fmt_progress_bar(pct, lang=lang)}</code>")
+            lines.append(f"✅ {fmt_bytes(remaining, lang)}")
         else:
-            lines.append(f"📈 {fmt_bytes(used)} ({t('unlimited', lang)})")
+            lines.append(f"📈 {fmt_bytes(used, lang)} ({t('unlimited', lang)})")
     return "\n".join(lines)
 
 
@@ -4548,7 +4619,8 @@ async def show_view(message: Message,
                     text: Optional[str] = None,
                     rich: Optional[InputRichMessage] = None,
                     reply_markup=None,
-                    disable_web_page_preview: bool = False) -> Message:
+                    disable_web_page_preview: bool = False,
+                    state: "Optional[FSMContext]" = None) -> Message:
     """Replace the current chat message with a new view.
 
     Why this exists
@@ -4585,26 +4657,43 @@ async def show_view(message: Message,
     When the new content is byte-identical to the current message (e.g. the
     user taps the same button twice), Telegram returns ``"message is not
     modified"``.  We swallow this silently — no flicker, no delete+resend.
+
+    FSM prompt tracking (CHAT-CLUTTER-FIX)
+    --------------------------------------
+    When ``state`` is supplied, the returned message's id is stored in FSM
+    state under ``_prompt_msg_id`` so that :func:`del_inbound` can delete it
+    after the user types their response.  This is what makes the bot's OWN
+    "👥 Users — Send Telegram ID…" prompt disappear from the chat once the
+    admin responds, instead of piling up.  FSM entrypoint callbacks should
+    pass ``state=state``; non-FSM screens should omit it (default ``None``).
     """
     if rich is not None:
         try:
             await message.delete()
         except Exception:
             pass
-        return await message.answer_rich(rich_message=rich, reply_markup=reply_markup)
+        result = await message.answer_rich(rich_message=rich, reply_markup=reply_markup)
+        if state is not None:
+            await track_prompt(result, state)
+        return result
     # Text view: edit in place when possible (best UX, stable message id),
     # otherwise delete + resend (handles rich→text, photo→text, and
     # already-deleted cases).  ``disable_web_page_preview`` is forwarded so
     # screens that show a raw subscription URL don't trigger an ugly
     # link-preview card.
     try:
-        return await message.edit_text(text, reply_markup=reply_markup,
-                                       disable_web_page_preview=disable_web_page_preview)
+        result = await message.edit_text(text, reply_markup=reply_markup,
+                                         disable_web_page_preview=disable_web_page_preview)
+        if state is not None:
+            await track_prompt(result, state)
+        return result
     except TelegramBadRequest as e:
         msg_low = str(e).lower()
         # "message is not modified" → content identical; swallow silently to
         # avoid an unnecessary delete+resend flicker (e.g. double-tap).
         if "not modified" in msg_low:
+            if state is not None:
+                await track_prompt(message, state)
             return message
         # "no text in the message to edit" → current message is a photo/media
         # message (ticket-reply notification with a screenshot).  Fall through
@@ -4624,21 +4713,65 @@ async def show_view(message: Message,
         await message.delete()
     except Exception:
         pass
-    return await message.answer(text, reply_markup=reply_markup,
-                                disable_web_page_preview=disable_web_page_preview)
+    result = await message.answer(text, reply_markup=reply_markup,
+                                  disable_web_page_preview=disable_web_page_preview)
+    if state is not None:
+        await track_prompt(result, state)
+    return result
 
 
-async def del_inbound(message: Message):
-    """Delete the admin's inbound text message to keep the chat clean.
+async def del_inbound(message: Message, state: "Optional[FSMContext]" = None):
+    """Delete the admin's inbound text message AND the bot's tracked prompt.
 
-    FSM input handlers (``@router.message(AdminStates.…``) receive the admin's
-    TYPED query as ``message``.  If not deleted, every search query, every
-    "enter amount", every "enter label" the admin types piles up in the chat
-    and clutters the admin panel.  This helper deletes that typed message
-    silently (best-effort — in groups the bot may lack delete rights).
+    FSM input handlers (``@router.message(AdminStates.…`` / ``UserStates.…``)
+    receive the admin's TYPED query as ``message``.  If not deleted, every
+    search query, every "enter amount", every "enter label" the admin types
+    piles up in the chat and clutters the admin panel.
+
+    Additionally — and this is the part that fixes the "bot prompt stays in
+    chat" clutter — when ``state`` is supplied, this helper looks up the
+    ``_prompt_msg_id`` previously stored by :func:`track_prompt` and deletes
+    that bot prompt message too.  Without this, the "👥 Users — Send Telegram
+    ID…" prompt would remain in the chat after the admin types a query,
+    defeating the purpose of cleaning up.
+
+    Both deletes are best-effort (in groups the bot may lack delete rights).
     """
     try:
         await message.delete()
+    except Exception:
+        pass
+    if state is None:
+        return
+    try:
+        data = await state.get_data()
+    except Exception:
+        return
+    prompt_id = data.get("_prompt_msg_id")
+    if prompt_id:
+        try:
+            await message.bot.delete_message(chat_id=message.chat.id, message_id=prompt_id)
+        except Exception:
+            pass
+        # Clear it so a stale id is never re-deleted.
+        try:
+            await state.update_data(_prompt_msg_id=None)
+        except Exception:
+            pass
+
+
+async def track_prompt(prompt_msg: Message, state: "FSMContext"):
+    """Track a bot FSM-prompt message so :func:`del_inbound` can delete it.
+
+    Call this in FSM entrypoint callbacks right after ``show_view`` (or in
+    multi-step FSM handlers right after ``message.answer``) — i.e. immediately
+    after sending the prompt that asks the user for the next piece of input.
+
+    Storing the message_id in FSM state (rather than e.g. a module-global dict)
+    keeps it per-user and auto-clears when the FSM flow finishes / is cleared.
+    """
+    try:
+        await state.update_data(_prompt_msg_id=prompt_msg.message_id)
     except Exception:
         pass
 
@@ -5339,8 +5472,13 @@ def kb_broadcast_targets() -> InlineKeyboardMarkup:
 def kb_topup_packages(email: str, packages: List[int], lang: str, currency: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for gb in packages:
-        # Price: 1 GB = 2000 Toman (configurable via setting topup_price_per_gb)
-        kb.button(text=f"➕ {gb} GB", callback_data=TopupCB(action="buy", email=email, gb=gb).pack(), style="primary")
+        # LOCALIZATION: use fmt_gb so the button reads "۵ گیگابایت" in Persian
+        # instead of "5 GB".  Price is shown alongside so the user knows the
+        # cost before tapping.
+        price_per_gb = None  # price computed by caller via db.get_setting_float
+        # Use the localized GB label for the button text.
+        gb_label = fmt_gb(gb, lang)
+        kb.button(text=f"➕ {gb_label}", callback_data=TopupCB(action="buy", email=email, gb=gb).pack(), style="primary")
     kb.button(text=t("back", lang), callback_data=AccountCB(action="view", email=email).pack(), style="danger")
     kb.adjust(2)
     return kb.as_markup()
@@ -5618,6 +5756,116 @@ def _admin_handle_from_callback(user) -> str:
     return str(getattr(user, "id", "-"))
 
 
+async def _mark_payment_notifs_processed(payment: dict, status: str,
+                                          admin_label: str, bot) -> None:
+    """Edit (or delete) every admin's "new payment" notification once any
+    admin approves or rejects the payment.
+
+    RECEIPT-CROSS-ADMIN-CLEANUP: when a user submits a receipt, the bot sends
+    a "💰 New payment needs approval" notification (with a 👁 Review button)
+    to EVERY admin.  Without this helper, those notifications stay in each
+    admin's chat — and the other admins have no idea that admin A already
+    processed the receipt.  They'd tap 👁 Review, see "already approved", and
+    wonder why the notification is still there.
+
+    This helper iterates the ``notif_msg_ids`` JSON map stored on the payment
+    row (populated by ``ms_receipt`` when the notifications were sent) and,
+    for each admin's notification message:
+
+    1. Tries to EDIT the message caption/text to "✅ Approved by @admin"
+       (or "❌ Rejected by @admin") and replaces the action keyboard with a
+       single disabled "✅ Approved"/"❌ Rejected" button — so the admin can
+       SEE the outcome at a glance and canNOT tap Approve again.
+    2. If editing fails (e.g. the message is older than 48h, or it's a photo
+       and Telegram rejects the caption edit), falls back to DELETING the
+       message — better a clean chat than a stale actionable prompt.
+
+    All operations are best-effort and logged at WARNING level — a failure
+    here (e.g. admin blocked the bot) must never break the approve/reject
+    flow itself.
+
+    Args:
+        payment: the payment row (must include ``notif_msg_ids``).
+        status: "approved" or "rejected".
+        admin_label: human-readable label of the acting admin (e.g. "@alice").
+        bot: the aiogram Bot instance (for edit/delete API calls).
+    """
+    raw = payment.get("notif_msg_ids") if isinstance(payment, dict) else None
+    if not raw:
+        return
+    try:
+        notif_map = json.loads(raw)
+    except Exception:
+        return
+    if not isinstance(notif_map, dict) or not notif_map:
+        return
+
+    icon = "✅" if status == "approved" else "❌"
+    word_en = "Approved" if status == "approved" else "Rejected"
+    word_fa = "تأیید شد" if status == "approved" else "رد شد"
+    # Build the replacement keyboard — a single disabled-style button so the
+    # admin can see the outcome but can't tap anything.  (Telegram has no
+    # truly "disabled" button, so we use a no-op callback.)
+    done_kb = InlineKeyboardBuilder()
+    done_kb.button(text=f"{icon} {word_en} / {word_fa}",
+                   callback_data=PaymentCB(action="noop", payment_id=0).pack())
+    done_kb.adjust(1)
+
+    for admin_id_str, info in notif_map.items():
+        if not isinstance(info, dict):
+            continue
+        chat_id = info.get("chat_id")
+        message_id = info.get("message_id")
+        msg_type = info.get("type") or "text"
+        if not chat_id or not message_id:
+            continue
+        new_caption = (
+            f"{icon} <b>Payment {word_en}</b>\n\n"
+            f"👤 By: <b>{escape_html(admin_label)}</b>\n"
+            f"🧾 Payment #{payment.get('id', '?')}"
+        )
+        try:
+            if msg_type in ("photo", "document"):
+                # edit_message_caption works for photo/document messages.
+                try:
+                    await bot.edit_message_caption(
+                        chat_id=chat_id, message_id=message_id,
+                        caption=new_caption, reply_markup=done_kb.as_markup(),
+                    )
+                    continue
+                except TelegramBadRequest as e:
+                    msg_low = str(e).lower()
+                    # "message is not modified" is harmless — already in the
+                    # desired state (e.g. the acting admin's own notif was
+                    # already replaced by the approve handler's show_view).
+                    if "not modified" in msg_low:
+                        continue
+                    # For any other error, fall through to the delete path.
+            else:
+                # Plain-text notification — edit_message_text.
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat_id, message_id=message_id,
+                        text=new_caption, reply_markup=done_kb.as_markup(),
+                    )
+                    continue
+                except TelegramBadRequest as e:
+                    msg_low = str(e).lower()
+                    if "not modified" in msg_low:
+                        continue
+                    # fall through to delete
+        except Exception as e:
+            logger.debug("notif edit failed for admin %s msg %s: %s",
+                         admin_id_str, message_id, e)
+        # Fallback: delete the notification message so at least the stale
+        # "awaiting your review" prompt is gone from the admin's chat.
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception as e:
+            logger.debug("notif delete failed for admin %s msg %s: %s",
+                         admin_id_str, message_id, e)
+
+
 class AdminGuard:
     """Enforce admin / payment-admin access on the admin router.
 
@@ -5706,10 +5954,10 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         # Check if user needs to select language first
         if not db_user.get("language_selected", 0) and message.from_user.id not in ADMIN_IDS:
             await state.set_state(UserStates.waiting_for_language_on_start)
-            await message.answer(
+            await track_prompt(await message.answer(
                 "🌐 <b>Please select your language / لطفاً زبان خود را انتخاب کنید:</b>",
                 reply_markup=kb_language("en"),
-            )
+            ), state)
             return
         lang = _lang(db_user)
         me = await bot.get_me()
@@ -6140,10 +6388,12 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         await state.set_state(UserStates.waiting_for_account_name)
         await state.update_data(plan_id=callback_data.plan_id)
         await callback.message.edit_text(t("ask_account_name", lang), reply_markup=kb_cancel(lang))
+        await track_prompt(callback.message, state)
         await callback.answer()
 
     @router.message(UserStates.waiting_for_account_name)
     async def ms_account_name(message: Message, state: FSMContext, db_user: dict):
+        await del_inbound(message, state)
         lang = _lang(db_user)
         name = sanitize_name(message.text or "")
         if name is None:
@@ -6165,10 +6415,12 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         await state.set_state(UserStates.waiting_for_promo_code)
         await state.update_data(plan_id=callback_data.plan_id)
         await callback.message.edit_text(t("enter_promo", lang), reply_markup=kb_cancel(lang))
+        await track_prompt(callback.message, state)
         await callback.answer()
 
     @router.message(UserStates.waiting_for_promo_code)
     async def ms_promo_code(message: Message, state: FSMContext, db_user: dict):
+        await del_inbound(message, state)
         lang = _lang(db_user)
         code = (message.text or "").strip().upper()
         promo = await db.validate_promo_code(code)
@@ -6207,10 +6459,12 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         await state.set_state(UserStates.waiting_for_purchase_gift_code)
         await callback.message.edit_text(
             t("gift_in_purchase_hint", lang), reply_markup=kb_cancel(lang))
+        await track_prompt(callback.message, state)
         await callback.answer()
 
     @router.message(UserStates.waiting_for_purchase_gift_code)
     async def ms_purchase_gift_code(message: Message, state: FSMContext, db_user: dict):
+        await del_inbound(message, state)
         lang = _lang(db_user)
         code = (message.text or "").strip().upper()
         gift = await db.get_gift_code(code)
@@ -6478,19 +6732,38 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
                 bonus_gb = await db.get_setting_float("referral_bonus_gb", 0)
                 # Notify the referrer they have a claimable reward — don't
                 # apply it yet. They need to visit Referral → Claim Reward.
+                # LOCALIZATION: send the notification in the REFERRER's
+                # language (not the buyer's), since the referrer is the one
+                # receiving this message.
                 try:
-                    notify_text = (
-                        f"🎉 <b>Referral reward waiting!</b>\n\n"
-                        f"A friend just bought a plan using your link.\n"
-                    )
-                    if bonus_days > 0 or bonus_gb > 0:
-                        notify_text += (
-                            f"🎁 You can now claim <b>+{bonus_days} days</b> and "
-                            f"<b>+{bonus_gb} GB</b> on your account.\n\n"
-                            f"Open <b>🔗 Referral</b> → tap <b>Claim Reward</b>."
+                    referrer_row = await db.get_user(referrer_id)
+                    ref_lang = L((referrer_row or {}).get("language", DEFAULT_LANGUAGE))
+                    if ref_lang == "fa":
+                        notify_text = (
+                            f"🎉 <b>پاداش دعوت در انتظار شماست!</b>\n\n"
+                            f"یک دوست با لینک شما پلن خرید کرد.\n"
                         )
+                        if bonus_days > 0 or bonus_gb > 0:
+                            notify_text += (
+                                f"🎁 حالا می‌تونی <b>+{fmt_days(bonus_days, ref_lang)}</b> و "
+                                f"<b>+{fmt_gb(bonus_gb, ref_lang)}</b> روی اکانتت دریافت کنی.\n\n"
+                                f"باز کن <b>🔗 دعوت</b> → بزن <b>دریافت پاداش</b>."
+                            )
+                        else:
+                            notify_text += "باز کن 🔗 دعوت برای دیدن آمار."
                     else:
-                        notify_text += "Open 🔗 Referral to see your stats."
+                        notify_text = (
+                            f"🎉 <b>Referral reward waiting!</b>\n\n"
+                            f"A friend just bought a plan using your link.\n"
+                        )
+                        if bonus_days > 0 or bonus_gb > 0:
+                            notify_text += (
+                                f"🎁 You can now claim <b>+{fmt_days(bonus_days, ref_lang)}</b> and "
+                                f"<b>+{fmt_gb(bonus_gb, ref_lang)}</b> on your account.\n\n"
+                                f"Open <b>🔗 Referral</b> → tap <b>Claim Reward</b>."
+                            )
+                        else:
+                            notify_text += "Open 🔗 Referral to see your stats."
                     await bot.send_message(referrer_id, notify_text)
                 except TelegramBadRequest:
                     pass
@@ -6637,10 +6910,10 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         total = traffic.get("total", 0)
         used = up + down
         text = f"{t('traffic_title', lang)}\n<code>{escape_html(account['email'])}</code>\n\n"
-        text += f"⬆️ {fmt_bytes(up)}\n⬇️ {fmt_bytes(down)}\n📊 {fmt_bytes(used)}"
+        text += f"⬆️ {fmt_bytes(up, lang)}\n⬇️ {fmt_bytes(down, lang)}\n📊 {fmt_bytes(used, lang)}"
         if total > 0:
-            text += f" / {fmt_bytes(total)}\n<code>{fmt_progress_bar((used/total)*100)}</code>\n"
-            text += f"✅ {fmt_bytes(total-used)}"
+            text += f" / {fmt_bytes(total, lang)}\n<code>{fmt_progress_bar((used/total)*100, lang=lang)}</code>\n"
+            text += f"✅ {fmt_bytes(total-used, lang)}"
         else:
             text += f" ({t('unlimited', lang)})"
         online = await api.get_online_clients(server["panel_url"], server["api_token"])
@@ -6713,10 +6986,12 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         await state.set_state(UserStates.waiting_for_label)
         await state.update_data(email=callback_data.email)
         await callback.message.edit_text(t("ask_label", lang), reply_markup=kb_cancel(lang))
+        await track_prompt(callback.message, state)
         await callback.answer()
 
     @router.message(UserStates.waiting_for_label)
     async def ms_label(message: Message, state: FSMContext, db_user: dict):
+        await del_inbound(message, state)
         lang = _lang(db_user)
         text = (message.text or "").strip()[:30]
         data = await state.get_data()
@@ -7360,10 +7635,12 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             t("enter_custom_amount", lang, min=fmt_price(min_amount, lang, await _currency())),
             reply_markup=kb_cancel(lang),
         )
+        await track_prompt(callback.message, state)
         await callback.answer()
 
     @router.message(UserStates.waiting_for_custom_amount)
     async def ms_custom_amount(message: Message, state: FSMContext, db_user: dict):
+        await del_inbound(message, state)
         lang = _lang(db_user)
         # H8 — guard against non-text input (photo/sticker/voice). The FSM
         # filter StateFilter fires on ANY message type; without this guard,
@@ -7412,10 +7689,12 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             t("enter_receipt_text", lang),
             reply_markup=kb_cancel(lang),
         )
+        await track_prompt(callback.message, state)
         await callback.answer()
 
     @router.message(UserStates.waiting_for_receipt)
     async def ms_receipt(message: Message, state: FSMContext, db_user: dict):
+        await del_inbound(message, state)
         lang = _lang(db_user)
         data = await state.get_data()
         original_amount = data.get("original_amount", 0)
@@ -7489,6 +7768,12 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         # to full ADMIN_IDS.
         currency = await _currency()
         notify_targets = set(ADMIN_IDS) | await get_payment_admin_ids(db)
+        # RECEIPT-CROSS-ADMIN-CLEANUP: record each admin's notification
+        # message_id so that when ANY admin approves/rejects, we can edit
+        # (or delete) every other admin's notification — otherwise they'd
+        # still see "awaiting your review" and might try to approve an
+        # already-processed receipt.
+        notif_map: Dict[str, dict] = {}
         for admin_id in notify_targets:
             try:
                 notify_kb = InlineKeyboardBuilder()
@@ -7510,16 +7795,28 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
                     admin_text += f"\n🎯 Shortfall for plan: <b>{escape_html(shortfall_plan_name)}</b> (id #{resume_plan_id})"
                 # Forward the receipt media to the admin if there is one, so
                 # they can see it without even clicking through.
+                sent_msg = None
+                sent_kind = "text"
                 if receipt_file_id and receipt_type == "photo":
-                    await bot.send_photo(admin_id, receipt_file_id, caption=admin_text,
-                                         reply_markup=notify_kb.as_markup())
+                    sent_msg = await bot.send_photo(admin_id, receipt_file_id, caption=admin_text,
+                                                    reply_markup=notify_kb.as_markup())
+                    sent_kind = "photo"
                 elif receipt_file_id and receipt_type == "document":
-                    await bot.send_document(admin_id, receipt_file_id, caption=admin_text,
-                                            reply_markup=notify_kb.as_markup())
+                    sent_msg = await bot.send_document(admin_id, receipt_file_id, caption=admin_text,
+                                                       reply_markup=notify_kb.as_markup())
+                    sent_kind = "document"
                 else:
                     if receipt_text:
                         admin_text += f"\n📝 {escape_html(receipt_text[:300])}"
-                    await bot.send_message(admin_id, admin_text, reply_markup=notify_kb.as_markup())
+                    sent_msg = await bot.send_message(admin_id, admin_text, reply_markup=notify_kb.as_markup())
+                    sent_kind = "text"
+                # Record the (chat_id, message_id, type) for later cleanup.
+                if sent_msg is not None:
+                    notif_map[str(admin_id)] = {
+                        "chat_id": admin_id,  # admins are DM'd, so chat_id == admin_id
+                        "message_id": sent_msg.message_id,
+                        "type": sent_kind,
+                    }
             except TelegramForbiddenError:
                 pass  # admin blocked the bot — expected
             except TelegramBadRequest as e:
@@ -7528,6 +7825,15 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
                     logger.warning("payment-receipt admin notify failed: %s", e)
             except Exception as e:
                 logger.warning("payment-receipt admin notify failed: %s", e, exc_info=True)
+        # Persist the notification map so the approve/reject handler can
+        # edit/delete each admin's notification later.  Best-effort: a failure
+        # here doesn't break the receipt submission, just the cross-admin
+        # cleanup feature.
+        if notif_map:
+            try:
+                await db.update_payment_notif_ids(payment_id, json.dumps(notif_map))
+            except Exception as e:
+                logger.warning("update_payment_notif_ids failed for #%s: %s", payment_id, e)
 
     # ====================================================== REFERRAL
     @router.callback_query(MenuCB.filter(F.action == "referral"))
@@ -7564,7 +7870,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             f"• {fmt_num(stats['total_referrals'], lang)} — {'Total invited' if lang == 'en' else 'کل دعوت‌شدگان'}\n"
             f"• {fmt_num(stats['completed_referrals'], lang)} — {'Bought (rewarded)' if lang == 'en' else 'خرید کرده (پاداش‌دار)'}\n"
             f"• {fmt_num(stats['pending_referrals'], lang)} — {'Pending (not bought yet)' if lang == 'en' else 'در انتظار (هنوز خرید نکرده)'}\n"
-            f"• +{fmt_num(stats['bonus_days_total'], lang)}d / +{fmt_num(stats['bonus_gb_total'], lang)} GB — {'Total bonus earned' if lang == 'en' else 'کل پاداش کسب‌شده'}\n\n"
+            f"• +{fmt_days(stats['bonus_days_total'], lang)} / +{fmt_gb(stats['bonus_gb_total'], lang)} — {'Total bonus earned' if lang == 'en' else 'کل پاداش کسب‌شده'}\n\n"
         )
         if claimable > 0:
             text += f"{t('ref_claimable', lang, count=claimable)}\n\n"
@@ -7786,10 +8092,12 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         lang = _lang(db_user)
         await state.set_state(UserStates.waiting_for_gift_code)
         await callback.message.edit_text(t("enter_gift", lang), reply_markup=kb_cancel(lang))
+        await track_prompt(callback.message, state)
         await callback.answer()
 
     @router.message(UserStates.waiting_for_gift_code)
     async def ms_gift_code(message: Message, state: FSMContext, db_user: dict):
+        await del_inbound(message, state)
         lang = _lang(db_user)
         code = (message.text or "").strip().upper()
         gift = await db.get_gift_code(code)
@@ -7925,7 +8233,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         kb.button(text=t("back", lang), callback_data=MenuCB(action="help").pack(), style="danger")
         kb.adjust(2, 2, 1)
         # TICKET-MEDIA-1: use show_view (handles photo-message case).
-        await show_view(callback.message, text=t("choose_category", lang), reply_markup=kb.as_markup())
+        await show_view(callback.message, text=t("choose_category", lang), reply_markup=kb.as_markup(), state=state)
         await callback.answer()
 
     @router.callback_query(MenuCB.filter(F.action == "pick_cat"))
@@ -7936,11 +8244,12 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         await state.update_data(category=category)
         cat_label = t(f"cat_{category}", lang) if category in ("technical", "payment", "account", "other") else category
         # TICKET-MEDIA-1: use show_view (handles photo-message case).
-        await show_view(callback.message, text=t("ask_subject", lang, category=cat_label), reply_markup=kb_cancel(lang))
+        await show_view(callback.message, text=t("ask_subject", lang, category=cat_label), reply_markup=kb_cancel(lang), state=state)
         await callback.answer()
 
     @router.message(UserStates.waiting_for_ticket_subject)
     async def ms_ticket_subject(message: Message, state: FSMContext, db_user: dict):
+        await del_inbound(message, state)
         lang = _lang(db_user)
         subject = (message.text or "").strip()[:100]
         if not subject:
@@ -7948,10 +8257,11 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             return
         await state.update_data(subject=subject)
         await state.set_state(UserStates.waiting_for_ticket_message)
-        await message.answer(t("ask_message", lang, subject=escape_html(subject)), reply_markup=kb_cancel(lang))
+        await track_prompt(await message.answer(t("ask_message", lang, subject=escape_html(subject)), reply_markup=kb_cancel(lang)), state)
 
     @router.message(UserStates.waiting_for_ticket_message)
     async def ms_ticket_message(message: Message, state: FSMContext, db_user: dict):
+        await del_inbound(message, state)
         lang = _lang(db_user)
         # Accept either plain text OR a media attachment (with optional
         # caption) as the initial ticket body.  This mirrors ms_ticket_reply
@@ -8178,6 +8488,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             callback.message,
             text=header + t("ask_reply_with_media", lang),
             reply_markup=kb_cancel(lang),
+            state=state,
         )
         await callback.answer()
 
@@ -8187,6 +8498,7 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         audio/music, animation/GIF, round-video note, sticker — with optional
         caption) as a ticket reply. Persist the message + media metadata, then
         notify the other party — sending the media too if any. (TICKET-1)"""
+        await del_inbound(message, state)
         lang = _lang(db_user)
         # ---- Extract media + text from the incoming message ------------------
         media_type, media_file_id, caption, msg_text = extract_ticket_media(message)
@@ -8581,43 +8893,44 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         await show_view(callback.message, text=
             "➕ <b>Add Server</b>\n\nEnter alias (e.g. <code>DE-Frankfurt</code>):",
             reply_markup=kb_cancel("en"),
+            state=state,
         )
         await callback.answer()
 
     @router.message(AdminStates.waiting_for_server_alias)
     async def ms_srv_alias(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         await state.update_data(alias=message.text.strip())
         await state.set_state(AdminStates.waiting_for_server_url)
-        await message.answer("🔗 Enter panel URL (e.g. <code>https://1.2.3.4:2053</code>):",
-                             reply_markup=kb_cancel("en"))
+        await track_prompt(await message.answer("🔗 Enter panel URL (e.g. <code>https://1.2.3.4:2053</code>):",
+                             reply_markup=kb_cancel("en")), state)
 
     @router.message(AdminStates.waiting_for_server_url)
     async def ms_srv_url(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         url = (message.text or "").strip().rstrip("/")
         if not url.startswith("http"):
             await message.answer("❌ URL must start with http:// or https://", reply_markup=kb_cancel("en"))
             return
         await state.update_data(panel_url=url)
         await state.set_state(AdminStates.waiting_for_server_token)
-        await message.answer("🔐 Enter API token:", reply_markup=kb_cancel("en"))
+        await track_prompt(await message.answer("🔐 Enter API token:", reply_markup=kb_cancel("en")), state)
 
     @router.message(AdminStates.waiting_for_server_token)
     async def ms_srv_token(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         token = (message.text or "").strip()
         data = await state.get_data()
         await state.set_state(AdminStates.waiting_for_server_capacity)
         await state.update_data(token=token)
-        await message.answer(
+        await track_prompt(await message.answer(
             "🔢 Enter max client capacity (0 = unlimited):",
             reply_markup=kb_cancel("en"),
-        )
+        ), state)
 
     @router.message(AdminStates.waiting_for_server_capacity)
     async def ms_srv_capacity(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         try:
             cap = int((message.text or "0").strip())
         except ValueError:
@@ -8625,12 +8938,12 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             return
         await state.update_data(capacity=cap)
         await state.set_state(AdminStates.waiting_for_server_priority)
-        await message.answer("⭐ Enter priority (lower = preferred, default 10):",
-                             reply_markup=kb_cancel("en"))
+        await track_prompt(await message.answer("⭐ Enter priority (lower = preferred, default 10):",
+                             reply_markup=kb_cancel("en")), state)
 
     @router.message(AdminStates.waiting_for_server_priority)
     async def ms_srv_priority(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         try:
             pri = int((message.text or "10").strip())
         except ValueError:
@@ -8638,12 +8951,12 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             return
         await state.update_data(priority=pri)
         await state.set_state(AdminStates.waiting_for_server_location)
-        await message.answer("🌍 Enter location (e.g. <code>Germany</code>) or <code>-</code> for none:",
-                             reply_markup=kb_cancel("en"))
+        await track_prompt(await message.answer("🌍 Enter location (e.g. <code>Germany</code>) or <code>-</code> for none:",
+                             reply_markup=kb_cancel("en")), state)
 
     @router.message(AdminStates.waiting_for_server_location)
     async def ms_srv_location(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         loc = (message.text or "").strip()
         if loc == "-":
             loc = ""
@@ -8839,6 +9152,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         await show_view(callback.message, text=
             f"✏️ Enter new <b>{labels.get(field, field)}</b>:",
             reply_markup=kb_cancel("en"),
+            state=state,
         )
         await callback.answer()
 
@@ -8884,30 +9198,30 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     @router.callback_query(PlanCB.filter(F.action == "add"))
     async def cb_plan_add(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.waiting_for_plan_name)
-        await show_view(callback.message, text="➕ <b>Add Plan</b>\n\nEnter name:", reply_markup=kb_cancel("en"))
+        await show_view(callback.message, text="➕ <b>Add Plan</b>\n\nEnter name:", reply_markup=kb_cancel("en"), state=state)
         await callback.answer()
 
     @router.message(AdminStates.waiting_for_plan_name)
     async def ms_plan_name(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         await state.update_data(name=message.text.strip())
         await state.set_state(AdminStates.waiting_for_plan_desc)
-        await message.answer("📝 Description (or <code>-</code> for none):", reply_markup=kb_cancel("en"))
+        await track_prompt(await message.answer("📝 Description (or <code>-</code> for none):", reply_markup=kb_cancel("en")), state)
 
     @router.message(AdminStates.waiting_for_plan_desc)
     async def ms_plan_desc(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         desc = message.text.strip()
         if desc == "-":
             desc = ""
         await state.update_data(description=desc)
         await state.set_state(AdminStates.waiting_for_plan_traffic)
-        await message.answer("💾 Traffic in GB (0 = unlimited).\n💡 Decimal values OK, e.g. <code>0.2</code> for 200 MB, <code>0.5</code> for 500 MB:",
-                             reply_markup=kb_cancel("en"))
+        await track_prompt(await message.answer("💾 Traffic in GB (0 = unlimited).\n💡 Decimal values OK, e.g. <code>0.2</code> for 200 MB, <code>0.5</code> for 500 MB:",
+                             reply_markup=kb_cancel("en")), state)
 
     @router.message(AdminStates.waiting_for_plan_traffic)
     async def ms_plan_traffic(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         try:
             # Accept fractional GB (0.2 = 200 MB) — the panel API receives
             # bytes (total_gb * GB), so any decimal works.
@@ -8920,11 +9234,11 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             return
         await state.update_data(traffic_gb=gb)
         await state.set_state(AdminStates.waiting_for_plan_duration)
-        await message.answer("📅 Duration in days (0 = never):", reply_markup=kb_cancel("en"))
+        await track_prompt(await message.answer("📅 Duration in days (0 = never):", reply_markup=kb_cancel("en")), state)
 
     @router.message(AdminStates.waiting_for_plan_duration)
     async def ms_plan_duration(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         try:
             days = int(message.text.strip())
         except ValueError:
@@ -8942,11 +9256,11 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         await state.set_state(AdminStates.waiting_for_plan_price)
         cur = await _currency()
         unit = "Toman" if cur == "toman" else "USD"
-        await message.answer(f"💵 Price in {unit}:", reply_markup=kb_cancel("en"))
+        await track_prompt(await message.answer(f"💵 Price in {unit}:", reply_markup=kb_cancel("en")), state)
 
     @router.message(AdminStates.waiting_for_plan_price)
     async def ms_plan_price(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         try:
             price = float(message.text.strip())
         except ValueError:
@@ -8960,11 +9274,11 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             return
         await state.update_data(price=price)
         await state.set_state(AdminStates.waiting_for_plan_limit_ip)
-        await message.answer("🔢 Max simultaneous IPs (0 = unlimited):", reply_markup=kb_cancel("en"))
+        await track_prompt(await message.answer("🔢 Max simultaneous IPs (0 = unlimited):", reply_markup=kb_cancel("en")), state)
 
     @router.message(AdminStates.waiting_for_plan_limit_ip)
     async def ms_plan_limit_ip(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         try:
             limit_ip = int(message.text.strip())
         except ValueError:
@@ -9141,13 +9455,13 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         plan_id, field = callback_data.data.split("_", 1)
         await state.set_state(AdminStates.setting_edit_value)
         await state.update_data(edit_type="plan", plan_id=int(plan_id), field=field)
-        await show_view(callback.message, text=f"✏️ Enter new <b>{field}</b>:", reply_markup=kb_cancel("en"))
+        await show_view(callback.message, text=f"✏️ Enter new <b>{field}</b>:", reply_markup=kb_cancel("en"), state=state)
         await callback.answer()
 
     # Generic value handler for ALL admin FSM edits (server / plan / setting_int / acc_extend)
     @router.message(AdminStates.setting_edit_value)
     async def ms_setting_edit(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         data = await state.get_data()
         raw = (message.text or "").strip()
         edit_type = data.get("edit_type")
@@ -9363,6 +9677,9 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
                 f"✅ Extended <code>{escape_html(email)}</code>\n+{days}d +{fmt_gb(gb, 'en')}",
                 reply_markup=kb_admin_menu(),
             )
+            # Also re-fetch and show the account view so the admin can verify
+            # the new expiry / traffic at a glance (admin-side, stays English
+            # for consistency with the rest of the admin panel).
         else:
             await state.clear()
             await message.answer("⚠️ Unknown edit type.", reply_markup=kb_admin_menu())
@@ -9375,12 +9692,13 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             "👥 <b>Users</b>\n\nSearch by Telegram ID, username or email.\n"
             "Send <code>all</code> to list recent users.",
             reply_markup=kb_cancel("en"),
+            state=state,
         )
         await callback.answer()
 
     @router.message(AdminStates.waiting_for_user_search)
     async def ms_user_search(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         await state.clear()
         query = (message.text or "").strip()
         if query.lower() == "all":
@@ -9666,12 +9984,13 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         await show_view(callback.message, text=
             f"💰 <b>Add balance</b> to user <code>{tg_id}</code>\n\nEnter amount in {await _currency()}:",
             reply_markup=kb_cancel("en"),
+            state=state,
         )
         await callback.answer()
 
     @router.message(AdminStates.waiting_for_add_balance)
     async def ms_add_balance(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         try:
             amount = float((message.text or "").strip())
         except ValueError:
@@ -9712,12 +10031,13 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         await show_view(callback.message, text=
             f"➖ <b>Deduct balance</b> from <code>{tg_id}</code>\n\nEnter amount:",
             reply_markup=kb_cancel("en"),
+            state=state,
         )
         await callback.answer()
 
     @router.message(AdminStates.waiting_for_deduct_balance)
     async def ms_deduct_balance(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         try:
             amount = float((message.text or "").strip())
         except ValueError:
@@ -9759,7 +10079,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
                       callback_data=AdminCB(action="create_account_pick", data=f"{tg_id}_{p['id']}").pack())
         kb.button(text="❌ Cancel", callback_data=AdminCB(action="user_view", data=str(tg_id)).pack(), style="danger")
         kb.adjust(1)
-        await show_view(callback.message, text="➕ <b>Create account for user</b> — pick a plan:", reply_markup=kb.as_markup())
+        await show_view(callback.message, text="➕ <b>Create account for user</b> — pick a plan:", reply_markup=kb.as_markup(), state=state)
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "create_account_pick"))
@@ -9782,12 +10102,12 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
                 f"📦 Plan: {escape_html(plan['name'])}\n\n"
                 "Send a short label (max 30 chars) or <code>-</code> for no label:"
             ),
-            reply_markup=kb_cancel("en"))
+            reply_markup=kb_cancel("en"), state=state)
         await callback.answer()
 
     @router.message(AdminStates.waiting_for_admin_account_create)
     async def ms_admin_account_create(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         data = await state.get_data()
         await state.clear()
         tg_id = data["tg_id"]
@@ -9881,6 +10201,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         await show_view(callback.message, text=
             "➕ Extend account.\nSend days and GB, e.g. <code>30 10</code> (30 days, 10 GB). Use 0 to skip either.",
             reply_markup=kb_cancel("en"),
+            state=state,
         )
         await callback.answer()
 
@@ -10001,22 +10322,22 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_create_promo(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.waiting_for_promo_code_str)
         await show_view(callback.message, text="🎫 <b>Create promo</b>\n\nCode (or <code>-</code> for random):",
-                                         reply_markup=kb_cancel("en"))
+                                         reply_markup=kb_cancel("en"), state=state)
         await callback.answer()
 
     @router.message(AdminStates.waiting_for_promo_code_str)
     async def ms_promo_code(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         code = (message.text or "").strip().upper()
         if code == "-":
             code = gen_gift_code().replace("-", "")[:10]
         await state.update_data(code=code)
         await state.set_state(AdminStates.waiting_for_promo_discount)
-        await message.answer("💰 Discount percent (0-100):", reply_markup=kb_cancel("en"))
+        await track_prompt(await message.answer("💰 Discount percent (0-100):", reply_markup=kb_cancel("en")), state)
 
     @router.message(AdminStates.waiting_for_promo_discount)
     async def ms_promo_disc(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         try:
             d = int((message.text or "").strip())
         except ValueError:
@@ -10029,11 +10350,11 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             return
         await state.update_data(disc=d)
         await state.set_state(AdminStates.waiting_for_promo_max_uses)
-        await message.answer("🔢 Max uses (0 = unlimited):", reply_markup=kb_cancel("en"))
+        await track_prompt(await message.answer("🔢 Max uses (0 = unlimited):", reply_markup=kb_cancel("en")), state)
 
     @router.message(AdminStates.waiting_for_promo_max_uses)
     async def ms_promo_max(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         try:
             mu = int((message.text or "").strip())
         except ValueError:
@@ -10081,12 +10402,13 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         await show_view(callback.message, text=
             f"💰 <b>Balance gift</b>\n\nEnter amount in {await _currency()}:",
             reply_markup=kb_cancel("en"),
+            state=state,
         )
         await callback.answer()
 
     @router.message(AdminStates.waiting_for_gift_amount)
     async def ms_gift_amount(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         try:
             amount = float((message.text or "").strip())
         except ValueError:
@@ -10118,7 +10440,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
                       callback_data=AdminCB(action="gift_plan_pick", data=str(p["id"])).pack())
         kb.button(text="❌ Cancel", callback_data=AdminCB(action="gift_codes").pack(), style="danger")
         kb.adjust(1)
-        await show_view(callback.message, text="🎁 Pick a plan for the gift code:", reply_markup=kb.as_markup())
+        await show_view(callback.message, text="🎁 Pick a plan for the gift code:", reply_markup=kb.as_markup(), state=state)
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "gift_plan_pick"))
@@ -10243,12 +10565,13 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         await show_view(callback.message, text=
             f"📣 <b>Broadcast → {target}</b>\n\nSend the message (text/HTML):",
             reply_markup=kb_cancel("en"),
+            state=state,
         )
         await callback.answer()
 
     @router.message(AdminStates.waiting_for_broadcast_message)
     async def ms_broadcast(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         text = (message.text or "").strip()[:BROADCAST_MAX_TEXT_CHARS]
         # BROADCAST-EMPTY-GUARD: if the admin sent a photo / sticker / voice /
         # animation (or genuinely empty text), message.text is None → text="".
@@ -10445,7 +10768,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             text=f"⏱ <b>Backup interval</b>\n\nEnter the interval in <b>minutes</b>:\n\n"
                  f"Current: {cur} min ({cur // 60}h)\n\n"
                  f"Examples: 60 = hourly, 360 = every 6h, 1440 = daily, 10080 = weekly",
-            reply_markup=kb_cancel("en"))
+            reply_markup=kb_cancel("en"), state=state)
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "set_backup_keep"))
@@ -10457,7 +10780,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         await show_view(callback.message,
             text=f"📦 <b>Backup retention</b>\n\nHow many on-disk snapshots to keep?\n\n"
                  f"Current: {cur}\n\nOlder snapshots are automatically deleted.",
-            reply_markup=kb_cancel("en"))
+            reply_markup=kb_cancel("en"), state=state)
         await callback.answer()
 
     # ---- Settings Category Pages ----
@@ -10664,35 +10987,35 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_set_trial_days(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.setting_edit_value)
         await state.update_data(edit_type="setting_int", key="trial_days", label="Trial days")
-        await show_view(callback.message, text="📅 Enter trial days:", reply_markup=kb_cancel("en"))
+        await show_view(callback.message, text="📅 Enter trial days:", reply_markup=kb_cancel("en"), state=state)
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "set_trial_gb"))
     async def cb_set_trial_gb(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.setting_edit_value)
         await state.update_data(edit_type="setting_int", key="trial_gb", label="Trial GB")
-        await show_view(callback.message, text="💾 Enter trial GB:", reply_markup=kb_cancel("en"))
+        await show_view(callback.message, text="💾 Enter trial GB:", reply_markup=kb_cancel("en"), state=state)
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "set_ref_days"))
     async def cb_set_ref_days(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.setting_edit_value)
         await state.update_data(edit_type="setting_int", key="referral_bonus_days", label="Referral days")
-        await show_view(callback.message, text="🎁 Enter referral bonus days:", reply_markup=kb_cancel("en"))
+        await show_view(callback.message, text="🎁 Enter referral bonus days:", reply_markup=kb_cancel("en"), state=state)
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "set_ref_gb"))
     async def cb_set_ref_gb(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.setting_edit_value)
         await state.update_data(edit_type="setting_int", key="referral_bonus_gb", label="Referral GB")
-        await show_view(callback.message, text="🎁 Enter referral bonus GB:", reply_markup=kb_cancel("en"))
+        await show_view(callback.message, text="🎁 Enter referral bonus GB:", reply_markup=kb_cancel("en"), state=state)
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "set_topup_price"))
     async def cb_set_topup_price(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.setting_edit_value)
         await state.update_data(edit_type="setting_int", key="topup_price_per_gb", label="Topup price/GB")
-        await show_view(callback.message, text="➕ Enter topup price per GB:", reply_markup=kb_cancel("en"))
+        await show_view(callback.message, text="➕ Enter topup price per GB:", reply_markup=kb_cancel("en"), state=state)
         await callback.answer()
 
     # The generic setting_edit_value handler also covers setting_int — handle it:
@@ -10938,12 +11261,12 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             text=(f"🔗 Enter the Telegram numeric ID for:\n"
                   f"<code>{escape_html(callback_data.email)}</code>\n\n"
                   f"Send <code>0</code> or <code>-</code> to clear."),
-            reply_markup=kb_cancel("en"))
+            reply_markup=kb_cancel("en"), state=state)
         await callback.answer()
 
     @router.message(AdminStates.waiting_for_import_tg_id)
     async def ms_import_tg_id(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         raw = (message.text or "").strip()
         data = await state.get_data()
         await state.clear()
@@ -11055,21 +11378,21 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
     async def cb_set_card_number(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.setting_edit_value)
         await state.update_data(edit_type="setting_str", key="payment_card_number", label="Card number")
-        await show_view(callback.message, text="💳 Enter card number:", reply_markup=kb_cancel("en"))
+        await show_view(callback.message, text="💳 Enter card number:", reply_markup=kb_cancel("en"), state=state)
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "set_card_holder"))
     async def cb_set_card_holder(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.setting_edit_value)
         await state.update_data(edit_type="setting_str", key="payment_card_holder", label="Card holder")
-        await show_view(callback.message, text="👤 Enter card holder name:", reply_markup=kb_cancel("en"))
+        await show_view(callback.message, text="👤 Enter card holder name:", reply_markup=kb_cancel("en"), state=state)
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "set_payment_min"))
     async def cb_set_payment_min(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.setting_edit_value)
         await state.update_data(edit_type="setting_int", key="payment_min_amount", label="Min payment amount")
-        await show_view(callback.message, text="🔢 Enter minimum payment amount (Toman):", reply_markup=kb_cancel("en"))
+        await show_view(callback.message, text="🔢 Enter minimum payment amount (Toman):", reply_markup=kb_cancel("en"), state=state)
         await callback.answer()
 
     @router.callback_query(AdminCB.filter(F.action == "set_payment_presets"))
@@ -11080,6 +11403,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         await show_view(callback.message, text=
             f"📋 Enter preset amounts as comma-separated numbers (Toman):\n\nCurrent: {cur}",
             reply_markup=kb_cancel("en"),
+            state=state,
         )
         await callback.answer()
 
@@ -11124,12 +11448,12 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
                   "The user must have started the bot at least once (so we can "
                   "look them up). Payment admins can only approve/reject "
                   "pending payments — nothing else."),
-            reply_markup=kb_cancel("en"))
+            reply_markup=kb_cancel("en"), state=state)
         await callback.answer()
 
     @router.message(AdminStates.waiting_for_payment_admin_id)
     async def ms_payment_admin_id(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         raw = (message.text or "").strip()
         await state.clear()
         try:
@@ -11301,6 +11625,14 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
                     await bot.send_photo(callback.from_user.id, file_id, caption=photo_caption)
             except Exception as e:
                 logger.warning("pending-view receipt media send failed: %s", e, exc_info=True)
+
+    @router.callback_query(PaymentCB.filter(F.action == "noop"))
+    async def cb_payment_noop(callback: CallbackQuery):
+        """No-op handler for the disabled "✅ Approved"/"❌ Rejected" button
+        that replaces the action keyboard on cross-admin payment notifications
+        after one admin has already processed the receipt.  The button is
+        informational only — tapping it just closes the loading spinner."""
+        await callback.answer()
 
     @router.callback_query(PaymentCB.filter(F.action == "next_pending"))
     async def cb_next_pending(callback: CallbackQuery, callback_data: PaymentCB):
@@ -11706,6 +12038,18 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             pal_err = await _pa_lang(callback.from_user.id)
             await callback.answer(t("pa_approve_failed", pal_err, err=str(e)[:60]), show_alert=True)
             return
+        # RECEIPT-CROSS-ADMIN-CLEANUP: now that this admin has approved, edit
+        # (or delete) the "new payment" notification in EVERY admin's chat so
+        # the other admins see "✅ Approved by …" and don't try to approve it
+        # again.  Best-effort — must never block the approve flow.
+        try:
+            await _mark_payment_notifs_processed(
+                payment, "approved",
+                _admin_handle_from_callback(callback.from_user), bot,
+            )
+        except Exception as e:
+            logger.warning("cross-admin notif cleanup failed for approve #%s: %s",
+                           payment.get('id'), e)
         # Notify user
         user = await db.get_user(payment["user_tg_id"])
         lang = L((user or {}).get("language", DEFAULT_LANGUAGE))
@@ -11792,12 +12136,12 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         # PA-LANG: use _pa_lang so payment admins see the prompt in their
         # selected language.
         alang = await _pa_lang(callback.from_user.id)
-        await show_view(callback.message, text=t("enter_reject_reason", alang), reply_markup=kb_cancel(alang))
+        await show_view(callback.message, text=t("enter_reject_reason", alang), reply_markup=kb_cancel(alang), state=state)
         await callback.answer()
 
     @router.message(AdminStates.waiting_for_reject_reason)
     async def ms_reject_reason(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         reason = (message.text or "").strip()
         if reason == "-":
             reason = ""
@@ -11825,6 +12169,18 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             await message.answer(t("pa_already_processed_msg", pal),
                                  reply_markup=_menu)
             return
+        # RECEIPT-CROSS-ADMIN-CLEANUP: edit (or delete) the "new payment"
+        # notification in every admin's chat so the other admins see
+        # "❌ Rejected by …" and don't try to act on an already-processed
+        # receipt.  Best-effort — must never block the reject flow.
+        try:
+            await _mark_payment_notifs_processed(
+                payment, "rejected",
+                _admin_handle_from_callback(message.from_user), bot,
+            )
+        except Exception as e:
+            logger.warning("cross-admin notif cleanup failed for reject #%s: %s",
+                           payment.get('id'), e)
         # Notify user
         user = await db.get_user(payment["user_tg_id"])
         lang = L((user or {}).get("language", DEFAULT_LANGUAGE))
@@ -11865,12 +12221,13 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             "Enter channel username (e.g. <code>@mychannel</code>) or chat ID:\n"
             "The bot must be an admin in the channel!",
             reply_markup=kb_cancel("en"),
+            state=state,
         )
         await callback.answer()
 
     @router.message(AdminStates.waiting_for_force_join_channel)
     async def ms_force_join_channel(message: Message, state: FSMContext):
-        await del_inbound(message)
+        await del_inbound(message, state)
         input_text = (message.text or "").strip()
         chat_id = None
         username = ""
@@ -11964,6 +12321,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             f"Current (or default):\n<i>{escape_html(preview[:300])}{'…' if len(preview) > 300 else ''}</i>\n\n"
             f"Send the new text, or <code>-</code> to clear (use built-in default):",
             reply_markup=kb_cancel(lang_name),
+            state=state,
         )
         await callback.answer()
 
@@ -11996,6 +12354,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         await show_view(callback.message, text=
             f"📦 Enter topup packages as comma-separated GB values:\n\nCurrent: {cur}",
             reply_markup=kb_cancel("en"),
+            state=state,
         )
         await callback.answer()
 
@@ -12151,8 +12510,8 @@ async def task_traffic_alerts(bot: Bot, db: Database, api: PanelAPI):
                             acc["user_tg_id"],
                             f"{emoji} <b>Traffic {threshold}%</b>\n"
                             f"📱 <code>{escape_html(acc['email'])}</code>\n"
-                            f"📊 {fmt_bytes(used)} / {fmt_bytes(total)}\n"
-                            f"✅ {fmt_bytes(total-used)}",
+                            f"📊 {fmt_bytes(used, lang)} / {fmt_bytes(total, lang)}\n"
+                            f"✅ {fmt_bytes(total-used, lang)}",
                             reply_markup=kb.as_markup(),
                         )
                         await db.add_traffic_alert(acc["email"], threshold)
