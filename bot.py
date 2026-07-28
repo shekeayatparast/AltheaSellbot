@@ -1264,6 +1264,10 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "am_support_menu_title": "💬 Support & Tickets",
         "am_support_menu_desc": "View and reply to user support tickets.",
         "am_back_admin": "🔙 Admin Panel",
+        # USER-ACCOUNTS-REWORK: dedicated Accounts sub-section inside the
+        # Users admin area (accounts are no longer scattered in user_view).
+        "am_user_accounts_btn": "📱 Accounts",
+        "am_user_accounts_none": "No accounts.",
     },
     # ------------------------------------------------------------------ Farsi
     "fa": {
@@ -1638,6 +1642,9 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "am_support_menu_title": "💬 پشتیبانی و تیکت‌ها",
         "am_support_menu_desc": "مشاهده و پاسخ به تیکت‌های پشتیبانی کاربران.",
         "am_back_admin": "🔙 پنل ادمین",
+        # USER-ACCOUNTS-REWORK: زیربخش اختصاصی اکانت‌ها در بخش کاربران ادمین.
+        "am_user_accounts_btn": "📱 اکانت‌ها",
+        "am_user_accounts_none": "اکانتی وجود ندارد.",
     },
 }
 
@@ -4763,16 +4770,21 @@ def kb_admin_menu(lang: str = "en") -> InlineKeyboardMarkup:
 
 
 def kb_payments_menu() -> InlineKeyboardMarkup:
-    """💳 Payments submenu: Pending Pay, Pay History, By Admin, Back."""
+    """💳 Payments submenu: Pending Pay, Pay History, Back.
+
+    "By Admin" is intentionally NOT on this landing page — its proper home is
+    inside the Pay History view (see ``_render_history_table``'s bottom nav,
+    which shows a "👥 By Admin" button for full admins).  Keeping the Payments
+    landing page to just Pending + History makes it cleaner, per the user's
+    request.
+    """
     kb = InlineKeyboardBuilder()
     kb.button(style="primary", text="💰 Pending Pay",
               callback_data=AdminCB(action="pending_payments").pack())
     kb.button(style="primary", text="📋 Pay History",
               callback_data=AdminCB(action="payment_history").pack())
-    kb.button(style="primary", text="👥 By Admin",
-              callback_data=AdminCB(action="admin_payments").pack())
     kb.button(text="🔙 Admin Panel", callback_data=AdminCB(action="main").pack(), style="danger")
-    kb.adjust(1, 2, 1)
+    kb.adjust(2, 1)
     return kb.as_markup()
 
 
@@ -9253,6 +9265,12 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         # REFERRAL-INVITEES: show this user's invitee count in the user-detail
         # card so the admin can see at a glance how many they've referred.
         invitees = await db.get_referral_invitees(tg_id, limit=50)
+        # USER-ACCOUNTS-REWORK: accounts are no longer rendered inline here
+        # (old code appended a divider + heading + grid_table and scattered
+        # up to 6 per-account ⚙️ buttons in the same keyboard).  They now
+        # live in a dedicated sub-section (admin:user_accounts) so this
+        # overview card stays clean.  We keep just the count in the kv_table
+        # for an at-a-glance summary.
         blocks = [rich_tables.heading("👤 User"),
                   rich_tables.kv_table([
                       ("TG ID", user["tg_id"]),
@@ -9264,15 +9282,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
                       ("Joined", fmt_iso(user.get("created_at"), "%Y-%m-%d %H:%M:%S")),
                       ("Referred by", user.get("referred_by") or "-"),
                       ("Invitees", len(invitees)),
+                      ("Accounts", len(accounts)),
                   ])]
-        if accounts:
-            rows = [("🟢" if a["is_active"] else "🔴",
-                     ("🎁 " if a.get("is_trial") else "") + a["email"],
-                     a.get("label") or "") for a in accounts]
-            blocks.append(rich_tables.divider())
-            blocks.append(rich_tables.heading(f"📱 Accounts ({len(accounts)})", size=4))
-            blocks.append(rich_tables.grid_table(["Status", "Email", "Label"], rows,
-                                                 aligns=["center", "left", "left"]))
         rich = rich_tables.rich_message(*blocks)
         kb = InlineKeyboardBuilder()
         if user.get("is_banned"):
@@ -9282,19 +9293,58 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         kb.button(text="💰 Add Balance", callback_data=AdminCB(action="add_balance", data=str(tg_id)).pack(), style="primary")
         kb.button(text="➖ Deduct", callback_data=AdminCB(action="deduct_balance", data=str(tg_id)).pack(), style="danger")
         kb.button(text="➕ Create Account", callback_data=AdminCB(action="create_account", data=str(tg_id)).pack(), style="success")
+        # USER-ACCOUNTS-REWORK: dedicated Accounts sub-section (replaces the
+        # old inline accounts table + scattered per-account buttons).
+        kb.button(text=t("am_user_accounts_btn", "en"), callback_data=AdminCB(action="user_accounts", data=str(tg_id)).pack(), style="primary")
         # PAY-HISTORY-REWORK / REFERRAL-INVITEES: financial history + receipts
         # + invitees views.  These give the admin full visibility into a
         # user's money flow and referral activity per the user's request.
         kb.button(text="💼 Finance", callback_data=AdminCB(action="user_finance", data=str(tg_id)).pack(), style="primary")
         kb.button(text="🧾 Receipts", callback_data=AdminCB(action="user_receipts", data=str(tg_id)).pack(), style="primary")
         kb.button(text=t("admin_ref_invitees_btn", "en"), callback_data=AdminCB(action="user_invitees", data=str(tg_id)).pack(), style="primary")
-        # per-account actions
-        for a in accounts[:6]:
-            label_acc = a.get("label") or a["email"][:16]
-            kb.button(style="primary", text=f"⚙️ {label_acc}",
-                      callback_data=AdminCB(action="user_account", data=f"{tg_id}_{a['email']}").pack())
         kb.button(text="🔙 Search", callback_data=AdminCB(action="users").pack(), style="danger")
-        kb.adjust(2, 2, 1, 3, 1, 1)
+        kb.adjust(2, 2, 2, 2, 1)
+        await show_view(callback.message, rich=rich, reply_markup=kb.as_markup())
+        await callback.answer()
+
+    # ---- USER-ACCOUNTS-REWORK: dedicated accounts sub-section ------------
+    # Accounts used to be rendered inline in cb_user_view (a divider + heading
+    # + grid_table, plus up to 6 per-account ⚙️ buttons scattered in the same
+    # keyboard).  They now have their own view so the user-overview card stays
+    # clean and ALL accounts (not just the first 6) are reachable from one
+    # place.  Full-admin-only (not in AdminGuard._PAYMENT_ALLOWED_PREFIXES).
+    @router.callback_query(AdminCB.filter(F.action == "user_accounts"))
+    async def cb_user_accounts(callback: CallbackQuery, callback_data: AdminCB):
+        tg_id = int(callback_data.data)
+        user = await db.get_user(tg_id)
+        if not user:
+            await callback.answer(t("not_found", await admin_lang(callback.from_user.id)), show_alert=True)
+            return
+        accounts = await db.get_user_accounts(tg_id)
+        uname = (user.get("first_name") or user.get("username") or str(tg_id))
+        blocks: list = [rich_tables.heading(f"📱 Accounts — {uname}")]
+        if accounts:
+            rows = [("🟢" if a["is_active"] else "🔴",
+                     ("🎁 " if a.get("is_trial") else "") + a["email"],
+                     a.get("label") or "") for a in accounts]
+            blocks.append(rich_tables.grid_table(["Status", "Email", "Label"], rows,
+                                                 aligns=["center", "left", "left"]))
+        else:
+            blocks.append(rich_tables.paragraph(t("am_user_accounts_none", "en")))
+        rich = rich_tables.rich_message(*blocks)
+        kb = InlineKeyboardBuilder()
+        # One button per account (no 6-item cap — show them all).  Tapping
+        # opens the per-account detail (cb_user_account) with extend / reset
+        # traffic / enable / disable / delete actions.
+        for a in accounts:
+            label_acc = a.get("label") or a["email"][:16]
+            status_dot = "🟢" if a["is_active"] else "🔴"
+            kb.button(style="primary", text=f"{status_dot} {label_acc}",
+                      callback_data=AdminCB(action="user_account", data=f"{tg_id}_{a['email']}").pack())
+        kb.button(text="➕ Create Account", callback_data=AdminCB(action="create_account", data=str(tg_id)).pack(), style="success")
+        kb.button(text="🔙 User", callback_data=AdminCB(action="user_view", data=str(tg_id)).pack(), style="danger")
+        # 1 button per account row, then Create (1), then Back (1).
+        kb.adjust(*[1 for _ in accounts], 1, 1)
         await show_view(callback.message, rich=rich, reply_markup=kb.as_markup())
         await callback.answer()
 
@@ -9662,7 +9712,9 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         else:
             kb.button(text="✅ Enable", callback_data=AdminCB(action="acc_enable", data=f"{tg_id}_{email}").pack(), style="success")
         kb.button(text="🗑 Delete", callback_data=AdminCB(action="acc_delete", data=f"{tg_id}_{email}").pack(), style="danger")
-        kb.button(text="🔙 User", callback_data=AdminCB(action="user_view", data=str(tg_id)).pack(), style="danger")
+        # USER-ACCOUNTS-REWORK: back returns to the Accounts list (not the
+        # user overview) so the admin stays in the accounts context.
+        kb.button(text="🔙 Accounts", callback_data=AdminCB(action="user_accounts", data=str(tg_id)).pack(), style="danger")
         kb.adjust(2, 2, 1)
         await show_view(callback.message, text=text, reply_markup=kb.as_markup())
         await callback.answer()
@@ -11227,12 +11279,13 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             kb.button(style="primary",
                 text=f"{role_tag} {label[:20]} — ✅{r['approved']} ❌{r['rejected']}",
                 callback_data=AdminCB(action="admin_payments_view", data=str(r["tg_id"])).pack())
-        kb.button(style="primary", text=t("pa_history_btn", pal),
-                  callback_data=AdminCB(action="payment_history").pack())
-        # ADMIN-MENU-REWORK: back → Payments submenu.
+        # BY-ADMIN-MOVE: "By Admin" now lives inside Pay History, so this
+        # picker is only ever reached from there — back returns to the Pay
+        # History list (not the Payments submenu).  The old explicit "Pay
+        # History" button is removed since back now goes there.
         kb.button(style="danger", text=t("pa_admin_back_btn", pal),
-                  callback_data=AdminCB(action="payments_menu").pack())
-        kb.adjust(*[1 for _ in active], 2)
+                  callback_data=AdminCB(action="payment_history").pack())
+        kb.adjust(*[1 for _ in active], 1)
         await show_view(callback.message, rich=rich, reply_markup=kb.as_markup())
         await callback.answer()
 
@@ -11252,10 +11305,16 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         target_label = _admin_display(target_row) if target_row else f"#{target_id}"
         payments = await db.get_payments_by_admin(target_id, limit=30)
         if not payments:
-            # ADMIN-MENU-REWORK: empty-state → By Admin picker (back one level).
+            # BY-ADMIN-MOVE: empty-state → back to the By Admin picker (the
+            # view this was reached from), so the admin can pick another
+            # admin rather than landing on the Payments submenu.
+            kb_empty = InlineKeyboardBuilder()
+            kb_empty.button(style="danger", text=t("pa_admin_back_btn", pal),
+                            callback_data=AdminCB(action="admin_payments").pack())
+            kb_empty.adjust(1)
             await show_view(callback.message,
                 text=t("pa_history_admin_none", pal),
-                reply_markup=kb_payments_menu())
+                reply_markup=kb_empty.as_markup())
             await callback.answer()
             return
         await _render_history_table(callback, payments, pal,
