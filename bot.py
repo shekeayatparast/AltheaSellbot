@@ -418,15 +418,36 @@ class rich_tables:
         )
 
     @staticmethod
-    def referral_settings_rich(ref_en: int, ref_days: int, ref_gb: int) -> InputRichMessage:
-        return rich_tables.rich_message(
+    def referral_settings_rich(ref_en: int, ref_days: int, ref_gb: int,
+                                share_fa: str = "", share_en: str = "",
+                                extra_fa: str = "", extra_en: str = "") -> InputRichMessage:
+        blocks: List = [
             rich_tables.heading("🔗 Referral Settings"),
             rich_tables.kv_table([
                 ("Enabled", "Yes" if ref_en else "No"),
                 ("Bonus days", ref_days),
                 ("Bonus GB", ref_gb),
+                ("Share text 🇮🇷", "Custom" if (share_fa and share_fa.strip()) else "Default"),
+                ("Share text 🇬🇧", "Custom" if (share_en and share_en.strip()) else "Default"),
+                ("Extra note 🇮🇷", "✏️ set" if (extra_fa and extra_fa.strip()) else "—"),
+                ("Extra note 🇬🇧", "✏️ set" if (extra_en and extra_en.strip()) else "—"),
             ]),
-        )
+        ]
+        # Short previews of any customised texts so the admin can see at a
+        # glance what's currently configured without opening each editor.
+        previews: list = []
+        if share_fa and share_fa.strip():
+            previews.append(f"🇮🇷 Share: {share_fa.strip()[:60]}{'…' if len(share_fa.strip()) > 60 else ''}")
+        if share_en and share_en.strip():
+            previews.append(f"🇬🇧 Share: {share_en.strip()[:60]}{'…' if len(share_en.strip()) > 60 else ''}")
+        if extra_fa and extra_fa.strip():
+            previews.append(f"🇮🇷 Note: {extra_fa.strip()[:60]}{'…' if len(extra_fa.strip()) > 60 else ''}")
+        if extra_en and extra_en.strip():
+            previews.append(f"🇬🇧 Note: {extra_en.strip()[:60]}{'…' if len(extra_en.strip()) > 60 else ''}")
+        if previews:
+            blocks.append(rich_tables.divider())
+            blocks.append(rich_tables.paragraph("\n".join(previews)))
+        return rich_tables.rich_message(*blocks)
 
     @staticmethod
     def payment_settings_rich(pay_en: int, card: str, holder: str, min_amt: int) -> InputRichMessage:
@@ -2255,6 +2276,15 @@ class Database:
             "referral_bonus_days": str(int(os.getenv("REFERRAL_BONUS_DAYS", "5"))),
             "referral_bonus_gb": str(float(os.getenv("REFERRAL_BONUS_GB", "2"))),
             "referral_enabled": "1",   # admin can disable the whole referral program
+            # REFERRAL-TEXT-CFG: main admin can customise the share pitch
+            # (the message users forward to friends) and add an extra note
+            # shown at the bottom of the referral section. Both are per
+            # language (fa/en). Empty share text → built-in locale default;
+            # empty extra note → nothing appended.
+            "referral_share_text_fa": "",
+            "referral_share_text_en": "",
+            "referral_extra_text_fa": "",
+            "referral_extra_text_en": "",
             "currency": DEFAULT_CURRENCY,
             "default_language": DEFAULT_LANGUAGE,
             "topup_packages": json.dumps([5, 10, 20, 50]),  # GB options
@@ -8028,6 +8058,17 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
                 text += f"• {name} — {status}\n"
         else:
             text += f"\n\n{t('referral_no_history', lang)}"
+        # REFERRAL-TEXT-CFG: admin-defined extra note appended to the bottom
+        # of the referral section (e.g. a promo or custom instructions).
+        # Empty by default so existing bots are unaffected. {days}/{gb}
+        # placeholders are filled too, for flexibility.
+        _extra_raw = await db.get_setting(f"referral_extra_text_{lang}", "")
+        if _extra_raw and _extra_raw.strip():
+            try:
+                _extra = _extra_raw.strip().format(days=bonus_days, gb=bonus_gb)
+            except Exception:
+                _extra = _extra_raw.strip()
+            text += f"\n\n{_extra}"
         kb = InlineKeyboardBuilder()
         # Claim button — only shown when there are unclaimed rewards.
         if claimable > 0:
@@ -8038,7 +8079,18 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
         # a bare link.  The text is built from the admin-configured bonus
         # amounts (bonus_days / bonus_gb) so it always reflects the real
         # reward.  Persian users get a Persian pitch, English users English.
-        share_pitch = t('referral_share_text', lang, days=bonus_days, gb=bonus_gb)
+        # REFERRAL-TEXT-CFG: use the admin-customised share text if set,
+        # otherwise fall back to the locale default. {days}/{gb} placeholders
+        # are filled with the current bonus amounts so a custom pitch always
+        # reflects the real reward.
+        _custom_share = await db.get_setting(f"referral_share_text_{lang}", "")
+        _share_raw = (_custom_share.strip()
+                      if (_custom_share and _custom_share.strip())
+                      else t('referral_share_text', lang))
+        try:
+            share_pitch = _share_raw.format(days=bonus_days, gb=bonus_gb)
+        except Exception:
+            share_pitch = _share_raw
         share_url = f"https://t.me/share/url?url={quote(ref_link, safe='')}&text={quote(share_pitch, safe='')}"
         kb.button(style="primary", text=t("share_link", lang), url=share_url)
         # REFERRAL-INVITEES: button that opens the full invitees list
@@ -9755,6 +9807,15 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
                 val = raw if raw != "-" else ""
                 await state.clear()
                 await db.set_setting(key, val)
+                # REFERRAL-TEXT-CFG: after saving a referral share/extra text,
+                # re-render the referral settings view so the admin immediately
+                # sees the updated Custom/Default status and preview (instead
+                # of just dumping them back at the admin menu).
+                if key in ("referral_share_text_fa", "referral_share_text_en",
+                           "referral_extra_text_fa", "referral_extra_text_en"):
+                    await message.answer(f"✅ {label} updated.")
+                    await _render_settings_referral_view(message)
+                    return
                 if key in ("payment_card_number", "payment_card_holder", "api_token"):
                     shown = "••••" if val else "(empty)"
                 else:
@@ -10954,14 +11015,23 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         ref_en = await db.get_setting_int("referral_enabled", 1)
         ref_days = await db.get_setting_int("referral_bonus_days", 5)
         ref_gb = await db.get_setting_float("referral_bonus_gb", 2)
-        rich = rich_tables.referral_settings_rich(ref_en, ref_days, ref_gb)
+        share_fa = await db.get_setting("referral_share_text_fa", "")
+        share_en = await db.get_setting("referral_share_text_en", "")
+        extra_fa = await db.get_setting("referral_extra_text_fa", "")
+        extra_en = await db.get_setting("referral_extra_text_en", "")
+        rich = rich_tables.referral_settings_rich(ref_en, ref_days, ref_gb,
+                                                  share_fa, share_en, extra_fa, extra_en)
         kb = InlineKeyboardBuilder()
         kb.button(style="primary", text=f"{'✅' if ref_en else '❌'} Toggle Referral",
                   callback_data=AdminCB(action="toggle_referral").pack())
         kb.button(style="success", text="🎁 Bonus Days", callback_data=AdminCB(action="set_ref_days").pack())
         kb.button(style="success", text="🎁 Bonus GB", callback_data=AdminCB(action="set_ref_gb").pack())
+        kb.button(style="primary", text="📝 Share Text 🇮🇷", callback_data=AdminCB(action="set_ref_share_fa").pack())
+        kb.button(style="primary", text="📝 Share Text 🇬🇧", callback_data=AdminCB(action="set_ref_share_en").pack())
+        kb.button(style="primary", text="➕ Extra Note 🇮🇷", callback_data=AdminCB(action="set_ref_extra_fa").pack())
+        kb.button(style="primary", text="➕ Extra Note 🇬🇧", callback_data=AdminCB(action="set_ref_extra_en").pack())
         kb.button(text="🔙 Settings", callback_data=AdminCB(action="settings").pack(), style="danger")
-        kb.adjust(1, 2, 1)
+        kb.adjust(1, 2, 2, 2, 1)
         await show_view(message, rich=rich, reply_markup=kb.as_markup())
 
     @router.callback_query(SettingsCatCB.filter(F.category == "referral"))
@@ -11155,6 +11225,63 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         await state.update_data(edit_type="setting_int", key="referral_bonus_gb", label="Referral GB")
         await show_view(callback.message, text="🎁 Enter referral bonus GB:", reply_markup=kb_cancel("en"), state=state)
         await callback.answer()
+
+    # ---- Referral text customisation (REFERRAL-TEXT-CFG) ----
+    # The main admin can override the share pitch (the message users forward
+    # to friends) and add an extra note shown at the bottom of the referral
+    # section. Both are per-language (fa/en). Sending "-" clears the field so
+    # the locale default share text / no extra note is used again. The share
+    # text supports {days} and {gb} placeholders that are filled automatically
+    # with the current bonus amounts when the user taps Share.
+    async def _start_referral_text_edit(callback: CallbackQuery, state: FSMContext,
+                                         key: str, label: str, lang_name: str,
+                                         is_share: bool):
+        await state.set_state(AdminStates.setting_edit_value)
+        await state.update_data(edit_type="setting_str", key=key, label=label)
+        current = await db.get_setting(key, "")
+        fallback = t('referral_share_text', lang_name) if is_share else ""
+        preview = current if (current and current.strip()) else fallback
+        if is_share:
+            placeholder_note = (
+                "\n\n💡 Placeholders: <code>{days}</code> = bonus days, "
+                "<code>{gb}</code> = bonus GB (filled automatically when shared)."
+            )
+            clear_hint = "use built-in default"
+        else:
+            placeholder_note = (
+                "\n\n💡 This note appears at the bottom of the referral section. "
+                "Use it for promotions or custom instructions. HTML is supported."
+            )
+            clear_hint = "hide the note"
+        await show_view(callback.message, text=
+            f"📝 <b>{label}</b>\n\n"
+            f"Current (or default):\n<i>{escape_html(preview[:400])}{'…' if len(preview) > 400 else ''}</i>"
+            f"{placeholder_note}"
+            f"\n\nSend the new text, or <code>-</code> to clear ({clear_hint}):",
+            reply_markup=kb_cancel(lang_name),
+            state=state,
+        )
+        await callback.answer()
+
+    @router.callback_query(AdminCB.filter(F.action == "set_ref_share_fa"))
+    async def cb_set_ref_share_fa(callback: CallbackQuery, state: FSMContext):
+        await _start_referral_text_edit(callback, state, "referral_share_text_fa",
+                                         "Referral share text (Farsi)", "fa", is_share=True)
+
+    @router.callback_query(AdminCB.filter(F.action == "set_ref_share_en"))
+    async def cb_set_ref_share_en(callback: CallbackQuery, state: FSMContext):
+        await _start_referral_text_edit(callback, state, "referral_share_text_en",
+                                         "Referral share text (English)", "en", is_share=True)
+
+    @router.callback_query(AdminCB.filter(F.action == "set_ref_extra_fa"))
+    async def cb_set_ref_extra_fa(callback: CallbackQuery, state: FSMContext):
+        await _start_referral_text_edit(callback, state, "referral_extra_text_fa",
+                                         "Referral extra note (Farsi)", "fa", is_share=False)
+
+    @router.callback_query(AdminCB.filter(F.action == "set_ref_extra_en"))
+    async def cb_set_ref_extra_en(callback: CallbackQuery, state: FSMContext):
+        await _start_referral_text_edit(callback, state, "referral_extra_text_en",
+                                         "Referral extra note (English)", "en", is_share=False)
 
     @router.callback_query(AdminCB.filter(F.action == "set_topup_price"))
     async def cb_set_topup_price(callback: CallbackQuery, state: FSMContext):
