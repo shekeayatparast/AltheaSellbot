@@ -1253,6 +1253,17 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "ref_invitees_none": "No invitees yet.",
         "ref_invitees_btn": "👥 Show Invitees",
         "admin_ref_invitees_btn": "👥 View Invitees",
+        # ADMIN-MENU-REWORK: top-level admin panel reorganised into submenus.
+        "am_payments_menu": "💳 Payments",
+        "am_payments_menu_title": "💳 Payments Management",
+        "am_payments_menu_desc": "Approve pending payments, review receipt history, or audit each payment admin's approvals.",
+        "am_promos_menu": "🎁 Promotions",
+        "am_promos_menu_title": "🎁 Promotions & Marketing",
+        "am_promos_menu_desc": "Promo codes, gift codes, and broadcasts.",
+        "am_support_menu": "💬 Support",
+        "am_support_menu_title": "💬 Support & Tickets",
+        "am_support_menu_desc": "View and reply to user support tickets.",
+        "am_back_admin": "🔙 Admin Panel",
     },
     # ------------------------------------------------------------------ Farsi
     "fa": {
@@ -1616,6 +1627,17 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "ref_invitees_none": "هنوز دعوت‌شده‌ای وجود ندارد.",
         "ref_invitees_btn": "👥 نمایش دعوت‌شدگان",
         "admin_ref_invitees_btn": "👥 دعوت‌شدگان",
+        # ADMIN-MENU-REWORK: پنل ادمین اصلی به زیرمنوهای دسته‌بندی‌شده مرتب شد.
+        "am_payments_menu": "💳 پرداخت‌ها",
+        "am_payments_menu_title": "💳 مدیریت پرداخت‌ها",
+        "am_payments_menu_desc": "تأیید پرداخت‌های در انتظار، بررسی تاریخچهٔ رسیدها، یا بررسی تأییدهای هر ادمین پرداخت.",
+        "am_promos_menu": "🎁 تبلیغات",
+        "am_promos_menu_title": "🎁 تبلیغات و بازاریابی",
+        "am_promos_menu_desc": "کدهای تخفیف، کدهای هدیه، و پیام همگانی.",
+        "am_support_menu": "💬 پشتیبانی",
+        "am_support_menu_title": "💬 پشتیبانی و تیکت‌ها",
+        "am_support_menu_desc": "مشاهده و پاسخ به تیکت‌های پشتیبانی کاربران.",
+        "am_back_admin": "🔙 پنل ادمین",
     },
 }
 
@@ -4710,23 +4732,67 @@ def kb_main_menu(is_admin: bool, lang: str = "en") -> InlineKeyboardMarkup:
 
 
 def kb_admin_menu(lang: str = "en") -> InlineKeyboardMarkup:
+    """ADMIN-MENU-REWORK: top-level admin panel — reorganised into submenus.
+
+    Previously 14 flat buttons (Dashboard, Servers, Plans, Users, Finance,
+    Pending Pay, Pay History, By Admin, Promos, Gift Codes, Tickets,
+    Broadcast, Cleanup, Settings).  Now grouped into 6 category buttons +
+    Dashboard + Settings + Back, so the main panel is clean (5 rows × 2).
+
+    Submenus:
+      💳 Payments  → Pending Pay, Pay History, By Admin
+      🎁 Promotions → Promos, Gift Codes, Broadcast
+      💬 Support   → Tickets
+      🖥 Servers   → (existing) + 🧹 Cleanup moved here
+
+    Builders: kb_payments_menu, kb_promos_menu, kb_support_menu.
+    """
     kb = InlineKeyboardBuilder()
     kb.button(text="📊 Dashboard", callback_data=AdminCB(action="dashboard").pack(), style="primary")
+    kb.button(style="primary", text="👥 Users", callback_data=AdminCB(action="users").pack())
     kb.button(style="primary", text="🖥 Servers", callback_data=AdminCB(action="servers").pack())
     kb.button(style="primary", text="📦 Plans", callback_data=AdminCB(action="plans").pack())
-    kb.button(style="primary", text="👥 Users", callback_data=AdminCB(action="users").pack())
+    kb.button(style="primary", text="💳 Payments", callback_data=AdminCB(action="payments_menu").pack())
     kb.button(style="primary", text="💰 Finance", callback_data=AdminCB(action="finance").pack())
-    kb.button(style="primary", text="💰 Pending Pay", callback_data=AdminCB(action="pending_payments").pack())
-    kb.button(style="primary", text="📋 Pay History", callback_data=AdminCB(action="payment_history").pack())
-    kb.button(style="primary", text="👥 By Admin", callback_data=AdminCB(action="admin_payments").pack())
-    kb.button(style="primary", text="🎫 Promos", callback_data=AdminCB(action="promos").pack())
-    kb.button(style="success", text="🎁 Gift Codes", callback_data=AdminCB(action="gift_codes").pack())
-    kb.button(style="primary", text="💬 Tickets", callback_data=AdminCB(action="tickets").pack())
-    kb.button(style="primary", text="📣 Broadcast", callback_data=AdminCB(action="broadcast").pack())
-    kb.button(style="primary", text="🧹 Cleanup", callback_data=AdminCB(action="cleanup").pack())
+    kb.button(style="primary", text="🎁 Promotions", callback_data=AdminCB(action="promos_menu").pack())
+    kb.button(style="primary", text="💬 Support", callback_data=AdminCB(action="support_menu").pack())
     kb.button(style="primary", text="⚙️ Settings", callback_data=AdminCB(action="settings").pack())
     kb.button(text=t("back_menu", lang), callback_data=MenuCB(action="main").pack(), style="danger")
-    kb.adjust(2, 2, 2, 2, 2, 1, 2, 2, 2, 1)
+    kb.adjust(2, 2, 2, 2, 2, 1)
+    return kb.as_markup()
+
+
+def kb_payments_menu() -> InlineKeyboardMarkup:
+    """💳 Payments submenu: Pending Pay, Pay History, By Admin, Back."""
+    kb = InlineKeyboardBuilder()
+    kb.button(style="primary", text="💰 Pending Pay",
+              callback_data=AdminCB(action="pending_payments").pack())
+    kb.button(style="primary", text="📋 Pay History",
+              callback_data=AdminCB(action="payment_history").pack())
+    kb.button(style="primary", text="👥 By Admin",
+              callback_data=AdminCB(action="admin_payments").pack())
+    kb.button(text="🔙 Admin Panel", callback_data=AdminCB(action="main").pack(), style="danger")
+    kb.adjust(1, 2, 1)
+    return kb.as_markup()
+
+
+def kb_promos_menu() -> InlineKeyboardMarkup:
+    """🎁 Promotions submenu: Promos, Gift Codes, Broadcast, Back."""
+    kb = InlineKeyboardBuilder()
+    kb.button(style="primary", text="🎫 Promos", callback_data=AdminCB(action="promos").pack())
+    kb.button(style="success", text="🎁 Gift Codes", callback_data=AdminCB(action="gift_codes").pack())
+    kb.button(style="primary", text="📣 Broadcast", callback_data=AdminCB(action="broadcast").pack())
+    kb.button(text="🔙 Admin Panel", callback_data=AdminCB(action="main").pack(), style="danger")
+    kb.adjust(2, 1, 1)
+    return kb.as_markup()
+
+
+def kb_support_menu() -> InlineKeyboardMarkup:
+    """💬 Support submenu: Tickets, Back."""
+    kb = InlineKeyboardBuilder()
+    kb.button(style="primary", text="💬 Tickets", callback_data=AdminCB(action="tickets").pack())
+    kb.button(text="🔙 Admin Panel", callback_data=AdminCB(action="main").pack(), style="danger")
+    kb.adjust(1, 1)
     return kb.as_markup()
 
 
@@ -4928,8 +4994,12 @@ def kb_servers(servers: List[dict]) -> InlineKeyboardMarkup:
     kb.button(text="📥 Import from Panel", callback_data=AdminCB(action="import_main").pack(), style="primary")
     kb.button(text="➕ Add Server", callback_data=ServerCB(action="add").pack(), style="success")
     kb.button(text="🔄 Sync All", callback_data=ServerCB(action="sync_all").pack(), style="primary")
+    # ADMIN-MENU-REWORK: 🧹 Cleanup moved here from the top-level admin menu
+    # (it's a server-maintenance tool — delete depleted clients across all
+    # panels + sync client counts — so it belongs with the other server ops).
+    kb.button(text="🧹 Cleanup & Maintenance", callback_data=AdminCB(action="cleanup").pack(), style="danger")
     kb.button(text="🔙 Admin", callback_data=AdminCB(action="main").pack(), style="danger")
-    kb.adjust(1, 2, 1)
+    kb.adjust(1, 2, 1, 1, 1)
     return kb.as_markup()
 
 
@@ -5164,7 +5234,8 @@ def kb_broadcast_targets() -> InlineKeyboardMarkup:
     kb.button(text="🟢 Active", callback_data=AdminCB(action="broadcast_active").pack(), style="success")
     kb.button(text="🔴 Expired", callback_data=AdminCB(action="broadcast_expired").pack(), style="danger")
     kb.button(style="success", text="🎁 Trial", callback_data=AdminCB(action="broadcast_trial").pack())
-    kb.button(text="🔙 Admin", callback_data=AdminCB(action="main").pack(), style="danger")
+    # ADMIN-MENU-REWORK: back → Promotions submenu.
+    kb.button(text="🔙 Promotions", callback_data=AdminCB(action="promos_menu").pack(), style="danger")
     kb.adjust(2, 2, 1)
     return kb.as_markup()
 
@@ -8311,6 +8382,36 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
                 reply_markup=kb_payment_admin_menu(pal))
         await callback.answer()
 
+    # ------------------------------------------------------- submenus
+    # ADMIN-MENU-REWORK: top-level admin panel split into category submenus
+    # so the main panel stays clean (5 rows × 2 instead of 14 flat buttons).
+    # Each submenu is a simple landing page with the category's buttons +
+    # a back-to-admin button.  Full-admin-only — payment admins never see
+    # these (AdminGuard blocks admin:payments_menu / promos_menu / support_menu).
+    @router.callback_query(AdminCB.filter(F.action == "payments_menu"))
+    async def cb_payments_menu(callback: CallbackQuery, state: FSMContext):
+        await state.clear()
+        await show_view(callback.message,
+            text="<b>💳 Payments Management</b>\n\nApprove pending payments, review receipt history, or audit each payment admin's approvals.",
+            reply_markup=kb_payments_menu())
+        await callback.answer()
+
+    @router.callback_query(AdminCB.filter(F.action == "promos_menu"))
+    async def cb_promos_menu(callback: CallbackQuery, state: FSMContext):
+        await state.clear()
+        await show_view(callback.message,
+            text="<b>🎁 Promotions & Marketing</b>\n\nPromo codes, gift codes, and broadcasts.",
+            reply_markup=kb_promos_menu())
+        await callback.answer()
+
+    @router.callback_query(AdminCB.filter(F.action == "support_menu"))
+    async def cb_support_menu(callback: CallbackQuery, state: FSMContext):
+        await state.clear()
+        await show_view(callback.message,
+            text="<b>💬 Support & Tickets</b>\n\nView and reply to user support tickets.",
+            reply_markup=kb_support_menu())
+        await callback.answer()
+
     # ------------------------------------------------------- dashboard
     @router.callback_query(AdminCB.filter(F.action == "dashboard"))
     async def cb_dashboard(callback: CallbackQuery, state: FSMContext):
@@ -9680,7 +9781,9 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         cur = await _currency()
         kb = InlineKeyboardBuilder()
         kb.button(text="➕ Create", callback_data=AdminCB(action="create_promo").pack(), style="success")
-        kb.button(text="🔙 Admin", callback_data=AdminCB(action="main").pack(), style="danger")
+        # ADMIN-MENU-REWORK: back goes to the Promotions submenu (not the
+        # top-level admin panel) so the admin stays in the promotions context.
+        kb.button(text="🔙 Promotions", callback_data=AdminCB(action="promos_menu").pack(), style="danger")
         kb.adjust(1)
         if promos:
             rich = rich_tables.promos_rich(promos, cur, fmt_price)
@@ -9754,7 +9857,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         kb = InlineKeyboardBuilder()
         kb.button(text="➕ Gift (Balance)", callback_data=AdminCB(action="create_gift_balance").pack(), style="success")
         kb.button(text="➕ Gift (Plan)", callback_data=AdminCB(action="create_gift_plan").pack(), style="primary")
-        kb.button(text="🔙 Admin", callback_data=AdminCB(action="main").pack(), style="danger")
+        # ADMIN-MENU-REWORK: back → Promotions submenu.
+        kb.button(text="🔙 Promotions", callback_data=AdminCB(action="promos_menu").pack(), style="danger")
         kb.adjust(1, 1, 1)
         if gifts:
             rich = rich_tables.gift_codes_rich(gifts)
@@ -9849,8 +9953,9 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             tickets = await db.get_open_tickets()
             title = f"💬 <b>Open Tickets ({len(tickets)})</b>"
         if not tickets:
+            # ADMIN-MENU-REWORK: empty-state back → Support submenu.
             await show_view(callback.message, text=f"{title}\n\n✅ No tickets.",
-                            reply_markup=kb_admin_menu())
+                            reply_markup=kb_support_menu())
             await callback.answer()
             return
         kb = InlineKeyboardBuilder()
@@ -9882,7 +9987,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             kb.button(style="primary", text="📋 Show all", callback_data=AdminCB(action="tickets", data="all").pack())
         else:
             kb.button(style="primary", text="🟢 Open only", callback_data=AdminCB(action="tickets", data="open").pack())
-        kb.button(text="🔙 Admin", callback_data=AdminCB(action="main").pack(), style="danger")
+        # ADMIN-MENU-REWORK: back → Support submenu.
+        kb.button(text="🔙 Support", callback_data=AdminCB(action="support_menu").pack(), style="danger")
         kb.adjust(1, 1)
         await show_view(callback.message, text=title, reply_markup=kb.as_markup())
         await callback.answer()
@@ -10010,7 +10116,9 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         kb = InlineKeyboardBuilder()
         kb.button(text="🧹 Delete depleted (all servers)", callback_data=AdminCB(action="cleanup_depleted").pack(), style="danger")
         kb.button(text="🧹 Sync client counts", callback_data=AdminCB(action="cleanup_sync_counts").pack(), style="primary")
-        kb.button(text="🔙 Admin", callback_data=AdminCB(action="main").pack(), style="danger")
+        # ADMIN-MENU-REWORK: Cleanup now lives in the Servers section, so
+        # back → servers list (not the top-level admin panel).
+        kb.button(text="🔙 Servers", callback_data=AdminCB(action="servers").pack(), style="danger")
         kb.adjust(1, 1)
         await show_view(callback.message, text="🧹 <b>Cleanup & maintenance</b>", reply_markup=kb.as_markup())
         await callback.answer()
@@ -10900,7 +11008,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         pal = await _pa_lang(callback.from_user.id)
         payments = await db.get_pending_payments()
         if not payments:
-            menu = kb_admin_menu() if await _is_full_admin(callback.from_user.id) else kb_payment_admin_menu(pal)
+            # ADMIN-MENU-REWORK: full admin → Payments submenu, payment admin → their panel.
+            menu = kb_payments_menu() if await _is_full_admin(callback.from_user.id) else kb_payment_admin_menu(pal)
             await show_view(callback.message, text=t("pa_no_pending", pal), reply_markup=menu)
             await callback.answer()
             return
@@ -10953,7 +11062,11 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
                       callback_data=PaymentCB(action="next_pending", payment_id=index + 1).pack())
         kb.button(style="primary", text=t("pa_full_history_btn", pal),
                   callback_data=AdminCB(action="payment_history").pack())
-        kb.button(text=t("pa_admin_back_btn", pal), callback_data=AdminCB(action="main").pack(), style="danger")
+        # ADMIN-MENU-REWORK: back is role-aware — full admins go back to the
+        # Payments submenu (since they entered from there), payment admins go
+        # back to their main payment-admin panel.
+        back_action = "payments_menu" if await _is_full_admin(callback.from_user.id) else "main"
+        kb.button(text=t("pa_admin_back_btn", pal), callback_data=AdminCB(action=back_action).pack(), style="danger")
         kb.adjust(2, 1, 2)
 
         file_id = payment.get("receipt_file_id")
@@ -10986,7 +11099,8 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         pal = await _pa_lang(callback.from_user.id)
         payments = await db.get_pending_payments()
         if not payments:
-            menu = kb_admin_menu() if await _is_full_admin(callback.from_user.id) else kb_payment_admin_menu(pal)
+            # ADMIN-MENU-REWORK: full admin → Payments submenu, payment admin → their panel.
+            menu = kb_payments_menu() if await _is_full_admin(callback.from_user.id) else kb_payment_admin_menu(pal)
             await show_view(callback.message, text=t("pa_no_more_pending", pal), reply_markup=menu)
             await callback.answer()
             return
@@ -11019,7 +11133,9 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         payments = await db.get_recent_payments(limit=30)
         is_full = True
         if not payments:
-            menu = kb_admin_menu() if is_full else kb_payment_admin_menu(pal)
+            # ADMIN-MENU-REWORK: full admin empty-state → Payments submenu
+            # (not the top-level admin panel) so the admin stays in context.
+            menu = kb_payments_menu() if is_full else kb_payment_admin_menu(pal)
             await show_view(callback.message, text=t("pa_no_payments", pal), reply_markup=menu)
             await callback.answer()
             return
@@ -11041,7 +11157,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         payments = await db.get_payments_by_admin(callback.from_user.id, limit=30)
         is_full = await _is_full_admin(callback.from_user.id)
         if not payments:
-            menu = kb_admin_menu() if is_full else kb_payment_admin_menu(pal)
+            menu = kb_payments_menu() if is_full else kb_payment_admin_menu(pal)
             await show_view(callback.message, text=t("pa_no_own_approvals", pal), reply_markup=menu)
             await callback.answer()
             return
@@ -11074,8 +11190,9 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         # not just payment-only admins.
         all_admin_ids = set(ADMIN_IDS) | pa_ids
         if not all_admin_ids:
+            # ADMIN-MENU-REWORK: empty-state → Payments submenu.
             await show_view(callback.message, text=t("pa_history_admins_none", pal),
-                            reply_markup=kb_admin_menu())
+                            reply_markup=kb_payments_menu())
             await callback.answer()
             return
         rows_data = await db.get_payment_admins_with_counts(all_admin_ids)
@@ -11083,7 +11200,7 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         active = [r for r in rows_data if r["total"] > 0]
         if not active:
             await show_view(callback.message, text=t("pa_history_admins_none", pal),
-                            reply_markup=kb_admin_menu())
+                            reply_markup=kb_payments_menu())
             await callback.answer()
             return
         # Build grid_table: Admin • Approved • Rejected • Total
@@ -11112,8 +11229,9 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
                 callback_data=AdminCB(action="admin_payments_view", data=str(r["tg_id"])).pack())
         kb.button(style="primary", text=t("pa_history_btn", pal),
                   callback_data=AdminCB(action="payment_history").pack())
+        # ADMIN-MENU-REWORK: back → Payments submenu.
         kb.button(style="danger", text=t("pa_admin_back_btn", pal),
-                  callback_data=AdminCB(action="main").pack())
+                  callback_data=AdminCB(action="payments_menu").pack())
         kb.adjust(*[1 for _ in active], 2)
         await show_view(callback.message, rich=rich, reply_markup=kb.as_markup())
         await callback.answer()
@@ -11134,9 +11252,10 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         target_label = _admin_display(target_row) if target_row else f"#{target_id}"
         payments = await db.get_payments_by_admin(target_id, limit=30)
         if not payments:
+            # ADMIN-MENU-REWORK: empty-state → By Admin picker (back one level).
             await show_view(callback.message,
                 text=t("pa_history_admin_none", pal),
-                reply_markup=kb_admin_menu())
+                reply_markup=kb_payments_menu())
             await callback.answer()
             return
         await _render_history_table(callback, payments, pal,
@@ -11211,8 +11330,11 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
             kb.button(style="danger", text=t("pa_admin_back_btn", pal),
                       callback_data=AdminCB(action=back_to[0], data=back_to[1]).pack())
         else:
+            # ADMIN-MENU-REWORK: default back is role-aware — full admins go
+            # to the Payments submenu, payment admins go to their panel.
+            back_action = "payments_menu" if is_full else "main"
             kb.button(style="danger", text=t("pa_admin_back_btn", pal),
-                      callback_data=AdminCB(action="main").pack())
+                      callback_data=AdminCB(action=back_action).pack())
         # 1 button per row for payment rows, then the nav row(s):
         # full admin → 2 (Pending + By Admin) then 1 (Back);
         # payment admin → 1 (Pending) then 1 (Back).
@@ -11432,13 +11554,16 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         if payments:
             await _render_pending_view(callback, payments, 0, pal)
         else:
-            # M14 — show the right menu: full admins see the full admin menu,
-            # payment-only admins see the payment-admin menu (otherwise they
-            # see buttons they can't use → "Access denied" alerts).
-            _admin_menu = kb_admin_menu if await _is_full_admin(callback.from_user.id) else kb_payment_admin_menu
+            # M14 — show the right menu: full admins see the Payments submenu
+            # (ADMIN-MENU-REWORK: they just approved a payment, so stay in the
+            # Payments context), payment-only admins see the payment-admin menu.
+            if await _is_full_admin(callback.from_user.id):
+                _menu = kb_payments_menu()
+            else:
+                _menu = kb_payment_admin_menu(pal)
             await show_view(callback.message, text=
                 t("pa_approved_msg", pal, id=payment['id'], amt=int(payment['amount']), uid=payment['user_tg_id']),
-                reply_markup=_admin_menu(pal),
+                reply_markup=_menu,
             )
         await callback.answer(t("pa_approved_toast", pal))
 
@@ -11463,16 +11588,23 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         # PA-LANG: localise the admin-facing messages.
         pal = await _pa_lang(message.from_user.id)
         if not payment or payment["status"] != "pending":
-            _admin_menu = kb_admin_menu if await _is_full_admin(message.from_user.id) else kb_payment_admin_menu
-            await message.answer(t("pa_not_found_processed", pal), reply_markup=_admin_menu(pal))
+            # ADMIN-MENU-REWORK: full admin → Payments submenu.
+            if await _is_full_admin(message.from_user.id):
+                _menu = kb_payments_menu()
+            else:
+                _menu = kb_payment_admin_menu(pal)
+            await message.answer(t("pa_not_found_processed", pal), reply_markup=_menu)
             return
         # C1 — atomic reject: only one admin can transition pending→rejected.
         ok = await db.reject_payment(payment["id"], message.from_user.id, reason,
                                      admin_username=_admin_handle_from_callback(message.from_user))
         if not ok:
-            _admin_menu = kb_admin_menu if await _is_full_admin(message.from_user.id) else kb_payment_admin_menu
+            if await _is_full_admin(message.from_user.id):
+                _menu = kb_payments_menu()
+            else:
+                _menu = kb_payment_admin_menu(pal)
             await message.answer(t("pa_already_processed_msg", pal),
-                                 reply_markup=_admin_menu(pal))
+                                 reply_markup=_menu)
             return
         # Notify user
         user = await db.get_user(payment["user_tg_id"])
@@ -11487,10 +11619,14 @@ def create_admin_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot)
         except Exception as e:
             logger.warning("reject notify failed: %s", e)
         # M14 — branch on admin type for the menu.
-        _admin_menu = kb_admin_menu if await _is_full_admin(message.from_user.id) else kb_payment_admin_menu
+        # ADMIN-MENU-REWORK: full admin → Payments submenu.
+        if await _is_full_admin(message.from_user.id):
+            _menu = kb_payments_menu()
+        else:
+            _menu = kb_payment_admin_menu(pal)
         await message.answer(
             t("pa_rejected_msg", pal, id=payment['id']),
-            reply_markup=_admin_menu(pal),
+            reply_markup=_menu,
         )
 
     # ---- Force join settings handlers ----
