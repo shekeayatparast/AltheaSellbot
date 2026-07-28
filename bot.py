@@ -987,6 +987,21 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "acc_enabled": "✅ Account <code>{email}</code> enabled.\n\nYou can now connect.",
         "renew_success": "✅ <b>Account renewed!</b>",
         "renew_failed": "❌ Renewal failed: {msg}",
+        # RENEW-EXPLAIN: confirmation screen explaining what renewal does to
+        # remaining days/traffic before the user commits.  Keys with {…}
+        # placeholders are filled in cb_account_renew with computed values.
+        "renew_how_title": "ℹ️ <b>How renewal works</b>",
+        "renew_how_deduct": "💵 Plan price is deducted from your wallet balance.",
+        "renew_how_days_add": "📅 Remaining days are <b>added</b> to the plan's duration.",
+        "renew_how_expired": "⏰ Your subscription has expired — the new period starts from now.",
+        "renew_how_traffic_add": "💾 Remaining traffic is <b>added</b> to the plan's traffic.",
+        "renew_how_unlimited": "♾️ Traffic stays <b>Unlimited</b>.",
+        "renew_after_title": "📋 <b>After renewal:</b>",
+        "renew_after_days": "📅 Duration: <b>{days}</b>",
+        "renew_after_traffic": "💾 Traffic: <b>{traffic}</b>",
+        "renew_after_balance": "💳 Balance: <b>{balance}</b>",
+        "renew_sure": "❓ <b>Are you sure you want to renew this account?</b>",
+        "renew_confirm_btn": "✅ Yes, Renew Now",
         "delete_confirm": "🗑 <b>Delete account?</b>\n\n<code>{email}</code>\n\nThis permanently removes the account from the panel. This cannot be undone.",
         "confirm_delete": "🗑 Confirm Delete",
         "acc_deleted": "🗑 Account <code>{email}</code> deleted.",
@@ -1154,6 +1169,17 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "verify_join": "✅ I Joined",
         "force_join_success": "✅ Membership verified! You can now use the bot.",
         "force_join_failed": "❌ You haven't joined all required channels yet.\nPlease join the channels listed above first, then press the ✅ button.",
+        # FORCE-JOIN-FEEDBACK: persistent message shown when the user taps
+        # "✅ I Joined" without actually joining.  Distinct from the original
+        # force_join prompt (starts with ❌ instead of 🔒) so Telegram's
+        # "message is not modified" error is NOT triggered — the message
+        # visibly changes every time, giving the user clear feedback.
+        "force_join_not_joined": (
+            "❌ <b>You haven't joined yet!</b>\n\n"
+            "You are still not a member of all required channels:\n\n"
+            "{channels}\n\n"
+            "👉 Please join the channels above first, then press ✅ below."
+        ),
         "no_inbounds_configured": "❌ This plan has no configured inbounds. Please contact admin.",
         "broadcast_header_en": "📢 <b>Public Announcement</b>\n\n",
         "charge_wallet_btn": "💳 Charge Wallet",
@@ -1380,6 +1406,20 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "acc_enabled": "✅ اکانت <code>{email}</code> فعال شد.\n\nحالا می‌توانید وصل شوید.",
         "renew_success": "✅ <b>اکانت تمدید شد!</b>",
         "renew_failed": "❌ تمدید ناموفق بود: {msg}",
+        # RENEW-EXPLAIN: صفحهٔ تأیید تمدید که قبل از اقدام، نحوهٔ تمدید را
+        # برای کاربر توضیح می‌دهد.
+        "renew_how_title": "ℹ️ <b>نحوهٔ تمدید</b>",
+        "renew_how_deduct": "💵 هزینهٔ پلن از موجودی کیف پول شما کسر می‌شود.",
+        "renew_how_days_add": "📅 روزهای باقی‌مانده با مدت پلن <b>جمع می‌شوند</b>.",
+        "renew_how_expired": "⏰ اشتراک شما منقضی شده — دورهٔ جدید از الان شروع می‌شود.",
+        "renew_how_traffic_add": "💾 حجم باقی‌مانده با حجم پلن <b>جمع می‌شود</b>.",
+        "renew_how_unlimited": "♾️ حجم <b>نامحدود</b> باقی می‌ماند.",
+        "renew_after_title": "📋 <b>بعد از تمدید:</b>",
+        "renew_after_days": "📅 مدت: <b>{days}</b>",
+        "renew_after_traffic": "💾 حجم: <b>{traffic}</b>",
+        "renew_after_balance": "💳 موجودی: <b>{balance}</b>",
+        "renew_sure": "❓ <b>آیا از تمدید این اکانت مطمئن هستید؟</b>",
+        "renew_confirm_btn": "✅ بله، تمدید کن",
         "delete_confirm": "🗑 <b>حذف اکانت؟</b>\n\n<code>{email}</code>\n\nاین کار اکانت را برای همیشه از پنل حذف می‌کند و قابل بازگشت نیست.",
         "confirm_delete": "🗑 تأیید حذف",
         "acc_deleted": "🗑 اکانت <code>{email}</code> حذف شد.",
@@ -1534,6 +1574,15 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "verify_join": "✅ عضو شدم",
         "force_join_success": "✅ عضویت تأیید شد! حالا می‌توانید از ربات استفاده کنید.",
         "force_join_failed": "❌ شما هنوز عضو همهٔ کانال‌های مورد نیاز نشده‌اید.\nابتدا عضو کانال‌های ذکرشده در بالا شوید، سپس دکمهٔ ✅ را بزنید.",
+        # FORCE-JOIN-FEEDBACK: پیام ماندگار وقتی کاربر بدون عضویت واقعی
+        # دکمهٔ «عضو شدم» را می‌زند. با ❌ شروع می‌شود (نه 🔒) تا پیام
+        # تغییر کند و کاربر بازخورد واضح ببیند.
+        "force_join_not_joined": (
+            "❌ <b>هنوز عضو نشده‌اید!</b>\n\n"
+            "شما هنوز عضو همهٔ کانال‌های مورد نیاز نشده‌اید:\n\n"
+            "{channels}\n\n"
+            "👉 ابتدا عضو کانال‌های بالا شوید، سپس دکمهٔ ✅ زیر را بزنید."
+        ),
         "no_inbounds_configured": "❌ این پلن اینباند تنظیم‌شده ندارد. با مدیریت تماس بگیرید.",
         "broadcast_header_fa": "📢 <b>اطلاعیه همگانی</b>\n\n",
         "charge_wallet_btn": "💳 شارژ کیف پول",
@@ -5883,8 +5932,14 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             kb.button(style="primary", text=t("language", lang), callback_data=MenuCB(action="language").pack())
             kb.adjust(1, 2)
             try:
+                # FORCE-JOIN-FEEDBACK: use force_join_not_joined (starts with
+                # ❌) instead of the original force_join prompt (starts with
+                # 🔒).  The different header guarantees the message content
+                # changes, so Telegram's edit_text won't hit "message is not
+                # modified" (which show_view swallows silently) — the user
+                # always sees a visible "you haven't joined" response.
                 await show_view(callback.message,
-                                text=t("force_join", lang, channels=channels_text),
+                                text=t("force_join_not_joined", lang, channels=channels_text),
                                 reply_markup=kb.as_markup())
             except Exception as e:
                 logger.warning("force-join re-render failed: %s", e)
@@ -6680,9 +6735,54 @@ def create_user_router(db: Database, api: PanelAPI, lb: LoadBalancer, bot: Bot) 
             # "Pay Exact Shortfall" button. The review_short_hint was a
             # regression from Task 16 that pointed at a non-existent button.
             text += f"\n{t('renew_short_hint', lang)}"
+        else:
+            # RENEW-EXPLAIN: when the user CAN afford the renewal, show a
+            # clear explanation of what renewal does (remaining days/traffic
+            # are added, price is deducted) plus the computed post-renewal
+            # values, then ask for explicit confirmation.  This mirrors the
+            # exact logic in cb_renew_confirm so the numbers match what
+            # actually happens.
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            exp_ms = account.get("expiry_time") or 0
+            is_expired = exp_ms <= now_ms
+            is_unlimited = account.get("traffic_gb") == 0
+            # Post-renewal duration (in days from now).
+            if is_expired:
+                new_total_days = plan["duration_days"]
+            else:
+                remaining_days = (exp_ms - now_ms) / MS_PER_DAY
+                new_total_days = plan["duration_days"] + remaining_days
+            # Post-renewal traffic.
+            if is_unlimited:
+                new_traffic_display = t("unlimited", lang)
+            else:
+                new_traffic_gb = (account.get("traffic_gb") or 0) + (plan.get("traffic_gb") or 0)
+                new_traffic_display = fmt_gb(new_traffic_gb, lang)
+            after_balance = balance - plan["price"]
+            text += "\n" + t("renew_how_title", lang) + "\n"
+            text += t("renew_how_deduct", lang) + "\n"
+            if is_expired:
+                text += t("renew_how_expired", lang) + "\n"
+            else:
+                text += t("renew_how_days_add", lang) + "\n"
+            if is_unlimited:
+                text += t("renew_how_unlimited", lang) + "\n"
+            else:
+                text += t("renew_how_traffic_add", lang) + "\n"
+            text += "\n" + t("renew_after_title", lang) + "\n"
+            if plan["duration_days"] > 0:
+                text += t("renew_after_days", lang,
+                          days=fmt_days(int(new_total_days), lang)) + "\n"
+            text += t("renew_after_traffic", lang, traffic=new_traffic_display) + "\n"
+            text += t("renew_after_balance", lang,
+                      balance=fmt_price(after_balance, lang, currency)) + "\n"
+            text += "\n" + t("renew_sure", lang)
         kb = InlineKeyboardBuilder()
         if balance >= plan["price"]:
-            kb.button(text=t("renew", lang),
+            # RENEW-EXPLAIN: distinct confirm button label so the user knows
+            # this is the final commitment (the old label was identical to
+            # the entry "🔄 Renew" button, which was confusing).
+            kb.button(text=t("renew_confirm_btn", lang),
                       callback_data=AccountCB(action="renew_confirm", email=account["email"]).pack(),
                       style="success")
         else:
